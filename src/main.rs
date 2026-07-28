@@ -9,6 +9,11 @@ use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
 const DONE_TIMEOUT: u64 = 30;
+/// Backstop for sessions pinned in a running state because their terminal hook
+/// never arrived — Claude Code skips `Stop` on user interrupt, and hooks can be
+/// lost to timeouts or a failed `zellij pipe`. Long enough that a genuinely
+/// slow tool call isn't mistaken for a dead one.
+const STALE_TIMEOUT: u64 = 600;
 const TIMER_INTERVAL: f64 = 1.0;
 const FLASH_TICK: f64 = 0.25;
 
@@ -273,7 +278,20 @@ impl State {
                         changed = true;
                     }
                 }
-                _ => {}
+                state::Activity::Init
+                | state::Activity::Thinking
+                | state::Activity::Tool(_)
+                | state::Activity::Notification => {
+                    if now.saturating_sub(session.last_event_ts) >= STALE_TIMEOUT {
+                        session.activity = state::Activity::Idle;
+                        changed = true;
+                    }
+                }
+                // Waiting (permission prompt) and Prompting (idle at the input)
+                // are resting states the user needs to keep seeing until they act.
+                state::Activity::Waiting
+                | state::Activity::Prompting
+                | state::Activity::Idle => {}
             }
         }
         changed
@@ -376,5 +394,84 @@ impl State {
                 self.sessions.insert(pane_id, session);
             }
         }
+    }
+}
+
+/// zellij-tile links against wasm host imports that don't exist when the crate
+/// is built for the host triple. Stub them so `cargo test
+/// --target x86_64-unknown-linux-gnu` can link. Never reached — the pure state
+/// logic under test doesn't call into the host.
+#[cfg(test)]
+#[no_mangle]
+extern "C" fn host_run_plugin_command() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Activity;
+
+    fn session_with(activity: Activity, age_secs: u64) -> SessionInfo {
+        SessionInfo {
+            session_id: "s1".into(),
+            pane_id: 1,
+            activity,
+            tab_name: None,
+            tab_index: None,
+            last_event_ts: unix_now().saturating_sub(age_secs),
+            cwd: None,
+            last_ts_ms: 0,
+        }
+    }
+
+    fn state_with(activity: Activity, age_secs: u64) -> State {
+        let mut state = State::default();
+        state.sessions.insert(1, session_with(activity, age_secs));
+        state
+    }
+
+    fn activity_of(state: &State) -> Activity {
+        state.sessions.get(&1).unwrap().activity.clone()
+    }
+
+    #[test]
+    fn done_ages_out_to_idle() {
+        let mut state = state_with(Activity::Done, DONE_TIMEOUT + 1);
+        assert!(state.cleanup_stale_sessions());
+        assert_eq!(activity_of(&state), Activity::Idle);
+    }
+
+    #[test]
+    fn stale_thinking_ages_out_to_idle() {
+        let mut state = state_with(Activity::Thinking, STALE_TIMEOUT + 1);
+        assert!(state.cleanup_stale_sessions());
+        assert_eq!(activity_of(&state), Activity::Idle);
+    }
+
+    #[test]
+    fn stale_tool_ages_out_to_idle() {
+        let mut state = state_with(Activity::Tool("Bash".into()), STALE_TIMEOUT + 1);
+        assert!(state.cleanup_stale_sessions());
+        assert_eq!(activity_of(&state), Activity::Idle);
+    }
+
+    #[test]
+    fn running_tool_within_timeout_is_left_alone() {
+        let mut state = state_with(Activity::Tool("Bash".into()), STALE_TIMEOUT - 60);
+        assert!(!state.cleanup_stale_sessions());
+        assert_eq!(activity_of(&state), Activity::Tool("Bash".into()));
+    }
+
+    #[test]
+    fn waiting_never_ages_out() {
+        let mut state = state_with(Activity::Waiting, STALE_TIMEOUT * 10);
+        assert!(!state.cleanup_stale_sessions());
+        assert_eq!(activity_of(&state), Activity::Waiting);
+    }
+
+    #[test]
+    fn prompting_never_ages_out() {
+        let mut state = state_with(Activity::Prompting, STALE_TIMEOUT * 10);
+        assert!(!state.cleanup_stale_sessions());
+        assert_eq!(activity_of(&state), Activity::Prompting);
     }
 }

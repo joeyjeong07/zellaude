@@ -1,5 +1,16 @@
 use crate::state::{Activity, FlashMode, HookPayload, SessionInfo, State};
 
+/// True when a `Notification` says Claude is sitting idle at the prompt, as
+/// opposed to asking for permission. Matched loosely because the wording is
+/// upstream text we don't control.
+fn is_idle_prompt_notification(message: Option<&str>) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+    let message = message.to_lowercase();
+    message.contains("waiting for") && !message.contains("permission")
+}
+
 pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     // Capture env info for use in notifications
     if let Some(ref name) = payload.zellij_session {
@@ -36,7 +47,13 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
         "PostToolUse" | "PostToolUseFailure" => Activity::Thinking,
         "UserPromptSubmit" => Activity::Thinking,
         "PermissionRequest" => Activity::Waiting,
-        // Notification is informational — just refresh the timestamp, keep current activity.
+        // Claude Code emits a Notification when the prompt has sat idle — that's
+        // the only signal we get that a turn ended without a `Stop` hook (user
+        // interrupt, lost hook). Other notifications (permission requests) are
+        // informational: refresh the timestamp and keep the current activity.
+        "Notification" if is_idle_prompt_notification(payload.message.as_deref()) => {
+            Activity::Prompting
+        }
         "Notification" => {
             if let Some(session) = state.sessions.get_mut(&payload.pane_id) {
                 session.last_event_ts = crate::state::unix_now();
@@ -104,5 +121,74 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     if let Some((idx, name)) = tab_index.zip(tab_name) {
         session.tab_index = Some(idx);
         session.tab_name = Some(name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(event: &str, ts_ms: u64) -> HookPayload {
+        HookPayload {
+            session_id: Some("s1".into()),
+            pane_id: 1,
+            hook_event: event.into(),
+            tool_name: None,
+            cwd: None,
+            zellij_session: None,
+            term_program: None,
+            ts_ms: Some(ts_ms),
+            message: None,
+        }
+    }
+
+    fn activity(state: &State) -> Activity {
+        state.sessions.get(&1).unwrap().activity.clone()
+    }
+
+    #[test]
+    fn idle_notification_marks_session_as_prompting() {
+        let mut state = State::default();
+        handle_hook_event(&mut state, payload("UserPromptSubmit", 100));
+        assert_eq!(activity(&state), Activity::Thinking);
+
+        let mut p = payload("Notification", 200);
+        p.message = Some("Claude is waiting for your input".into());
+        handle_hook_event(&mut state, p);
+
+        assert_eq!(activity(&state), Activity::Prompting);
+    }
+
+    #[test]
+    fn permission_notification_does_not_clear_running_activity() {
+        let mut state = State::default();
+        let mut p = payload("PreToolUse", 100);
+        p.tool_name = Some("Bash".into());
+        handle_hook_event(&mut state, p);
+
+        let mut p = payload("Notification", 200);
+        p.message = Some("Claude needs your permission to use Bash".into());
+        handle_hook_event(&mut state, p);
+
+        assert_eq!(activity(&state), Activity::Tool("Bash".into()));
+    }
+
+    #[test]
+    fn untagged_notification_keeps_current_activity() {
+        let mut state = State::default();
+        handle_hook_event(&mut state, payload("UserPromptSubmit", 100));
+        handle_hook_event(&mut state, payload("Notification", 200));
+
+        assert_eq!(activity(&state), Activity::Thinking);
+    }
+
+    #[test]
+    fn idle_notification_creates_session_when_none_exists() {
+        let mut state = State::default();
+        let mut p = payload("Notification", 100);
+        p.message = Some("Claude is waiting for your input".into());
+        handle_hook_event(&mut state, p);
+
+        assert_eq!(activity(&state), Activity::Prompting);
     }
 }

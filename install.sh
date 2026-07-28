@@ -8,6 +8,7 @@ set -euo pipefail
 
 PLUGIN_DIR="$HOME/.config/zellij/plugins"
 PLUGIN_PATH="$PLUGIN_DIR/zellaude.wasm"
+HOOK_PATH="$PLUGIN_DIR/zellaude-hook.sh"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -19,6 +20,7 @@ dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
 if [ "${1:-}" = "--uninstall" ]; then
     echo "Uninstalling zellaude..."
     rm -f "$PLUGIN_PATH" && dim "  removed $PLUGIN_PATH"
+    rm -f "$HOOK_PATH" && dim "  removed $HOOK_PATH"
     "$PROJECT_DIR/scripts/install-hooks.sh" --uninstall
     green "Done. Restart Zellij to take effect."
     exit 0
@@ -63,6 +65,12 @@ cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml" 2>&1 | tail -1
 mkdir -p "$PLUGIN_DIR"
 cp "$PROJECT_DIR/target/wasm32-wasip1/release/zellaude.wasm" "$PLUGIN_PATH"
 dim "  installed $PLUGIN_PATH"
+
+# install-hooks.sh points ~/.claude/settings.json at this path, so the hook
+# script has to land here too or hook changes never reach an existing install.
+cp "$PROJECT_DIR/scripts/zellaude-hook.sh" "$HOOK_PATH"
+chmod +x "$HOOK_PATH"
+dim "  installed $HOOK_PATH"
 
 # ── Install hooks ──────────────────────────────────────────
 

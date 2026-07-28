@@ -52,6 +52,10 @@ pub struct HookPayload {
     pub hook_event: String,
     pub tool_name: Option<String>,
     pub cwd: Option<String>,
+    /// Notification text, when the hook supplied one. Used to tell an
+    /// "idle at the prompt" notification apart from a permission notification.
+    #[serde(default)]
+    pub message: Option<String>,
     pub zellij_session: Option<String>,
     pub term_program: Option<String>,
     pub ts_ms: Option<u64>,

@@ -21,6 +21,7 @@ HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty')
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+MESSAGE=$(echo "$INPUT" | jq -r '.message // empty')
 
 [ -z "$HOOK_EVENT" ] && exit 0
 
@@ -31,6 +32,7 @@ PAYLOAD=$(jq -nc \
   --arg hook_event "$HOOK_EVENT" \
   --arg tool_name "$TOOL_NAME" \
   --arg cwd "$CWD" \
+  --arg message "$MESSAGE" \
   --arg zellij_session "$ZELLIJ_SESSION_NAME" \
   --arg term_program "${TERM_PROGRAM:-}" \
   --arg ts_ms "$TS_MS" \
@@ -40,6 +42,7 @@ PAYLOAD=$(jq -nc \
     hook_event: $hook_event,
     tool_name: (if $tool_name == "" then null else $tool_name end),
     cwd: (if $cwd == "" then null else $cwd end),
+    message: (if $message == "" then null else $message end),
     zellij_session: $zellij_session,
     term_program: (if $term_program == "" then null else $term_program end),
     ts_ms: ($ts_ms | tonumber)
@@ -98,7 +101,9 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
     TOOL_SUFFIX=""
     [ -n "$TOOL_NAME" ] && TOOL_SUFFIX=" — $TOOL_NAME"
     TITLE="⚠ Claude Code"
-    MESSAGE="Permission requested${TOOL_SUFFIX}"
+    # Distinct from $MESSAGE (the hook's own notification text, already
+    # captured into $PAYLOAD above) to avoid clobbering it.
+    NOTIFY_MESSAGE="Permission requested${TOOL_SUFFIX}"
 
     # Rate-limit: one notification per pane per 10 seconds
     LOCK="/tmp/zellaude-notify-${ZELLIJ_PANE_ID}"
@@ -118,15 +123,15 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
           if command -v terminal-notifier >/dev/null 2>&1; then
             terminal-notifier \
               -title "$TITLE" \
-              -message "$MESSAGE" \
+              -message "$NOTIFY_MESSAGE" \
               -execute "$FOCUS_CMD" &
           else
-            osascript -e "display notification \"$MESSAGE\" with title \"$TITLE\"" &
+            osascript -e "display notification \"$NOTIFY_MESSAGE\" with title \"$TITLE\"" &
           fi
           ;;
         Linux)
           if command -v notify-send >/dev/null 2>&1; then
-            notify-send "$TITLE" "$MESSAGE" &
+            notify-send "$TITLE" "$NOTIFY_MESSAGE" &
           fi
           ;;
       esac
