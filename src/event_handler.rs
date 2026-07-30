@@ -1,5 +1,46 @@
 use crate::state::{Activity, FlashMode, HookPayload, SessionInfo, State};
 
+fn update_session_identity(session: &mut SessionInfo, payload: &HookPayload) -> bool {
+    let Some(session_id) = payload
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return false;
+    };
+
+    if session.session_id == session_id {
+        return false;
+    }
+
+    session.session_id = session_id.to_string();
+    true
+}
+
+fn update_rainbow_mode(
+    session: &mut SessionInfo,
+    payload: &HookPayload,
+    reset_for_new_session: bool,
+) {
+    if reset_for_new_session {
+        session.rainbow_name = payload.rainbow_name.unwrap_or(false);
+        session.rainbow_mode_marker = payload.rainbow_mode_marker.clone();
+        return;
+    }
+
+    let Some(rainbow_name) = payload.rainbow_name else {
+        return;
+    };
+
+    if let Some(marker) = payload.rainbow_mode_marker.as_deref() {
+        if session.rainbow_mode_marker.as_deref() == Some(marker) {
+            return;
+        }
+        session.rainbow_mode_marker = Some(marker.to_string());
+    }
+    session.rainbow_name = rainbow_name;
+}
+
 pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     // Capture env info for use in notifications
     if let Some(ref name) = payload.zellij_session {
@@ -52,6 +93,8 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
         // Notification is informational — just refresh the timestamp, keep current activity.
         "Notification" => {
             if let Some(session) = state.sessions.get_mut(&payload.pane_id) {
+                let new_session = update_session_identity(session, &payload);
+                update_rainbow_mode(session, &payload, new_session);
                 session.last_event_ts = crate::state::unix_now();
                 if let Some(ts_ms) = payload.ts_ms {
                     session.last_ts_ms = ts_ms;
@@ -82,6 +125,8 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
             last_event_ts: 0,
             cwd: None,
             last_ts_ms: 0,
+            rainbow_name: payload.rainbow_name.unwrap_or(false),
+            rainbow_mode_marker: payload.rainbow_mode_marker.clone(),
         });
 
     if matches!(activity, Activity::Waiting) {
@@ -108,9 +153,8 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     if let Some(ts_ms) = payload.ts_ms {
         session.last_ts_ms = ts_ms;
     }
-    if let Some(sid) = &payload.session_id {
-        session.session_id = sid.clone();
-    }
+    let new_session = update_session_identity(session, &payload);
+    update_rainbow_mode(session, &payload, new_session || event == "SessionStart");
     if let Some(cwd) = payload.cwd {
         session.cwd = Some(cwd);
     }

@@ -43,6 +43,10 @@ pub struct SessionInfo {
     pub cwd: Option<String>,
     #[serde(default)]
     pub last_ts_ms: u64,
+    #[serde(default)]
+    pub rainbow_name: bool,
+    #[serde(default)]
+    pub rainbow_mode_marker: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +59,10 @@ pub struct HookPayload {
     pub zellij_session: Option<String>,
     pub term_program: Option<String>,
     pub ts_ms: Option<u64>,
+    #[serde(default)]
+    pub rainbow_name: Option<bool>,
+    #[serde(default)]
+    pub rainbow_mode_marker: Option<String>,
 }
 
 pub struct ClickRegion {
@@ -152,6 +160,7 @@ pub struct State {
     pub pane_to_tab: HashMap<u32, (usize, String)>,
     pub tabs: Vec<TabInfo>,
     pub pane_manifest: Option<PaneManifest>,
+    pub zellij_styling: Option<Styling>,
     pub active_tab_index: Option<usize>,
     pub click_regions: Vec<ClickRegion>,
     /// pane_id -> flash deadline in ms (for waiting animation)

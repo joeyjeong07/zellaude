@@ -8,10 +8,12 @@ A Zellij status bar plugin that replaces the default tab bar with Claude Code an
 
 - **Full tab bar** — shows all Zellij tabs (not just agent sessions), replacing the native tab bar
 - **Session & mode display** — shows the Zellij session name and current input mode (NORMAL, LOCKED, PANE, etc.) with color-coded indicators
-- **Live activity indicators** — see what every Claude Code and Codex session is doing at a glance; non-agent tabs shown dimly
+- **Live activity indicators** — see what every Claude Code and Codex session is doing at a glance; non-agent tabs remain visible without activity glyphs
+- **Theme-aware palette** — follows Zellij's live theme colors; Gruvbox Dark is explicitly verified
+- **Ultra-mode rainbow** — tab names shimmer through rainbow colors for Codex `ultra` sessions and Claude Code `ultracode` sessions
 - **Clickable tabs** — click any tab to switch to it
 - **Smart pane focus** — clicking an agent-aware tab focuses its most recently active Claude Code or Codex pane, revealing it inside a stack; waiting (⚠) sessions retain priority
-- **Permission flash** — sessions pulse bright yellow for 2 seconds when a permission request arrives
+- **Permission flash** — sessions pulse with the theme's error color for 2 seconds when a permission request arrives
 - **Desktop notifications** — macOS notification on permission requests (rate-limited to once per 10s per tab), with click-to-focus support via [terminal-notifier](https://github.com/julienXX/terminal-notifier)
 - **Elapsed time** — shows how long a session has been in its current state (after 30s), making it easy to spot stuck sessions
 - **Multi-instance sync** — all Zellij tabs show a unified view of all sessions
@@ -20,18 +22,20 @@ A Zellij status bar plugin that replaces the default tab bar with Claude Code an
 
 | Symbol | Meaning |
 |--------|---------|
-| $\color{#b4afc3}{◆}$ | Session starting |
-| $\color{#b48cff}{●}$ | Thinking |
-| $\color{#ffaa32}{⚡}$ | Running Bash |
-| $\color{#ffaa32}{◉}$ | Reading / searching files |
-| $\color{#ffaa32}{✎}$ | Editing / writing files |
-| $\color{#ffaa32}{⊜}$ | Spawning subagent |
-| $\color{#ffaa32}{◈}$ | Web search / fetch |
-| $\color{#ffaa32}{⚙}$ | Other tool |
-| $\color{#50c878}{▶}$ | Waiting for user prompt |
-| $\color{#ff3c3c}{⚠}$ | Waiting for permission |
-| $\color{#50c878}{✓}$ | Done |
-| $\color{#b4afc3}{○}$ | Idle |
+| ◆ | Session starting |
+| ● | Thinking |
+| ⚡ | Running Bash |
+| ◉ | Reading / searching files |
+| ✎ | Editing / writing files |
+| ⊜ | Spawning subagent |
+| ◈ | Web search / fetch |
+| ⚙ | Other tool |
+| ▶ | Waiting for user prompt |
+| ⚠ | Waiting for permission |
+| ✓ | Done |
+| ○ | Idle |
+
+Indicator colors come from the active Zellij theme. Ultra-mode tab names remain an intentional animated RGB exception.
 
 ### Settings
 
@@ -40,7 +44,7 @@ Click the **Zellaude** prefix on the left side of the bar to open the settings m
 | Setting | Options | Default | Description |
 |---------|---------|---------|-------------|
 | Notifications | Always / Unfocused / Off | Always | Desktop notifications on permission requests. "Unfocused" only notifies when the requesting pane is on a different tab. |
-| Flash | Persist / Brief / Off | Brief | Yellow flash on permission requests. "Persist" keeps flashing until resolved, "Brief" flashes for 2 seconds. |
+| Flash | Persist / Brief / Off | Brief | Theme-colored flash on permission requests. "Persist" keeps flashing until resolved, "Brief" flashes for 2 seconds. |
 | Elapsed time | On / Off | On | Show time since last activity (appears after 30s). |
 
 ## Install
@@ -125,6 +129,8 @@ Claude Code / Codex hook → zellaude-hook.sh → zellij pipe → plugin → ren
 
 The hook script and registration are version-tagged and updated automatically when the plugin version changes.
 The registered hook command uses `${HOME}/.config/zellij/plugins/zellaude-hook.sh`; Claude Code expands `${HOME}` when it runs hooks, keeping the settings entry portable across machines.
+
+Codex currently records its active reasoning effort in the hook transcript rather than hook input, while Claude Code reports `ultracode` as ordinary `xhigh` effort. Zellaude resolves both best-effort from the live session transcript and launch flags. Custom Claude launchers that hide `--effort ultracode` can export `ZELLAUDE_CLAUDE_MODE=ultracode` when Claude's active effort remains `xhigh`.
 
 All state lives in WASM memory. No temp files, no race conditions. Multiple plugin instances (one per tab) sync state automatically via inter-plugin messaging. Sessions are cleaned up automatically when tabs are closed.
 

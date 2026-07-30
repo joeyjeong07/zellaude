@@ -1,10 +1,12 @@
 mod event_handler;
 mod installer;
+mod rainbow;
 mod render;
 mod session_selection;
 mod state;
 mod tab_pane_map;
 mod tool_symbol;
+mod theme;
 
 use state::{unix_now, unix_now_ms, HookPayload, MenuAction, SessionInfo, Settings, State, ViewMode};
 use std::collections::BTreeMap;
@@ -63,6 +65,7 @@ impl ZellijPlugin for State {
             }
             Event::ModeUpdate(mode_info) => {
                 self.input_mode = mode_info.mode;
+                self.zellij_styling = Some(mode_info.style.colors);
                 if let Some(name) = mode_info.session_name {
                     self.zellij_session_name = Some(name);
                 }
@@ -153,12 +156,19 @@ impl ZellijPlugin for State {
                 let stale_changed = self.cleanup_stale_sessions();
                 let flash_changed = self.cleanup_expired_flashes();
                 let has_flashes = self.has_active_flashes();
-                if has_flashes {
+                let has_rainbows = self.has_rainbow_sessions();
+                if has_rainbows {
+                    set_timeout(rainbow::ANIMATION_TICK_SECONDS);
+                } else if has_flashes {
                     set_timeout(FLASH_TICK);
                 } else {
                     set_timeout(TIMER_INTERVAL);
                 }
-                has_flashes || stale_changed || flash_changed || self.has_elapsed_display()
+                has_rainbows
+                    || has_flashes
+                    || stale_changed
+                    || flash_changed
+                    || self.has_elapsed_display()
             }
             Event::PermissionRequestResult(_) => {
                 // Now that permissions are granted, mark as non-selectable
@@ -296,6 +306,10 @@ impl State {
     fn has_active_flashes(&self) -> bool {
         let now = unix_now_ms();
         self.flash_deadlines.values().any(|&deadline| now < deadline)
+    }
+
+    fn has_rainbow_sessions(&self) -> bool {
+        self.sessions.values().any(|session| session.rainbow_name)
     }
 
     fn cleanup_expired_flashes(&mut self) -> bool {

@@ -24,6 +24,8 @@ mod state {
         pub last_event_ts: u64,
         pub cwd: Option<String>,
         pub last_ts_ms: u64,
+        pub rainbow_name: bool,
+        pub rainbow_mode_marker: Option<String>,
     }
 }
 

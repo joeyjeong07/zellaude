@@ -85,6 +85,8 @@ mod tests {
             last_event_ts,
             cwd: None,
             last_ts_ms,
+            rainbow_name: false,
+            rainbow_mode_marker: None,
         }
     }
 
