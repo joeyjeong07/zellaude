@@ -25,7 +25,9 @@ run_hook() {
   local expected=$3
   local mode=${4:-}
   local expected_marker=${5:-skip}
-  local actual actual_marker
+  local expected_session_id=${6:-skip}
+  local expected_subagent=${7:-skip}
+  local actual actual_marker actual_session_id actual_subagent
 
   : > "$CAPTURE_FILE"
   if [ "$client" = "codex" ]; then
@@ -62,6 +64,24 @@ run_hook() {
     if [ "$actual_marker" != "$expected_marker" ]; then
       printf 'expected %s marker %s, got %s\n' \
         "$client" "$expected_marker" "$actual_marker" >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$expected_session_id" != "skip" ]; then
+    actual_session_id=$(jq -c '.session_id' "$CAPTURE_FILE")
+    if [ "$actual_session_id" != "$expected_session_id" ]; then
+      printf 'expected %s session id %s, got %s\n' \
+        "$client" "$expected_session_id" "$actual_session_id" >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$expected_subagent" != "skip" ]; then
+    actual_subagent=$(jq -c '.is_subagent' "$CAPTURE_FILE")
+    if [ "$actual_subagent" != "$expected_subagent" ]; then
+      printf 'expected %s subagent %s, got %s\n' \
+        "$client" "$expected_subagent" "$actual_subagent" >&2
       exit 1
     fi
   fi
@@ -149,11 +169,36 @@ run_hook codex "$(jq -nc \
   --arg transcript "$CODEX_TRANSCRIPT" \
   --arg agent_transcript "$CODEX_AGENT_TRANSCRIPT" \
   '{session_id:"codex-agent",hook_event_name:"SubagentStop",turn_id:"child-turn",transcript_path:$transcript,agent_transcript_path:$agent_transcript}')" \
-  null
+  null \
+  "" \
+  skip \
+  '""' \
+  true
 
 run_hook codex \
   '{"session_id":"codex-unknown","hook_event_name":"SessionStart"}' \
   null
+run_hook codex \
+  '{"session_id":"codex-child","hook_event_name":"PreToolUse","agent_id":"child-1","reasoning_effort":"high"}' \
+  null \
+  "" \
+  skip \
+  '""' \
+  true
+
+CODEX_INTERNAL_CHILD_TRANSCRIPT="$TEST_DIR/codex-internal-child.jsonl"
+cat > "$CODEX_INTERNAL_CHILD_TRANSCRIPT" <<'CODEX_INTERNAL_CHILD_JSONL'
+{"type":"session_meta","payload":{"source":{"subagent":{"review":{}}}}}
+{"type":"turn_context","payload":{"turn_id":"internal-child-turn","effort":"high"}}
+CODEX_INTERNAL_CHILD_JSONL
+run_hook codex "$(jq -nc \
+  --arg transcript "$CODEX_INTERNAL_CHILD_TRANSCRIPT" \
+  '{session_id:"codex-internal-child",hook_event_name:"PreToolUse",turn_id:"internal-child-turn",transcript_path:$transcript}')" \
+  null \
+  "" \
+  skip \
+  '""' \
+  true
 
 CLAUDE_ULTRA_TRANSCRIPT="$TEST_DIR/claude-ultra.jsonl"
 cat > "$CLAUDE_ULTRA_TRANSCRIPT" <<'CLAUDE_ULTRA_JSONL'
@@ -184,6 +229,13 @@ run_hook claude \
   false
 run_hook claude \
   '{"session_id":"claude-explicit","hook_event_name":"SessionStart","ultracode":true}' \
+  true
+run_hook claude \
+  '{"session_id":"claude-child","hook_event_name":"PreToolUse","agent_id":"child-1","ultracode":false}' \
+  null \
+  "" \
+  skip \
+  '""' \
   true
 run_hook claude \
   '{"session_id":"claude-sentinel","hook_event_name":"SessionStart"}' \

@@ -1,6 +1,10 @@
 use crate::state::{Activity, FlashMode, HookPayload, SessionInfo, State};
 
 fn update_session_identity(session: &mut SessionInfo, payload: &HookPayload) -> bool {
+    if payload.is_subagent {
+        return false;
+    }
+
     let Some(session_id) = payload
         .session_id
         .as_deref()
@@ -22,6 +26,10 @@ fn update_rainbow_mode(
     payload: &HookPayload,
     reset_for_new_session: bool,
 ) {
+    if payload.is_subagent {
+        return;
+    }
+
     if reset_for_new_session {
         session.rainbow_name = payload.rainbow_name.unwrap_or(false);
         session.rainbow_mode_marker = payload.rainbow_mode_marker.clone();
@@ -55,6 +63,9 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     // SessionEnd → remove this session. Ignore a late end event from a process
     // that has already been replaced by a newer agent session in the pane.
     if event == "SessionEnd" {
+        if payload.is_subagent {
+            return;
+        }
         let should_remove = state
             .sessions
             .get(&payload.pane_id)
@@ -67,6 +78,14 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
         if should_remove {
             state.sessions.remove(&payload.pane_id);
         }
+        return;
+    }
+
+    // Child agents share their root's pane, so they may enrich an existing
+    // session's activity but must never create pane ownership. This also lets
+    // a freshly loaded plugin accept synchronized root state without a
+    // child-created placeholder winning on an equal timestamp.
+    if payload.is_subagent && !state.sessions.contains_key(&payload.pane_id) {
         return;
     }
 

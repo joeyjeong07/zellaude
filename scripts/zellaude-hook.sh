@@ -45,6 +45,32 @@ TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
 TURN_ID=$(echo "$INPUT" | jq -r '.turn_id // empty')
+AGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // empty')
+IS_SUBAGENT=false
+case "$HOOK_EVENT" in
+  SubagentStart|SubagentStop) IS_SUBAGENT=true ;;
+esac
+if [ "$IS_SUBAGENT" = false ] && [ -n "$AGENT_ID" ]; then
+  IS_SUBAGENT=true
+fi
+if [ "$IS_SUBAGENT" = false ] &&
+   [ "$CLIENT" = "codex" ] &&
+   [ -r "$TRANSCRIPT_PATH" ]; then
+  TRANSCRIPT_IS_SUBAGENT=$(
+    head -n 16 "$TRANSCRIPT_PATH" 2>/dev/null |
+      jq -Rnr '
+        [
+          inputs
+          | fromjson?
+          | select(.type == "session_meta")
+          | .payload.source?
+          | select((type == "object") and has("subagent"))
+        ]
+        | length > 0
+      ' 2>/dev/null || printf 'false'
+  )
+  [ "$TRANSCRIPT_IS_SUBAGENT" = true ] && IS_SUBAGENT=true
+fi
 MAX_TRANSCRIPT_BYTES=2097152
 
 detect_codex_rainbow() {
@@ -331,7 +357,14 @@ detect_claude_rainbow() {
   esac
 }
 
-if [ "$CLIENT" = "codex" ]; then
+if [ "$IS_SUBAGENT" = true ]; then
+  # Child agents inherit the root terminal's Zellij pane but have a different
+  # session ID and may use a different effort. Keep their activity updates
+  # without letting them replace the root session's tab mode.
+  SESSION_ID=""
+  RAINBOW_NAME=null
+  RAINBOW_MODE_MARKER=""
+elif [ "$CLIENT" = "codex" ]; then
   RAINBOW_NAME=$(detect_codex_rainbow)
   RAINBOW_MODE_MARKER=""
 else
@@ -357,6 +390,7 @@ PAYLOAD=$(jq -nc \
   --arg ts_ms "$TS_MS" \
   --argjson rainbow_name "$RAINBOW_NAME" \
   --arg rainbow_mode_marker "$RAINBOW_MODE_MARKER" \
+  --argjson is_subagent "$IS_SUBAGENT" \
   '{
     pane_id: ($pane_id | tonumber),
     session_id: $session_id,
@@ -366,6 +400,7 @@ PAYLOAD=$(jq -nc \
     zellij_session: $zellij_session,
     term_program: (if $term_program == "" then null else $term_program end),
     ts_ms: ($ts_ms | tonumber),
+    is_subagent: $is_subagent,
     rainbow_name: $rainbow_name,
     rainbow_mode_marker: (
       if $rainbow_mode_marker == ""

@@ -60,6 +60,8 @@ pub struct HookPayload {
     pub term_program: Option<String>,
     pub ts_ms: Option<u64>,
     #[serde(default)]
+    pub is_subagent: bool,
+    #[serde(default)]
     pub rainbow_name: Option<bool>,
     #[serde(default)]
     pub rainbow_mode_marker: Option<String>,

@@ -60,6 +60,7 @@ mod state {
         pub zellij_session: Option<String>,
         pub term_program: Option<String>,
         pub ts_ms: Option<u64>,
+        pub is_subagent: bool,
         pub rainbow_name: Option<bool>,
         pub rainbow_mode_marker: Option<String>,
     }
@@ -92,7 +93,7 @@ mod state {
 #[path = "../src/event_handler.rs"]
 mod event_handler;
 
-use state::{HookPayload, State};
+use state::{Activity, HookPayload, State};
 
 fn payload(
     session_id: &str,
@@ -109,6 +110,7 @@ fn payload(
         zellij_session: None,
         term_program: None,
         ts_ms: Some(ts_ms),
+        is_subagent: false,
         rainbow_name,
         rainbow_mode_marker: marker.map(str::to_string),
     }
@@ -191,4 +193,44 @@ fn session_start_resets_state_even_when_a_resumed_session_reuses_its_id() {
     event_handler::handle_hook_event(&mut state, resumed);
 
     assert!(state.sessions.get(&7).unwrap().rainbow_name);
+}
+
+#[test]
+fn child_agents_never_replace_the_root_session_or_its_rainbow_mode() {
+    let mut state = State::default();
+
+    let mut early_child = payload("child-before-sync", Some(false), None, 1);
+    early_child.hook_event = "PreToolUse".to_string();
+    early_child.is_subagent = true;
+    event_handler::handle_hook_event(&mut state, early_child);
+    assert!(state.sessions.is_empty());
+
+    event_handler::handle_hook_event(
+        &mut state,
+        payload("root-ultra", Some(true), Some("ultra"), 2),
+    );
+
+    let mut child_tool = payload("child-xhigh", Some(false), None, 3);
+    child_tool.hook_event = "PreToolUse".to_string();
+    child_tool.tool_name = Some("Read".to_string());
+    child_tool.is_subagent = true;
+    event_handler::handle_hook_event(&mut state, child_tool);
+
+    let session = state.sessions.get(&7).unwrap();
+    assert_eq!(session.session_id, "root-ultra");
+    assert!(session.rainbow_name);
+    assert_eq!(session.activity, Activity::Tool("Read".to_string()));
+
+    let mut child_stop = payload("child-xhigh", None, None, 4);
+    child_stop.hook_event = "SubagentStop".to_string();
+    child_stop.is_subagent = true;
+    event_handler::handle_hook_event(&mut state, child_stop);
+
+    let session = state.sessions.get(&7).unwrap();
+    assert_eq!(session.session_id, "root-ultra");
+    assert!(session.rainbow_name);
+    assert_eq!(session.activity, Activity::AgentDone);
+
+    event_handler::handle_hook_event(&mut state, payload("root-ultra", Some(false), None, 5));
+    assert!(!state.sessions.get(&7).unwrap().rainbow_name);
 }

@@ -377,7 +377,7 @@ fn rainbow_letters_are_contrast_checked_against_the_gruvbox_tab_pair() {
 }
 
 #[test]
-fn permission_flash_uses_gruvbox_error_background_and_suppresses_rainbow() {
+fn permission_flash_uses_gruvbox_error_background_and_preserves_rainbow() {
     let mut state = State {
         zellij_styling: Some(gruvbox_dark()),
         tabs: vec![tab(0, "agent", true)],
@@ -401,10 +401,27 @@ fn permission_flash_uses_gruvbox_error_background_and_suppresses_rainbow() {
     state.flash_deadlines.insert(7, 2_000);
 
     let output = render::build_status_bar(&mut state, 1, 80);
+    let color = rainbow::ensure_contrast(
+        rainbow::rainbow_rgb(1_000, 0, 0, false),
+        (204, 36, 29),
+        (251, 241, 199),
+    );
+    let mut expected = String::new();
+    rainbow::write_rainbow(
+        &mut expected,
+        "agent",
+        1_000,
+        0,
+        false,
+        Some((204, 36, 29)),
+        Some((251, 241, 199)),
+    )
+    .unwrap();
 
     assert!(output.contains("\x1b[48;2;204;36;29m"));
     assert!(output.contains("\x1b[48;2;204;36;29m \x1b[38;2;251;241;199m⚠"));
-    assert!(output.contains("\x1b[38;2;251;241;199m⚠ \x1b[1m\x1b[38;2;251;241;199magent"));
+    assert!(output.contains(&expected));
+    assert!(rainbow::contrast_ratio(color, (204, 36, 29)) >= 4.5);
 }
 
 #[test]
