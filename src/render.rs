@@ -1,4 +1,5 @@
 use crate::session_selection::{session_to_display, session_to_focus};
+use crate::tool_symbol::tool_symbol;
 use crate::state::{
     unix_now, unix_now_ms, Activity, ClickRegion, FlashMode, MenuAction, MenuClickRegion,
     NotifyMode, SessionInfo, SettingKey, State, ViewMode,
@@ -18,17 +19,12 @@ fn activity_style(activity: &Activity) -> Style {
     match activity {
         Activity::Init => Style { symbol: "◆", r: 180, g: 175, b: 195 },
         Activity::Thinking => Style { symbol: "●", r: 180, g: 140, b: 255 },
-        Activity::Tool(name) => {
-            let symbol = match name.as_str() {
-                "Bash" => "⚡",
-                "Read" | "Glob" | "Grep" => "◉",
-                "Edit" | "Write" | "apply_patch" => "✎",
-                "Task" | "Agent" | "spawn_agent" => "⊜",
-                "WebSearch" | "WebFetch" => "◈",
-                _ => "⚙",
-            };
-            Style { symbol, r: 255, g: 170, b: 50 }
-        }
+        Activity::Tool(name) => Style {
+            symbol: tool_symbol(name),
+            r: 255,
+            g: 170,
+            b: 50,
+        },
         Activity::Prompting => Style { symbol: "▶", r: 80, g: 200, b: 120 },
         Activity::Waiting => Style { symbol: "⚠", r: 255, g: 60, b: 60 },
         Activity::Notification => Style { symbol: "◇", r: 200, g: 200, b: 100 },

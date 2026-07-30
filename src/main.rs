@@ -4,6 +4,7 @@ mod render;
 mod session_selection;
 mod state;
 mod tab_pane_map;
+mod tool_symbol;
 
 use state::{unix_now, unix_now_ms, HookPayload, MenuAction, SessionInfo, Settings, State, ViewMode};
 use std::collections::BTreeMap;
@@ -379,3 +380,13 @@ impl State {
         }
     }
 }
+
+/// zellij-tile links against a wasm host import that does not exist when the
+/// crate is built for the host triple, so `cargo test` could not link the binary
+/// at all and the test suite was unrunnable. Stub it for non-wasm builds —
+/// `#[cfg(test)]` is not enough, because the presence of a `tests/` directory
+/// makes cargo build the plain binary too. Never reached: the pure logic under
+/// test does not call into the host.
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+extern "C" fn host_run_plugin_command() {}
