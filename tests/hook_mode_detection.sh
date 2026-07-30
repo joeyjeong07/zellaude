@@ -161,6 +161,24 @@ run_hook codex "$(jq -nc \
   '{session_id:"codex-missing-turn",hook_event_name:"PreToolUse",turn_id:"missing-turn",transcript_path:$transcript}')" \
   null
 
+CODEX_LONG_TRANSCRIPT="$TEST_DIR/codex-long.jsonl"
+cat > "$CODEX_LONG_TRANSCRIPT" <<'CODEX_LONG_JSONL'
+{"type":"turn_context","payload":{"turn_id":"turn-long-ultra","effort":"ultra"}}
+CODEX_LONG_JSONL
+{
+  printf '{"type":"response_item","payload":"'
+  head -c 2200000 /dev/zero | tr '\0' x
+  printf '"}\n'
+} >> "$CODEX_LONG_TRANSCRIPT"
+run_hook codex "$(jq -nc \
+  --arg transcript "$CODEX_LONG_TRANSCRIPT" \
+  '{session_id:"codex-long",hook_event_name:"PreToolUse",turn_id:"turn-long-ultra",transcript_path:$transcript}')" \
+  true
+run_hook codex "$(jq -nc \
+  --arg transcript "$CODEX_LONG_TRANSCRIPT" \
+  '{session_id:"codex-long-resume",hook_event_name:"SessionStart",transcript_path:$transcript}')" \
+  true
+
 CODEX_AGENT_TRANSCRIPT="$TEST_DIR/codex-agent.jsonl"
 cat > "$CODEX_AGENT_TRANSCRIPT" <<'CODEX_AGENT_JSONL'
 {"timestamp":"2026-07-30T00:00:00Z","type":"turn_context","payload":{"turn_id":"child-turn","model":"gpt-test","effort":"ultra"}}

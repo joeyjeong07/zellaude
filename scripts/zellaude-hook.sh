@@ -73,6 +73,40 @@ if [ "$IS_SUBAGENT" = false ] &&
 fi
 MAX_TRANSCRIPT_BYTES=2097152
 
+parse_codex_transcript_effort() {
+  local requested_turn_id=$1
+
+  jq -Rnr --arg turn_id "$requested_turn_id" '
+    [
+        inputs
+        | fromjson?
+        | select(.type == "turn_context")
+        | {
+            turn_id: (.payload.turn_id? // ""),
+            effort: (
+              .payload.effort?
+              // .payload.reasoning_effort?
+              // empty
+            )
+          }
+        | select(.effort | type == "string")
+      ] as $contexts
+    | (
+        if $turn_id == "" then
+          $contexts | last
+        else
+          [
+            $contexts[]
+            | select(.turn_id == $turn_id)
+          ]
+          | last
+        end
+      ) // {}
+    | .effort // empty
+    | ascii_downcase
+  ' 2>/dev/null
+}
+
 detect_codex_rainbow() {
   local direct_effort transcript_effort
 
@@ -95,39 +129,34 @@ detect_codex_rainbow() {
   # Codex 0.146 does not put reasoning effort in hook stdin. Its current
   # turn_context is written to the supplied JSONL transcript before hooks run.
   [ -r "$TRANSCRIPT_PATH" ] || { printf 'null'; return; }
-  transcript_effort=$(
-    tail -n 512 "$TRANSCRIPT_PATH" 2>/dev/null |
-      tail -c "$MAX_TRANSCRIPT_BYTES" |
-      jq -Rnr --arg turn_id "$TURN_ID" '
-        [
-            inputs
-            | fromjson?
-            | select(.type == "turn_context")
-            | {
-                turn_id: (.payload.turn_id? // ""),
-                effort: (
-                  .payload.effort?
-                  // .payload.reasoning_effort?
-                  // empty
-                )
-              }
-            | select(.effort | type == "string")
-          ] as $contexts
-        | (
-            if $turn_id == "" then
-              $contexts | last
-            else
-              [
-                $contexts[]
-                | select(.turn_id == $turn_id)
-              ]
-              | last
-            end
-          ) // {}
-        | .effort // empty
-        | ascii_downcase
-      ' 2>/dev/null
-  )
+  transcript_effort=""
+
+  # Long-running sessions can append thousands of lines after the root turn
+  # while background agents finish. Locate an exact turn anywhere in the file
+  # before falling back to the bounded recent window.
+  if [ -n "$TURN_ID" ]; then
+    transcript_effort=$(
+      grep -F -- "$TURN_ID" "$TRANSCRIPT_PATH" 2>/dev/null |
+        parse_codex_transcript_effort "$TURN_ID"
+    )
+  fi
+
+  if [ -z "$transcript_effort" ]; then
+    transcript_effort=$(
+      tail -c "$MAX_TRANSCRIPT_BYTES" "$TRANSCRIPT_PATH" 2>/dev/null |
+        parse_codex_transcript_effort "$TURN_ID"
+    )
+  fi
+
+  # A resumed idle session may not supply a turn ID and its latest context can
+  # be older than the bounded window. Only pay for a full scan in that rare
+  # fallback case, filtering before jq so large tool outputs are not parsed.
+  if [ -z "$transcript_effort" ]; then
+    transcript_effort=$(
+      grep -F 'turn_context' "$TRANSCRIPT_PATH" 2>/dev/null |
+        parse_codex_transcript_effort "$TURN_ID"
+    )
+  fi
 
   if [ -z "$transcript_effort" ]; then
     printf 'null'
