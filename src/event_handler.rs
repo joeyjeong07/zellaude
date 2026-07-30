@@ -11,9 +11,21 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
 
     let event = payload.hook_event.as_str();
 
-    // SessionEnd → remove session (never drop: terminal cleanup)
+    // SessionEnd → remove this session. Ignore a late end event from a process
+    // that has already been replaced by a newer agent session in the pane.
     if event == "SessionEnd" {
-        state.sessions.remove(&payload.pane_id);
+        let should_remove = state
+            .sessions
+            .get(&payload.pane_id)
+            .map(|session| {
+                payload.session_id.as_deref().unwrap_or_default().is_empty()
+                    || session.session_id.is_empty()
+                    || payload.session_id.as_deref() == Some(session.session_id.as_str())
+            })
+            .unwrap_or(false);
+        if should_remove {
+            state.sessions.remove(&payload.pane_id);
+        }
         return;
     }
 
@@ -30,6 +42,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
 
     let activity = match event {
         "SessionStart" => Activity::Init,
+        "SubagentStart" => Activity::Tool("Task".to_string()),
         "PreToolUse" => {
             Activity::Tool(payload.tool_name.clone().unwrap_or_default())
         }

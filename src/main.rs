@@ -1,6 +1,7 @@
 mod event_handler;
 mod installer;
 mod render;
+mod session_selection;
 mod state;
 mod tab_pane_map;
 
@@ -84,8 +85,8 @@ impl ZellijPlugin for State {
                     ViewMode::Normal => {
                         for region in &self.click_regions {
                             if col >= region.start_col && col < region.end_col {
-                                if region.is_waiting {
-                                    focus_terminal_pane(region.pane_id, false);
+                                if let Some(pane_id) = region.focus_pane_id {
+                                    focus_terminal_pane(pane_id, false);
                                 } else {
                                     switch_tab_to(region.tab_index as u32 + 1);
                                 }
@@ -140,7 +141,7 @@ impl ZellijPlugin for State {
                         self.config_loaded = true;
                         true
                     }
-                    Some("install_hooks") => {
+                    Some("install_hooks") if exit_code == Some(0) => {
                         self.hooks_installed = true;
                         false
                     }
@@ -169,7 +170,7 @@ impl ZellijPlugin for State {
                 if !self.config_loaded {
                     self.load_config();
                 }
-                // Auto-install hook script and register Claude Code hooks
+                // Auto-install the bridge and register Claude Code/Codex hooks
                 if !self.hooks_installed {
                     installer::run_install();
                 }
@@ -365,7 +366,7 @@ impl State {
             let dominated = self
                 .sessions
                 .get(&pane_id)
-                .map(|existing| session.last_event_ts > existing.last_event_ts)
+                .map(|existing| session_selection::is_newer_than(&session, existing))
                 .unwrap_or(true);
             if dominated {
                 // Refresh tab name from our local pane map

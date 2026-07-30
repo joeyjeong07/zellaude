@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# install-hooks.sh — Add zellaude hook entries to ~/.claude/settings.json
+# install-hooks.sh — Install the bridge and register Claude Code/Codex hooks
 #
 # Usage: ./scripts/install-hooks.sh [--uninstall]
 set -euo pipefail
 
-SETTINGS="$HOME/.claude/settings.json"
-HOOK_SCRIPT="$(cd "$(dirname "$0")" && pwd)/zellaude-hook.sh"
-HOOK_CMD='${HOME}/.config/zellij/plugins/zellaude-hook.sh'
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CODEX_CONFIG_DIR="${CODEX_HOME:-$HOME/.codex}"
+CODEX_HOOKS="$CODEX_CONFIG_DIR/hooks.json"
+SOURCE_HOOK="$(cd "$(dirname "$0")" && pwd)/zellaude-hook.sh"
+INSTALLED_HOOK="$HOME/.config/zellij/plugins/zellaude-hook.sh"
+CLAUDE_HOOK_CMD='${HOME}/.config/zellij/plugins/zellaude-hook.sh'
+CODEX_HOOK_CMD='${HOME}/.config/zellij/plugins/zellaude-hook.sh --client codex'
+
+CLAUDE_EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","UserPromptSubmit","PermissionRequest","Notification","Stop","SubagentStart","SubagentStop","SessionStart","SessionEnd"]'
+CODEX_EVENTS='["PreToolUse","PostToolUse","UserPromptSubmit","PermissionRequest","Stop","SubagentStart","SubagentStop","SessionStart","SessionEnd"]'
 
 resolve_file_symlink() {
   local path dir target
@@ -23,8 +30,11 @@ resolve_file_symlink() {
   printf '%s/%s\n' "$dir" "$(basename "$path")"
 }
 
-if [ -L "$SETTINGS" ]; then
-  SETTINGS="$(resolve_file_symlink "$SETTINGS")"
+if [ -L "$CLAUDE_SETTINGS" ]; then
+  CLAUDE_SETTINGS="$(resolve_file_symlink "$CLAUDE_SETTINGS")"
+fi
+if [ -L "$CODEX_HOOKS" ]; then
+  CODEX_HOOKS="$(resolve_file_symlink "$CODEX_HOOKS")"
 fi
 
 if ! command -v jq &>/dev/null; then
@@ -32,39 +42,31 @@ if ! command -v jq &>/dev/null; then
   exit 1
 fi
 
-if [ ! -f "$HOOK_SCRIPT" ]; then
-  echo "Error: Hook script not found at $HOOK_SCRIPT" >&2
+if [ ! -f "$SOURCE_HOOK" ]; then
+  echo "Error: Hook script not found at $SOURCE_HOOK" >&2
   exit 1
 fi
 
-# The hook entry shared by all events
-HOOK_ENTRY=$(jq -nc --arg cmd "$HOOK_CMD" '[{
-  "hooks": [{
-    "type": "command",
-    "command": $cmd,
-    "timeout": 5,
-    "async": true
-  }]
-}]')
-
-EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","UserPromptSubmit","PermissionRequest","Notification","Stop","SubagentStop","SessionStart","SessionEnd"]'
-
-backup_settings() {
-  if [ -f "$SETTINGS" ]; then
-    cp "$SETTINGS" "$SETTINGS.bak"
-    echo "Backed up $SETTINGS to $SETTINGS.bak"
+backup_file() {
+  local file=$1
+  if [ -f "$file" ]; then
+    cp "$file" "$file.bak"
+    echo "Backed up $file to $file.bak"
   fi
 }
 
-uninstall() {
-  if [ ! -f "$SETTINGS" ]; then
-    echo "No settings file found at $SETTINGS"
-    exit 0
+ensure_json_file() {
+  local file=$1
+  if [ ! -f "$file" ]; then
+    mkdir -p "$(dirname "$file")"
+    echo '{}' > "$file"
   fi
+}
 
-  backup_settings
+remove_zellaude_entries() {
+  local file=$1
+  [ -f "$file" ] || return 0
 
-  # Remove only zellaude hook entries
   local tmp
   tmp=$(mktemp)
   jq '
@@ -72,41 +74,97 @@ uninstall() {
       .hooks |= with_entries(
         .value |= [
           .[] | . as $group |
-          ($group.hooks // []) | map(select((.command // "") | endswith("zellaude-hook.sh") | not)) |
-          . as $filtered |
+          ($group.hooks // [])
+            | map(select(((.command // "") | contains("zellaude-hook.sh")) | not))
+            | . as $filtered |
           if length > 0 then ($group | .hooks = $filtered) else empty end
         ]
-      ) | .hooks |= with_entries(select(.value | length > 0)) |
+      ) |
+      .hooks |= with_entries(select(.value | length > 0)) |
       if .hooks == {} then del(.hooks) else . end
-    else . end
-  ' "$SETTINGS" > "$tmp"
-  mv "$tmp" "$SETTINGS"
-  echo "Uninstalled zellaude hooks from $SETTINGS"
+    else
+      .
+    end
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+add_hook_entries() {
+  local file=$1
+  local events=$2
+  local entry=$3
+  local tmp
+  tmp=$(mktemp)
+  jq --argjson events "$events" --argjson entry "$entry" '
+    .hooks //= {} |
+    reduce ($events[]) as $event (
+      .;
+      .hooks[$event] = (.hooks[$event] // []) + $entry
+    )
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+uninstall() {
+  local found=false
+  for file in "$CLAUDE_SETTINGS" "$CODEX_HOOKS"; do
+    if [ -f "$file" ]; then
+      found=true
+      backup_file "$file"
+      remove_zellaude_entries "$file"
+      echo "Uninstalled zellaude hooks from $file"
+    fi
+  done
+
+  if [ -f "$INSTALLED_HOOK" ]; then
+    found=true
+    rm -f "$INSTALLED_HOOK"
+    echo "Removed $INSTALLED_HOOK"
+  fi
+
+  if [ "$found" = false ]; then
+    echo "No zellaude hooks found"
+  fi
 }
 
 install() {
-  # Create settings file if it doesn't exist
-  if [ ! -f "$SETTINGS" ]; then
-    mkdir -p "$(dirname "$SETTINGS")"
-    echo '{}' > "$SETTINGS"
-  fi
+  mkdir -p "$(dirname "$INSTALLED_HOOK")"
+  cp "$SOURCE_HOOK" "$INSTALLED_HOOK"
+  chmod +x "$INSTALLED_HOOK"
 
-  backup_settings
+  ensure_json_file "$CLAUDE_SETTINGS"
+  ensure_json_file "$CODEX_HOOKS"
+  backup_file "$CLAUDE_SETTINGS"
+  backup_file "$CODEX_HOOKS"
 
-  # First uninstall any existing zellaude hooks to avoid duplicates
-  uninstall 2>/dev/null || true
+  # Replace only zellaude's handlers, preserving all unrelated hook groups.
+  remove_zellaude_entries "$CLAUDE_SETTINGS"
+  remove_zellaude_entries "$CODEX_HOOKS"
 
-  # Add hook entries for each event
-  local tmp
-  tmp=$(mktemp)
-  jq --argjson events "$EVENTS" --argjson entry "$HOOK_ENTRY" '
-    .hooks //= {} |
-    reduce ($events[]) as $event (.; .hooks[$event] = (.hooks[$event] // []) + $entry)
-  ' "$SETTINGS" > "$tmp"
-  mv "$tmp" "$SETTINGS"
-  echo "Installed zellaude hooks into $SETTINGS"
-  echo "Hook script: $HOOK_SCRIPT"
-  echo "Events: PreToolUse, PostToolUse, UserPromptSubmit, PermissionRequest, Notification, Stop, SubagentStop, SessionStart, SessionEnd"
+  local claude_entry codex_entry
+  claude_entry=$(jq -nc --arg cmd "$CLAUDE_HOOK_CMD" '[{
+    "hooks": [{
+      "type": "command",
+      "command": $cmd,
+      "timeout": 5,
+      "async": true
+    }]
+  }]')
+  codex_entry=$(jq -nc --arg cmd "$CODEX_HOOK_CMD" '[{
+    "hooks": [{
+      "type": "command",
+      "command": $cmd,
+      "timeout": 3
+    }]
+  }]')
+
+  add_hook_entries "$CLAUDE_SETTINGS" "$CLAUDE_EVENTS" "$claude_entry"
+  add_hook_entries "$CODEX_HOOKS" "$CODEX_EVENTS" "$codex_entry"
+
+  echo "Installed zellaude bridge: $INSTALLED_HOOK"
+  echo "Installed Claude Code hooks: $CLAUDE_SETTINGS"
+  echo "Installed Codex hooks: $CODEX_HOOKS"
+  echo "Codex will ask you to review and trust the new hooks once via /hooks."
 }
 
 case "${1:-}" in

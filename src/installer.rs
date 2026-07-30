@@ -17,8 +17,11 @@ fn hook_script_content() -> String {
 
 const INSTALL_TEMPLATE: &str = r##"set -e
 HOOK_PATH="$HOME/.config/zellij/plugins/zellaude-hook.sh"
-HOOK_CMD='${HOME}/.config/zellij/plugins/zellaude-hook.sh'
-SETTINGS="$HOME/.claude/settings.json"
+CLAUDE_HOOK_CMD='${HOME}/.config/zellij/plugins/zellaude-hook.sh'
+CODEX_HOOK_CMD='${HOME}/.config/zellij/plugins/zellaude-hook.sh --client codex'
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CODEX_CONFIG_DIR="${CODEX_HOME:-$HOME/.codex}"
+CODEX_HOOKS="$CODEX_CONFIG_DIR/hooks.json"
 
 resolve_file_symlink() {
   path=$1
@@ -34,14 +37,20 @@ resolve_file_symlink() {
   printf '%s/%s\n' "$dir" "$(basename "$path")"
 }
 
-# Resolve symlink so mv doesn't replace the link with a regular file
-if [ -L "$SETTINGS" ]; then
-  SETTINGS="$(resolve_file_symlink "$SETTINGS")"
+# Resolve symlinks so mv doesn't replace them with regular files
+if [ -L "$CLAUDE_SETTINGS" ]; then
+  CLAUDE_SETTINGS="$(resolve_file_symlink "$CLAUDE_SETTINGS")"
+fi
+if [ -L "$CODEX_HOOKS" ]; then
+  CODEX_HOOKS="$(resolve_file_symlink "$CODEX_HOOKS")"
 fi
 
 # Check if already current
 if grep -qF '__VERSION_TAG__' "$HOOK_PATH" 2>/dev/null; then
-  if [ -f "$SETTINGS" ] && grep -qF "$HOOK_CMD" "$SETTINGS" 2>/dev/null; then
+  if [ -f "$CLAUDE_SETTINGS" ] &&
+     grep -qF "$CLAUDE_HOOK_CMD" "$CLAUDE_SETTINGS" 2>/dev/null &&
+     [ -f "$CODEX_HOOKS" ] &&
+     grep -qF "$CODEX_HOOK_CMD" "$CODEX_HOOKS" 2>/dev/null; then
     echo "current"
     exit 0
   fi
@@ -57,41 +66,72 @@ chmod +x "$HOOK_PATH"
 # Register hooks (requires jq)
 if ! command -v jq >/dev/null 2>&1; then
   echo "no_jq"
-  exit 0
+  exit 1
 fi
 
-if [ ! -f "$SETTINGS" ]; then
-  mkdir -p "$HOME/.claude"
-  echo '{}' > "$SETTINGS"
-fi
+ensure_json_file() {
+  file=$1
+  if [ ! -f "$file" ]; then
+    mkdir -p "$(dirname "$file")"
+    echo '{}' > "$file"
+  fi
+}
 
-# Back up settings before modifying
-cp "$SETTINGS" "$SETTINGS.bak"
+remove_zellaude_entries() {
+  file=$1
+  tmp=$(mktemp)
+  jq '
+    if .hooks and (.hooks | type == "object") then
+      .hooks |= with_entries(
+        .value |= [
+          .[] | . as $group |
+          ($group.hooks // [])
+            | map(select(((.command // "") | contains("zellaude-hook.sh")) | not))
+            | . as $filtered |
+          if length > 0 then ($group | .hooks = $filtered) else empty end
+        ]
+      ) |
+      .hooks |= with_entries(select(.value | length > 0)) |
+      if .hooks == {} then del(.hooks) else . end
+    else
+      .
+    end
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
 
-# Remove ALL existing zellaude hook entries (any path ending in zellaude-hook.sh)
-tmp=$(mktemp)
-jq '
-  if .hooks and (.hooks | type == "object") then
-    .hooks |= with_entries(
-      .value |= [
-        .[] | . as $group |
-        ($group.hooks // []) | map(select((.command // "") | endswith("zellaude-hook.sh") | not)) |
-        . as $filtered |
-        if length > 0 then ($group | .hooks = $filtered) else empty end
-      ]
-    ) | .hooks |= with_entries(select(.value | length > 0)) |
-    if .hooks == {} then del(.hooks) else . end
-  else . end
-' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
+add_hook_entries() {
+  file=$1
+  events=$2
+  entry=$3
+  tmp=$(mktemp)
+  jq --argjson events "$events" --argjson entry "$entry" '
+    .hooks //= {} |
+    reduce ($events[]) as $event (
+      .;
+      .hooks[$event] = (.hooks[$event] // []) + $entry
+    )
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+ensure_json_file "$CLAUDE_SETTINGS"
+ensure_json_file "$CODEX_HOOKS"
+
+# Back up both user configuration files before modifying them
+cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak"
+cp "$CODEX_HOOKS" "$CODEX_HOOKS.bak"
+
+# Replace only zellaude handlers and preserve unrelated hook groups
+remove_zellaude_entries "$CLAUDE_SETTINGS"
+remove_zellaude_entries "$CODEX_HOOKS"
 
 # Add new hook entries with literal ${HOME} to keep settings portable
-EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","UserPromptSubmit","PermissionRequest","Notification","Stop","SubagentStop","SessionStart","SessionEnd"]'
-ENTRY=$(jq -nc --arg cmd "$HOOK_CMD" '[{"hooks": [{"type": "command", "command": $cmd, "timeout": 5, "async": true}]}]')
-tmp=$(mktemp)
-jq --argjson events "$EVENTS" --argjson entry "$ENTRY" '
-  .hooks //= {} |
-  reduce ($events[]) as $event (.; .hooks[$event] = (.hooks[$event] // []) + $entry)
-' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
+CLAUDE_EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","UserPromptSubmit","PermissionRequest","Notification","Stop","SubagentStart","SubagentStop","SessionStart","SessionEnd"]'
+CODEX_EVENTS='["PreToolUse","PostToolUse","UserPromptSubmit","PermissionRequest","Stop","SubagentStart","SubagentStop","SessionStart","SessionEnd"]'
+CLAUDE_ENTRY=$(jq -nc --arg cmd "$CLAUDE_HOOK_CMD" '[{"hooks": [{"type": "command", "command": $cmd, "timeout": 5, "async": true}]}]')
+CODEX_ENTRY=$(jq -nc --arg cmd "$CODEX_HOOK_CMD" '[{"hooks": [{"type": "command", "command": $cmd, "timeout": 3}]}]')
+
+add_hook_entries "$CLAUDE_SETTINGS" "$CLAUDE_EVENTS" "$CLAUDE_ENTRY"
+add_hook_entries "$CODEX_HOOKS" "$CODEX_EVENTS" "$CODEX_ENTRY"
 
 echo "installed"
 "##;

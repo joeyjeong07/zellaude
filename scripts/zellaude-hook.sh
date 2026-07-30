@@ -1,28 +1,48 @@
 #!/usr/bin/env bash
-# zellaude-hook.sh — Claude Code hook → zellij pipe bridge
-# Forwards hook events to the zellaude Zellij plugin via pipe.
+# zellaude-hook.sh — agent hook → zellij pipe bridge
+# Forwards Claude Code and Codex hook events to the zellaude Zellij plugin.
 #
-# Usage in ~/.claude/settings.json hooks:
-#   "command": "/path/to/zellaude-hook.sh"
+# Usage:
+#   Claude Code: "/path/to/zellaude-hook.sh"
+#   Codex:       "/path/to/zellaude-hook.sh --client codex"
+
+CLIENT="claude"
+if [ "${1:-}" = "--client" ] && [ -n "${2:-}" ]; then
+  CLIENT="$2"
+fi
+case "$CLIENT" in
+  codex) CLIENT_LABEL="Codex" ;;
+  *) CLIENT="claude"; CLIENT_LABEL="Claude Code" ;;
+esac
+
+# Read hook JSON from stdin before checking Zellij. Codex Stop hooks require
+# a JSON response even when there is no pane event to forward.
+INPUT=$(cat)
+HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty')
+
+finish() {
+  # Codex requires JSON stdout from these two hooks. An empty object leaves
+  # the agent flow unchanged.
+  if [ "$CLIENT" = "codex" ] &&
+     { [ "$HOOK_EVENT" = "Stop" ] || [ "$HOOK_EVENT" = "SubagentStop" ]; }; then
+    printf '{}\n'
+  fi
+  exit "${1:-0}"
+}
 
 # Exit silently if not running inside Zellij
-[ -z "$ZELLIJ_SESSION_NAME" ] && exit 0
-[ -z "$ZELLIJ_PANE_ID" ] && exit 0
+[ -z "${ZELLIJ_SESSION_NAME:-}" ] && finish 0
+[ -z "${ZELLIJ_PANE_ID:-}" ] && finish 0
+[ -z "$HOOK_EVENT" ] && finish 0
 
 # Capture send-time immediately so the plugin can order events
 # that race through parallel hook subprocesses.
 TS_MS=$(jq -nc 'now * 1000 | floor')
 
-# Read hook JSON from stdin
-INPUT=$(cat)
-
 # Extract fields with jq (required dependency)
-HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty')
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-
-[ -z "$HOOK_EVENT" ] && exit 0
 
 # Build compact JSON payload
 PAYLOAD=$(jq -nc \
@@ -97,7 +117,7 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
   if [ "$SHOULD_NOTIFY" = true ]; then
     TOOL_SUFFIX=""
     [ -n "$TOOL_NAME" ] && TOOL_SUFFIX=" — $TOOL_NAME"
-    TITLE="⚠ Claude Code"
+    TITLE="⚠ ${CLIENT_LABEL}"
     MESSAGE="Permission requested${TOOL_SUFFIX}"
 
     # Rate-limit: one notification per pane per 10 seconds
@@ -119,14 +139,15 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
             terminal-notifier \
               -title "$TITLE" \
               -message "$MESSAGE" \
-              -execute "$FOCUS_CMD" &
+              -execute "$FOCUS_CMD" >/dev/null 2>&1 &
           else
-            osascript -e "display notification \"$MESSAGE\" with title \"$TITLE\"" &
+            osascript -e "display notification \"$MESSAGE\" with title \"$TITLE\"" \
+              >/dev/null 2>&1 &
           fi
           ;;
         Linux)
           if command -v notify-send >/dev/null 2>&1; then
-            notify-send "$TITLE" "$MESSAGE" &
+            notify-send "$TITLE" "$MESSAGE" >/dev/null 2>&1 &
           fi
           ;;
       esac
@@ -134,5 +155,7 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
   fi
 fi
 
-# Send to plugin (hook is already async, no need to background)
-zellij pipe --name "zellaude" -- "$PAYLOAD"
+# Forwarding is best-effort: a missing Zellij session/plugin should never fail
+# the agent's own hook. Redirect output so Codex sees only the JSON it expects.
+zellij pipe --name "zellaude" -- "$PAYLOAD" >/dev/null 2>&1 || true
+finish 0

@@ -1,3 +1,4 @@
+use crate::session_selection::{session_to_display, session_to_focus};
 use crate::state::{
     unix_now, unix_now_ms, Activity, ClickRegion, FlashMode, MenuAction, MenuClickRegion,
     NotifyMode, SessionInfo, SettingKey, State, ViewMode,
@@ -13,20 +14,6 @@ struct Style {
     b: u8,
 }
 
-fn activity_priority(activity: &Activity) -> u8 {
-    match activity {
-        Activity::Waiting => 8,
-        Activity::Tool(_) => 7,
-        Activity::Thinking => 6,
-        Activity::Prompting => 5,
-        Activity::Notification => 4,
-        Activity::Init => 3,
-        Activity::Done => 2,
-        Activity::AgentDone => 1,
-        Activity::Idle => 0,
-    }
-}
-
 fn activity_style(activity: &Activity) -> Style {
     match activity {
         Activity::Init => Style { symbol: "◆", r: 180, g: 175, b: 195 },
@@ -35,8 +22,8 @@ fn activity_style(activity: &Activity) -> Style {
             let symbol = match name.as_str() {
                 "Bash" => "⚡",
                 "Read" | "Glob" | "Grep" => "◉",
-                "Edit" | "Write" => "✎",
-                "Task" => "⊜",
+                "Edit" | "Write" | "apply_patch" => "✎",
+                "Task" | "Agent" | "spawn_agent" => "⊜",
                 "WebSearch" | "WebFetch" => "◈",
                 _ => "⚙",
             };
@@ -243,19 +230,32 @@ fn render_tabs(
         return;
     }
 
-    // For each tab, find the best (highest-priority) Claude session
+    // For each tab, find the best session to display and the pane to focus.
     let best_sessions: Vec<Option<&SessionInfo>> = tabs
         .iter()
         .map(|tab| {
-            state
-                .sessions
-                .values()
-                .filter(|s| s.tab_index == Some(tab.position))
-                .max_by_key(|s| activity_priority(&s.activity))
+            session_to_display(
+                state
+                    .sessions
+                    .values()
+                    .filter(|s| s.tab_index == Some(tab.position)),
+            )
+        })
+        .collect();
+    let focus_pane_ids: Vec<Option<u32>> = tabs
+        .iter()
+        .map(|tab| {
+            session_to_focus(
+                state
+                    .sessions
+                    .values()
+                    .filter(|s| s.tab_index == Some(tab.position)),
+            )
+            .map(|session| session.pane_id)
         })
         .collect();
 
-    // Pre-compute elapsed strings (only for Claude tabs)
+    // Pre-compute elapsed strings (only for agent-aware tabs)
     let elapsed_strs: Vec<Option<String>> = best_sessions
         .iter()
         .map(|session: &Option<&SessionInfo>| {
@@ -299,7 +299,7 @@ fn render_tabs(
         }
 
         let session = best_sessions[i];
-        let is_claude = session.is_some();
+        let is_agent = session.is_some();
         let tab_name = &tab.name;
 
         // Truncate name
@@ -348,7 +348,7 @@ fn render_tabs(
         let tab_bg_str = bg(tab_bg.0, tab_bg.1, tab_bg.2);
         let region_start = *col;
 
-        if is_claude {
+        if is_agent {
             let s = session.unwrap();
             let style = activity_style(&s.activity);
 
@@ -393,22 +393,14 @@ fn render_tabs(
             let _ = write!(buf, " ");
             *col += 1;
 
-            // Click region: if any session is waiting, use its pane_id for focus
-            let waiting_session = state
-                .sessions
-                .values()
-                .filter(|s| s.tab_index == Some(tab.position))
-                .find(|s| matches!(s.activity, Activity::Waiting));
-
             state.click_regions.push(ClickRegion {
                 start_col: region_start,
                 end_col: *col,
                 tab_index: tab.position,
-                pane_id: waiting_session.map_or(0, |s| s.pane_id),
-                is_waiting: waiting_session.is_some(),
+                focus_pane_id: focus_pane_ids[i],
             });
         } else {
-            // Non-Claude tab: dimmer, no symbol
+            // Non-agent tab: dimmer, no symbol
             let name_fg = if is_active {
                 fg(220, 215, 230)
             } else {
@@ -441,8 +433,7 @@ fn render_tabs(
                 start_col: region_start,
                 end_col: *col,
                 tab_index: tab.position,
-                pane_id: 0,
-                is_waiting: false,
+                focus_pane_id: None,
             });
         }
 

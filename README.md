@@ -1,16 +1,16 @@
 # Zellaude
 
-A Zellij status bar plugin that replaces the default tab bar with Claude Code activity awareness.
+A Zellij status bar plugin that replaces the default tab bar with Claude Code and Codex activity awareness.
 
 ![Zellaude status bar example](assets/bar-example.svg)
 
 ## Features
 
-- **Full tab bar** — shows all Zellij tabs (not just Claude sessions), replacing the native tab bar
+- **Full tab bar** — shows all Zellij tabs (not just agent sessions), replacing the native tab bar
 - **Session & mode display** — shows the Zellij session name and current input mode (NORMAL, LOCKED, PANE, etc.) with color-coded indicators
-- **Live activity indicators** — see what every Claude Code session is doing at a glance; non-Claude tabs shown dimly
+- **Live activity indicators** — see what every Claude Code and Codex session is doing at a glance; non-agent tabs shown dimly
 - **Clickable tabs** — click any tab to switch to it
-- **Smart pane focus** — clicking a waiting (⚠) session focuses the exact pane so you can respond to the permission prompt immediately
+- **Smart pane focus** — clicking an agent-aware tab focuses its most recently active Claude Code or Codex pane, revealing it inside a stack; waiting (⚠) sessions retain priority
 - **Permission flash** — sessions pulse bright yellow for 2 seconds when a permission request arrives
 - **Desktop notifications** — macOS notification on permission requests (rate-limited to once per 10s per tab), with click-to-focus support via [terminal-notifier](https://github.com/julienXX/terminal-notifier)
 - **Elapsed time** — shows how long a session has been in its current state (after 30s), making it easy to spot stuck sessions
@@ -63,7 +63,9 @@ default_tab_template {
 }
 ```
 
-On first load, the plugin automatically installs the hook script and registers it with Claude Code. No cloning, no install scripts.
+On first load, the plugin automatically installs the hook script and registers it with Claude Code and Codex. No cloning, no install scripts.
+
+[Codex requires a one-time review](https://developers.openai.com/codex/hooks) before running newly installed user hooks. Start Codex, open `/hooks`, inspect the Zellaude handlers, and trust them.
 
 ### Build from source
 
@@ -114,11 +116,11 @@ Without it, notifications still appear via osascript but clicking them won't foc
 
 Two components:
 
-1. **WASM plugin** — runs inside Zellij, receives events, maintains state in memory, renders the status bar, sends desktop notifications. On first load, writes the hook script to `~/.config/zellij/plugins/zellaude-hook.sh` and registers it in `~/.claude/settings.json`.
-2. **Hook script** — a thin bash bridge that forwards Claude Code hook events to the plugin via `zellij pipe`
+1. **WASM plugin** — runs inside Zellij, receives events, maintains state in memory, renders the status bar, and sends desktop notifications. On first load, it writes the hook script to `~/.config/zellij/plugins/zellaude-hook.sh` and registers it in `~/.claude/settings.json` and `~/.codex/hooks.json`.
+2. **Hook script** — a thin bash bridge that forwards Claude Code and Codex hook events to the plugin via `zellij pipe`
 
 ```
-Claude Code hook → zellaude-hook.sh → zellij pipe → plugin → render
+Claude Code / Codex hook → zellaude-hook.sh → zellij pipe → plugin → render
 ```
 
 The hook script and registration are version-tagged and updated automatically when the plugin version changes.

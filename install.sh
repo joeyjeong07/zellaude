@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Build and install zellaude (Zellij plugin + Claude Code hooks)
+# install.sh — Build and install zellaude (Zellij plugin + agent hooks)
 #
 # Usage:
 #   ./install.sh            # install everything

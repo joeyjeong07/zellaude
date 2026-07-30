@@ -61,8 +61,7 @@ pub struct ClickRegion {
     pub start_col: usize,
     pub end_col: usize,
     pub tab_index: usize,
-    pub pane_id: u32,
-    pub is_waiting: bool,
+    pub focus_pane_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
