@@ -56,12 +56,15 @@ if grep -qF '__VERSION_TAG__' "$HOOK_PATH" 2>/dev/null; then
   fi
 fi
 
-# Write hook script
+# Write the hook script atomically so concurrent plugin instances cannot expose
+# a partially written bridge.
 mkdir -p "$(dirname "$HOOK_PATH")"
-cat > "$HOOK_PATH" << 'ZELLAUDE_HOOK_EOF'
+HOOK_TMP=$(mktemp "$(dirname "$HOOK_PATH")/.zellaude-hook.XXXXXX")
+cat > "$HOOK_TMP" << 'ZELLAUDE_HOOK_EOF'
 __HOOK_SCRIPT__
 ZELLAUDE_HOOK_EOF
-chmod +x "$HOOK_PATH"
+chmod +x "$HOOK_TMP"
+mv "$HOOK_TMP" "$HOOK_PATH"
 
 # Register hooks (requires jq)
 if ! command -v jq >/dev/null 2>&1; then
@@ -73,7 +76,9 @@ ensure_json_file() {
   file=$1
   if [ ! -f "$file" ]; then
     mkdir -p "$(dirname "$file")"
-    echo '{}' > "$file"
+    tmp=$(mktemp "$(dirname "$file")/.zellaude-hooks.XXXXXX")
+    printf '{}\n' > "$tmp"
+    mv "$tmp" "$file"
   fi
 }
 
@@ -99,12 +104,30 @@ remove_zellaude_entries() {
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
-add_hook_entries() {
+replace_zellaude_entries() {
   file=$1
   events=$2
   entry=$3
-  tmp=$(mktemp)
+  tmp=$(mktemp "$(dirname "$file")/.zellaude-hooks.XXXXXX")
   jq --argjson events "$events" --argjson entry "$entry" '
+    if ((.hooks // {}) | type) == "object" then
+      .hooks //= {}
+    else
+      .hooks = {}
+    end |
+    .hooks |= with_entries(
+      .value |= [
+        .[] | . as $group |
+        (($group.hooks // [])
+          | map(select(((.command // "") | contains("zellaude-hook.sh")) | not))
+        ) as $filtered |
+        if ($filtered | length) > 0
+        then ($group | .hooks = $filtered)
+        else empty
+        end
+      ]
+    ) |
+    .hooks |= with_entries(select(.value | length > 0)) |
     .hooks //= {} |
     reduce ($events[]) as $event (
       .;
@@ -117,12 +140,12 @@ ensure_json_file "$CLAUDE_SETTINGS"
 ensure_json_file "$CODEX_HOOKS"
 
 # Back up both user configuration files before modifying them
-cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak"
-cp "$CODEX_HOOKS" "$CODEX_HOOKS.bak"
-
-# Replace only zellaude handlers and preserve unrelated hook groups
-remove_zellaude_entries "$CLAUDE_SETTINGS"
-remove_zellaude_entries "$CODEX_HOOKS"
+CLAUDE_BACKUP_TMP=$(mktemp "$(dirname "$CLAUDE_SETTINGS")/.zellaude-backup.XXXXXX")
+CODEX_BACKUP_TMP=$(mktemp "$(dirname "$CODEX_HOOKS")/.zellaude-backup.XXXXXX")
+cp "$CLAUDE_SETTINGS" "$CLAUDE_BACKUP_TMP"
+cp "$CODEX_HOOKS" "$CODEX_BACKUP_TMP"
+mv "$CLAUDE_BACKUP_TMP" "$CLAUDE_SETTINGS.bak"
+mv "$CODEX_BACKUP_TMP" "$CODEX_HOOKS.bak"
 
 # Add new hook entries with literal ${HOME} to keep settings portable
 CLAUDE_EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","UserPromptSubmit","PermissionRequest","Notification","Stop","SubagentStart","SubagentStop","SessionStart","SessionEnd"]'
@@ -130,8 +153,10 @@ CODEX_EVENTS='["PreToolUse","PostToolUse","UserPromptSubmit","PermissionRequest"
 CLAUDE_ENTRY=$(jq -nc --arg cmd "$CLAUDE_HOOK_CMD" '[{"hooks": [{"type": "command", "command": $cmd, "timeout": 5, "async": true}]}]')
 CODEX_ENTRY=$(jq -nc --arg cmd "$CODEX_HOOK_CMD" '[{"hooks": [{"type": "command", "command": $cmd, "timeout": 3}]}]')
 
-add_hook_entries "$CLAUDE_SETTINGS" "$CLAUDE_EVENTS" "$CLAUDE_ENTRY"
-add_hook_entries "$CODEX_HOOKS" "$CODEX_EVENTS" "$CODEX_ENTRY"
+# Remove and replace zellaude handlers in one transaction per file. Several
+# status-bar instances can reach this installer at the same time after reload.
+replace_zellaude_entries "$CLAUDE_SETTINGS" "$CLAUDE_EVENTS" "$CLAUDE_ENTRY"
+replace_zellaude_entries "$CODEX_HOOKS" "$CODEX_EVENTS" "$CODEX_ENTRY"
 
 echo "installed"
 "##;

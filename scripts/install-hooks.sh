@@ -4,6 +4,8 @@
 # Usage: ./scripts/install-hooks.sh [--uninstall]
 set -euo pipefail
 
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PACKAGE_VERSION=$(awk -F '"' '/^version = "/ { print $2; exit }' "$PROJECT_DIR/Cargo.toml")
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CODEX_CONFIG_DIR="${CODEX_HOME:-$HOME/.codex}"
 CODEX_HOOKS="$CODEX_CONFIG_DIR/hooks.json"
@@ -46,20 +48,28 @@ if [ ! -f "$SOURCE_HOOK" ]; then
   echo "Error: Hook script not found at $SOURCE_HOOK" >&2
   exit 1
 fi
+if [ -z "$PACKAGE_VERSION" ]; then
+  echo "Error: Could not read the zellaude version from $PROJECT_DIR/Cargo.toml" >&2
+  exit 1
+fi
 
 backup_file() {
-  local file=$1
+  local file=$1 tmp
   if [ -f "$file" ]; then
-    cp "$file" "$file.bak"
+    tmp=$(mktemp "$(dirname "$file")/.zellaude-backup.XXXXXX")
+    cp "$file" "$tmp"
+    mv "$tmp" "$file.bak"
     echo "Backed up $file to $file.bak"
   fi
 }
 
 ensure_json_file() {
-  local file=$1
+  local file=$1 tmp
   if [ ! -f "$file" ]; then
     mkdir -p "$(dirname "$file")"
-    echo '{}' > "$file"
+    tmp=$(mktemp "$(dirname "$file")/.zellaude-hooks.XXXXXX")
+    printf '{}\n' > "$tmp"
+    mv "$tmp" "$file"
   fi
 }
 
@@ -68,7 +78,7 @@ remove_zellaude_entries() {
   [ -f "$file" ] || return 0
 
   local tmp
-  tmp=$(mktemp)
+  tmp=$(mktemp "$(dirname "$file")/.zellaude-hooks.XXXXXX")
   jq '
     if .hooks and (.hooks | type == "object") then
       .hooks |= with_entries(
@@ -89,13 +99,31 @@ remove_zellaude_entries() {
   mv "$tmp" "$file"
 }
 
-add_hook_entries() {
+replace_zellaude_entries() {
   local file=$1
   local events=$2
   local entry=$3
   local tmp
-  tmp=$(mktemp)
+  tmp=$(mktemp "$(dirname "$file")/.zellaude-hooks.XXXXXX")
   jq --argjson events "$events" --argjson entry "$entry" '
+    if ((.hooks // {}) | type) == "object" then
+      .hooks //= {}
+    else
+      .hooks = {}
+    end |
+    .hooks |= with_entries(
+      .value |= [
+        .[] | . as $group |
+        (($group.hooks // [])
+          | map(select(((.command // "") | contains("zellaude-hook.sh")) | not))
+        ) as $filtered |
+        if ($filtered | length) > 0
+        then ($group | .hooks = $filtered)
+        else empty
+        end
+      ]
+    ) |
+    .hooks |= with_entries(select(.value | length > 0)) |
     .hooks //= {} |
     reduce ($events[]) as $event (
       .;
@@ -128,18 +156,24 @@ uninstall() {
 }
 
 install() {
+  local hook_tmp
   mkdir -p "$(dirname "$INSTALLED_HOOK")"
-  cp "$SOURCE_HOOK" "$INSTALLED_HOOK"
-  chmod +x "$INSTALLED_HOOK"
+  hook_tmp=$(mktemp "$(dirname "$INSTALLED_HOOK")/.zellaude-hook.XXXXXX")
+  awk -v version="$PACKAGE_VERSION" '
+    NR == 1 {
+      print
+      print "# zellaude v" version
+      next
+    }
+    { print }
+  ' "$SOURCE_HOOK" > "$hook_tmp"
+  chmod +x "$hook_tmp"
+  mv "$hook_tmp" "$INSTALLED_HOOK"
 
   ensure_json_file "$CLAUDE_SETTINGS"
   ensure_json_file "$CODEX_HOOKS"
   backup_file "$CLAUDE_SETTINGS"
   backup_file "$CODEX_HOOKS"
-
-  # Replace only zellaude's handlers, preserving all unrelated hook groups.
-  remove_zellaude_entries "$CLAUDE_SETTINGS"
-  remove_zellaude_entries "$CODEX_HOOKS"
 
   local claude_entry codex_entry
   claude_entry=$(jq -nc --arg cmd "$CLAUDE_HOOK_CMD" '[{
@@ -158,8 +192,10 @@ install() {
     }]
   }]')
 
-  add_hook_entries "$CLAUDE_SETTINGS" "$CLAUDE_EVENTS" "$claude_entry"
-  add_hook_entries "$CODEX_HOOKS" "$CODEX_EVENTS" "$codex_entry"
+  # Remove and replace zellaude's handlers in one transaction per file. This
+  # stays idempotent when several plugin instances auto-install concurrently.
+  replace_zellaude_entries "$CLAUDE_SETTINGS" "$CLAUDE_EVENTS" "$claude_entry"
+  replace_zellaude_entries "$CODEX_HOOKS" "$CODEX_EVENTS" "$codex_entry"
 
   echo "Installed zellaude bridge: $INSTALLED_HOOK"
   echo "Installed Claude Code hooks: $CLAUDE_SETTINGS"
