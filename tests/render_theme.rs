@@ -164,7 +164,10 @@ mod state {
         pub cwd: Option<String>,
         pub last_ts_ms: u64,
         pub rainbow_name: bool,
+        pub rainbow_name_known: bool,
+        pub rainbow_mode_ts_ms: u64,
         pub rainbow_mode_marker: Option<String>,
+        pub restored: bool,
     }
 
     pub struct State {
@@ -360,7 +363,10 @@ fn rainbow_letters_are_contrast_checked_against_the_gruvbox_tab_pair() {
             cwd: None,
             last_ts_ms: 1_000,
             rainbow_name: true,
+            rainbow_name_known: true,
+            rainbow_mode_ts_ms: 1_000,
             rainbow_mode_marker: Some("ultra".to_string()),
+            restored: false,
         },
     );
 
@@ -395,7 +401,10 @@ fn permission_flash_uses_gruvbox_error_background_and_preserves_rainbow() {
             cwd: None,
             last_ts_ms: 1_000,
             rainbow_name: true,
+            rainbow_name_known: true,
+            rainbow_mode_ts_ms: 1_000,
             rainbow_mode_marker: Some("ultra".to_string()),
+            restored: false,
         },
     );
     state.flash_deadlines.insert(7, 2_000);

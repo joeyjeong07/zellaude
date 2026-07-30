@@ -6,10 +6,239 @@
 #   Claude Code: "/path/to/zellaude-hook.sh"
 #   Codex:       "/path/to/zellaude-hook.sh --client codex"
 
+path_owner_id() {
+  stat -c '%u' "$1" 2>/dev/null ||
+    stat -f '%u' "$1" 2>/dev/null
+}
+
+path_mode() {
+  stat -c '%a' "$1" 2>/dev/null ||
+    stat -f '%Lp' "$1" 2>/dev/null
+}
+
+is_owned_private_parent() {
+  local path=$1 expected_owner=$2 owner mode
+  [ -d "$path" ] && [ ! -L "$path" ] || return 1
+  owner=$(path_owner_id "$path") || return 1
+  [ "$owner" = "$expected_owner" ] || return 1
+  mode=$(path_mode "$path") || return 1
+  case "$mode" in
+    ''|*[!0-7]*) return 1 ;;
+  esac
+  while [ "${#mode}" -gt 3 ]; do
+    mode=${mode#?}
+  done
+  [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+ensure_private_cache_dir() {
+  local path=$1 expected_owner=$2 owner
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -d "$path" ] && [ ! -L "$path" ] || return 1
+  else
+    (umask 077 && mkdir "$path") 2>/dev/null || return 1
+  fi
+
+  owner=$(path_owner_id "$path") || return 1
+  [ "$owner" = "$expected_owner" ] || return 1
+  chmod 700 "$path" 2>/dev/null || return 1
+  is_owned_private_parent "$path" "$expected_owner"
+}
+
+state_cache_dir() {
+  local runtime_root cache_root cache_dir user_id home_cache
+  user_id=$(id -u 2>/dev/null) || return 1
+
+  runtime_root=${XDG_RUNTIME_DIR:-}
+  case "$runtime_root" in
+    /*)
+      if is_owned_private_parent "$runtime_root" "$user_id"; then
+        cache_dir="$runtime_root/zellaude-$user_id"
+        ensure_private_cache_dir "$cache_dir" "$user_id" || return 1
+        printf '%s\n' "$cache_dir"
+        return 0
+      fi
+      ;;
+  esac
+
+  case "${HOME:-}" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  home_cache="$HOME/.cache"
+  if [ ! -e "$home_cache" ] && [ ! -L "$home_cache" ]; then
+    (umask 077 && mkdir "$home_cache") 2>/dev/null || return 1
+  fi
+  is_owned_private_parent "$home_cache" "$user_id" || return 1
+
+  cache_root="$home_cache/zellaude"
+  ensure_private_cache_dir "$cache_root" "$user_id" || return 1
+  cache_dir="$cache_root/runtime"
+  ensure_private_cache_dir "$cache_dir" "$user_id" || return 1
+  printf '%s\n' "$cache_dir"
+}
+
+state_cache_key() {
+  local value=$1 safe digest hex
+  safe=$(printf '%s' "$value" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '_')
+  if [ -n "$safe" ] && [ "$safe" = "$value" ]; then
+    printf '%s\n' "$safe"
+    return 0
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$value" | sha256sum | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$value" | shasum -a 256 | awk '{print $1}')
+  elif command -v openssl >/dev/null 2>&1; then
+    digest=$(printf '%s' "$value" | openssl dgst -sha256 2>/dev/null |
+      awk '{print $NF}')
+  else
+    hex=$(printf '%s' "$value" | LC_ALL=C od -An -tx1 |
+      tr -d '[:space:]')
+    [ -n "$hex" ] && [ "${#hex}" -le 240 ] || return 1
+    digest="x$hex"
+  fi
+  [ -n "$digest" ] || return 1
+  # '~' cannot occur in an unhashed key, so hashed and literal names cannot
+  # collide even when one name is the sanitized spelling of another.
+  printf '~%s\n' "$digest"
+}
+
+path_mtime() {
+  stat -c '%Y' "$1" 2>/dev/null ||
+    stat -f '%m' "$1" 2>/dev/null
+}
+
+CACHE_LOCK_TOKEN=""
+
+acquire_cache_lock() {
+  local lock_dir=$1 attempt now owner_path owner_token owner_count
+  local owner_pid owner_started lock_mtime is_stale
+  attempt=0
+
+  while [ "$attempt" -lt 50 ]; do
+    now=$(date +%s 2>/dev/null) || now=0
+    CACHE_LOCK_TOKEN="owner.$$.$now.${RANDOM:-0}"
+    if (umask 077 && mkdir "$lock_dir") 2>/dev/null; then
+      if mkdir "$lock_dir/$CACHE_LOCK_TOKEN" 2>/dev/null; then
+        return 0
+      fi
+      rmdir "$lock_dir" 2>/dev/null || true
+      CACHE_LOCK_TOKEN=""
+      return 1
+    fi
+
+    [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 1
+    owner_path=""
+    owner_token=""
+    owner_count=0
+    for owner_path_candidate in "$lock_dir"/owner.*; do
+      [ -d "$owner_path_candidate" ] &&
+        [ ! -L "$owner_path_candidate" ] || continue
+      owner_count=$((owner_count + 1))
+      owner_path=$owner_path_candidate
+      owner_token=${owner_path_candidate##*/}
+    done
+
+    is_stale=false
+    if [ "$owner_count" -eq 1 ]; then
+      owner_pid=${owner_token#owner.}
+      owner_pid=${owner_pid%%.*}
+      owner_started=${owner_token#owner.*.}
+      owner_started=${owner_started%%.*}
+      case "$owner_pid:$owner_started:$now" in
+        *[!0-9:]*|:*|*::*|*:) ;;
+        *)
+          if ! kill -0 "$owner_pid" 2>/dev/null ||
+             [ $((now - owner_started)) -ge 15 ]; then
+            is_stale=true
+          fi
+          ;;
+      esac
+      if [ "$is_stale" = true ] &&
+         rmdir "$owner_path" 2>/dev/null; then
+        rmdir "$lock_dir" 2>/dev/null || true
+        continue
+      fi
+    elif [ "$owner_count" -eq 0 ]; then
+      lock_mtime=$(path_mtime "$lock_dir" 2>/dev/null) || lock_mtime=$now
+      case "$lock_mtime:$now" in
+        *[!0-9:]*|:*|*::*|*:) ;;
+        *)
+          if [ $((now - lock_mtime)) -ge 2 ] &&
+             rmdir "$lock_dir" 2>/dev/null; then
+            continue
+          fi
+          ;;
+      esac
+    fi
+
+    attempt=$((attempt + 1))
+    sleep 0.02
+  done
+
+  CACHE_LOCK_TOKEN=""
+  return 1
+}
+
+release_cache_lock() {
+  local lock_dir=$1
+  [ -n "$CACHE_LOCK_TOKEN" ] || return 0
+  rmdir "$lock_dir/$CACHE_LOCK_TOKEN" 2>/dev/null || true
+  rmdir "$lock_dir" 2>/dev/null || true
+  CACHE_LOCK_TOKEN=""
+}
+
+restore_cached_states() {
+  local session_name cache_dir session_key state_file
+  session_name=$1
+  [ -n "$session_name" ] || return 0
+  cache_dir=$(state_cache_dir) || return 0
+  session_key=$(state_cache_key "$session_name") || return 0
+
+  for state_file in "$cache_dir/$session_key".*.json; do
+    [ -f "$state_file" ] && [ ! -L "$state_file" ] || continue
+    jq -c --arg session_name "$session_name" '
+      select(
+        .zellij_session == $session_name
+        and (.is_subagent == false)
+        and ((.session_id // "") != "")
+      )
+    ' "$state_file" 2>/dev/null || true
+  done
+}
+
 CLIENT="claude"
-if [ "${1:-}" = "--client" ] && [ -n "${2:-}" ]; then
-  CLIENT="$2"
+INSPECT_ONLY=false
+RESTORE_SESSION=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --client)
+      [ -n "${2:-}" ] || exit 0
+      CLIENT=$2
+      shift 2
+      ;;
+    --inspect)
+      INSPECT_ONLY=true
+      shift
+      ;;
+    --restore)
+      [ -n "${2:-}" ] || exit 0
+      RESTORE_SESSION=$2
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [ -n "$RESTORE_SESSION" ]; then
+  restore_cached_states "$RESTORE_SESSION"
+  exit 0
 fi
+
 case "$CLIENT" in
   codex) CLIENT_LABEL="Codex" ;;
   *) CLIENT="claude"; CLIENT_LABEL="Claude Code" ;;
@@ -180,24 +409,31 @@ parse_claude_effort_commands() {
             .message.content
             | contains("<command-name>/effort</command-name>")
           )
-        | .uuid
+        | {
+            uuid: (.uuid // ""),
+            timestamp: (.timestamp // "")
+          }
       ] as $commands
     | ($commands | last // null) as $command
     | if $command == null then
-        ["null", ""]
+        ["null", "", ""]
       else
         (
           [
             $entries[]
             | select(.type == "user")
-            | select(.parentUuid? == $command)
+            | select(.parentUuid? == $command.uuid)
             | select((.message.content? | type) == "string")
-            | .message.content
-            | select(contains("<local-command-stdout>"))
+            | select(.message.content | contains("<local-command-stdout>"))
+            | {
+                content: .message.content,
+                timestamp: (.timestamp // "")
+              }
           ]
-          | last // ""
-          | gsub("\u001b\\[[0-9;]*[[:alpha:]]"; "")
-        ) as $output
+          | last // {}
+        ) as $output_entry
+        | (($output_entry.content // "")
+            | gsub("\u001b\\[[0-9;]*[[:alpha:]]"; "")) as $output
         | (
             if $output | test(
               "(?i)^[[:space:]]*<local-command-stdout>[[:space:]]*(current effort level:|effort level set to|set effort level to|effort level:)[[:space:]]*ultracode"
@@ -211,10 +447,37 @@ parse_claude_effort_commands() {
               "null"
             end
           ) as $state
-        | [$state, (if $state == "null" then "" else $command end)]
+        | [
+            $state,
+            (if $state == "null" then "" else $command.uuid end),
+            (
+              if $state == "null"
+              then ""
+              elif (($output_entry.timestamp // "") | length) > 0
+              then $output_entry.timestamp
+              else ($command.timestamp // "")
+              end
+            )
+          ]
       end
     | @tsv
   ' 2>/dev/null
+}
+
+iso_timestamp_ms() {
+  printf '%s' "$1" |
+    jq -Rr '
+      try (
+        capture(
+          "^(?<seconds>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]+))?Z$"
+        ) as $parts
+        | (($parts.seconds + "Z") | fromdateiso8601) * 1000
+          + (
+              (($parts.fraction // "") + "000")[0:3]
+              | tonumber
+            )
+      ) catch empty
+    ' 2>/dev/null
 }
 
 claude_process_requested_mode() {
@@ -266,7 +529,8 @@ claude_process_requested_mode() {
 
 detect_claude_rainbow() {
   local explicit_state transcript_result transcript_state transcript_marker
-  local effort_level configured_effort launch_mode tail_lines
+  local transcript_timestamp transcript_timestamp_ms session_started_at_ms
+  local launch_state launch_effort effort_level configured_effort launch_mode tail_lines
 
   # Accept an explicit field if Claude exposes one in a future hook version
   # (or an SDK host supplies it today).
@@ -297,7 +561,7 @@ detect_claude_rainbow() {
 
   # Claude reports ultracode's model effort as xhigh, so recover the separate
   # session setting from the latest successful /effort command when available.
-  transcript_result=$'null\t'
+  transcript_result=$'null\t\t'
   if [ -r "$TRANSCRIPT_PATH" ]; then
     case "$HOOK_EVENT" in
       SessionStart) tail_lines=4096 ;;
@@ -309,10 +573,67 @@ detect_claude_rainbow() {
         tail -c "$MAX_TRANSCRIPT_BYTES" |
         parse_claude_effort_commands
     )
+    if [ "${transcript_result%%$'\t'*}" = "null" ]; then
+      transcript_result=$(
+        grep -F -e '<command-name>/effort</command-name>' \
+          -e '<local-command-stdout>' "$TRANSCRIPT_PATH" 2>/dev/null |
+          parse_claude_effort_commands
+      )
+    fi
   fi
-  IFS=$'\t' read -r transcript_state transcript_marker <<< "$transcript_result"
+  IFS=$'\t' read -r transcript_state transcript_marker transcript_timestamp \
+    <<< "$transcript_result"
   transcript_state=${transcript_state:-null}
   transcript_marker=${transcript_marker:-}
+  transcript_timestamp=${transcript_timestamp:-}
+
+  # Attach recovery reconstructs launch state from the target process rather
+  # than treating it as a current hook field. A successful /effort command
+  # issued after that process started is newer and therefore wins.
+  if [ "$HOOK_EVENT" = "SessionRestore" ]; then
+    launch_state=$(echo "$INPUT" | jq -r '
+      def as_state:
+        if . == true
+          or ((type == "string") and ((ascii_downcase == "true") or (ascii_downcase == "ultracode")))
+        then "true"
+        else "false"
+        end;
+
+      if has("launch_ultracode") and .launch_ultracode != null then
+        .launch_ultracode | as_state
+      else
+        (.launch_effort_level? // "" | ascii_downcase) as $effort
+        | if $effort == "ultracode" then
+            "true"
+          elif ($effort | IN("low", "medium", "high", "xhigh", "max", "auto", "unset")) then
+            "false"
+          else
+            empty
+          end
+      end
+    ')
+    session_started_at_ms=$(echo "$INPUT" | jq -r '
+      .session_started_at_ms?
+      | select(type == "number" and . > 0 and floor == .)
+      // empty
+    ')
+    transcript_timestamp_ms=""
+    if [ -n "$transcript_timestamp" ]; then
+      transcript_timestamp_ms=$(iso_timestamp_ms "$transcript_timestamp")
+    fi
+
+    if [ -n "$launch_state" ]; then
+      if [ "$transcript_state" != "null" ] &&
+         [ -n "$session_started_at_ms" ] &&
+         [ -n "$transcript_timestamp_ms" ] &&
+         [ "$transcript_timestamp_ms" -ge "$session_started_at_ms" ]; then
+        printf '%s\t%s' "$transcript_state" "$transcript_marker"
+      else
+        printf '%s\t%s' "$launch_state" "$transcript_marker"
+      fi
+      return
+    fi
+  fi
 
   configured_effort=$(printf '%s' "${CLAUDE_CODE_EFFORT_LEVEL:-}" |
     tr '[:upper:]' '[:lower:]')
@@ -416,6 +737,7 @@ PAYLOAD=$(jq -nc \
   --arg cwd "$CWD" \
   --arg zellij_session "$ZELLIJ_SESSION_NAME" \
   --arg term_program "${TERM_PROGRAM:-}" \
+  --arg client "$CLIENT" \
   --arg ts_ms "$TS_MS" \
   --argjson rainbow_name "$RAINBOW_NAME" \
   --arg rainbow_mode_marker "$RAINBOW_MODE_MARKER" \
@@ -428,9 +750,16 @@ PAYLOAD=$(jq -nc \
     cwd: (if $cwd == "" then null else $cwd end),
     zellij_session: $zellij_session,
     term_program: (if $term_program == "" then null else $term_program end),
+    client: $client,
     ts_ms: ($ts_ms | tonumber),
     is_subagent: $is_subagent,
     rainbow_name: $rainbow_name,
+    rainbow_mode_ts_ms: (
+      if $rainbow_name == null
+      then null
+      else ($ts_ms | tonumber)
+      end
+    ),
     rainbow_mode_marker: (
       if $rainbow_mode_marker == ""
       then null
@@ -438,6 +767,123 @@ PAYLOAD=$(jq -nc \
       end
     )
   }')
+
+persist_root_state() {
+  local cache_dir session_key cache_path lock_dir cache_tmp cache_payload
+  local merged_payload cached_owner cached_ts
+  [ "$IS_SUBAGENT" = false ] || return 0
+  [ -n "$SESSION_ID" ] || return 0
+
+  cache_dir=$(state_cache_dir) || return 0
+  session_key=$(state_cache_key "$ZELLIJ_SESSION_NAME") || return 0
+  cache_path="$cache_dir/$session_key.$ZELLIJ_PANE_ID.json"
+  lock_dir="$cache_path.lock"
+
+  umask 077
+  acquire_cache_lock "$lock_dir" || return 0
+
+  if [ -e "$cache_path" ] || [ -L "$cache_path" ]; then
+    if [ ! -f "$cache_path" ] || [ -L "$cache_path" ]; then
+      release_cache_lock "$lock_dir"
+      return 0
+    fi
+  fi
+
+  if [ "$HOOK_EVENT" = "SessionEnd" ]; then
+    if [ -f "$cache_path" ]; then
+      cached_owner=$(jq -r '.session_id // empty' "$cache_path" 2>/dev/null)
+      cached_ts=$(jq -r '.ts_ms // 0' "$cache_path" 2>/dev/null)
+      case "$cached_ts" in
+        ''|*[!0-9]*) cached_ts=0 ;;
+      esac
+      if [ "$cached_owner" = "$SESSION_ID" ] &&
+         [ "$TS_MS" -ge "$cached_ts" ]; then
+        rm -f "$cache_path"
+      fi
+    fi
+    release_cache_lock "$lock_dir"
+    return 0
+  fi
+
+  cache_payload=$PAYLOAD
+
+  if [ -f "$cache_path" ]; then
+    cached_ts=$(jq -r '.ts_ms // 0' "$cache_path" 2>/dev/null)
+    case "$cached_ts" in
+      ''|*[!0-9]*) cached_ts=0 ;;
+    esac
+    if [ "$cached_ts" -gt "$TS_MS" ]; then
+      release_cache_lock "$lock_dir"
+      return 0
+    fi
+
+    merged_payload=$(
+      jq -c --argjson current "$PAYLOAD" '
+        . as $previous
+        | if (
+            $previous.session_id == $current.session_id
+            and $current.hook_event != "SessionStart"
+          ) then
+            $current
+            | (
+                $current.rainbow_mode_marker != null
+                and (
+                  $current.rainbow_mode_marker
+                  == $previous.rainbow_mode_marker
+                )
+              ) as $same_marker
+            | .rainbow_name = (
+                if $current.rainbow_name == null or $same_marker
+                then $previous.rainbow_name
+                else $current.rainbow_name
+                end
+              )
+            | .rainbow_mode_ts_ms = (
+                if $current.rainbow_name == null or $same_marker
+                then (
+                  $previous.rainbow_mode_ts_ms
+                  // $previous.ts_ms
+                  // null
+                )
+                else $current.rainbow_mode_ts_ms
+                end
+              )
+            | .rainbow_mode_marker = (
+                if (
+                  $current.rainbow_name == null
+                  or $current.rainbow_mode_marker == null
+                  or $same_marker
+                )
+                then $previous.rainbow_mode_marker
+                else $current.rainbow_mode_marker
+                end
+              )
+          else
+            $current
+          end
+      ' "$cache_path" 2>/dev/null
+    ) || merged_payload=""
+    [ -z "$merged_payload" ] || cache_payload=$merged_payload
+  fi
+
+  cache_tmp=$(mktemp "$cache_dir/.state.XXXXXX" 2>/dev/null) || {
+    release_cache_lock "$lock_dir"
+    return 0
+  }
+  if printf '%s\n' "$cache_payload" > "$cache_tmp"; then
+    mv "$cache_tmp" "$cache_path" 2>/dev/null || rm -f "$cache_tmp"
+  else
+    rm -f "$cache_tmp"
+  fi
+  release_cache_lock "$lock_dir"
+}
+
+if [ "$INSPECT_ONLY" = true ]; then
+  printf '%s\n' "$PAYLOAD"
+  exit 0
+fi
+
+persist_root_state
 
 # Permission request: bell + desktop notification
 if [ "$HOOK_EVENT" = "PermissionRequest" ]; then

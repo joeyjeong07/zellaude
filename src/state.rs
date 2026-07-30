@@ -45,8 +45,26 @@ pub struct SessionInfo {
     pub last_ts_ms: u64,
     #[serde(default)]
     pub rainbow_name: bool,
+    #[serde(default = "default_rainbow_name_known")]
+    pub rainbow_name_known: bool,
+    /// Timestamp of the observation that set `rainbow_name`. This is kept
+    /// separate from activity recency so attach recovery can correct stale
+    /// mode state without making an idle session look newly active.
+    #[serde(default)]
+    pub rainbow_mode_ts_ms: u64,
     #[serde(default)]
     pub rainbow_mode_marker: Option<String>,
+    /// Attach-time recovery is provisional and must never outrank state
+    /// observed from a real hook or synchronized from a live peer.
+    #[serde(default)]
+    pub restored: bool,
+}
+
+fn default_rainbow_name_known() -> bool {
+    // Older instances used false for both a detected standard mode and an
+    // unknown mode. Keep rendering the stored bool, but let exact discovery
+    // enrich it instead of treating that ambiguity as authoritative.
+    false
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +81,8 @@ pub struct HookPayload {
     pub is_subagent: bool,
     #[serde(default)]
     pub rainbow_name: Option<bool>,
+    #[serde(default)]
+    pub rainbow_mode_ts_ms: Option<u64>,
     #[serde(default)]
     pub rainbow_mode_marker: Option<String>,
 }
@@ -159,6 +179,7 @@ pub struct MenuClickRegion {
 #[derive(Default)]
 pub struct State {
     pub sessions: BTreeMap<u32, SessionInfo>,
+    pub session_end_tombstones: BTreeMap<(u32, String), u64>,
     pub pane_to_tab: HashMap<u32, (usize, String)>,
     pub tabs: Vec<TabInfo>,
     pub pane_manifest: Option<PaneManifest>,
@@ -175,5 +196,7 @@ pub struct State {
     pub prefix_click_region: Option<(usize, usize)>,
     pub menu_click_regions: Vec<MenuClickRegion>,
     pub config_loaded: bool,
+    pub command_permissions_granted: bool,
     pub hooks_installed: bool,
+    pub attach_scan_requested: bool,
 }

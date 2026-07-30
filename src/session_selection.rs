@@ -24,7 +24,53 @@ fn recency_key(session: &SessionInfo) -> (u64, u32) {
 }
 
 pub fn is_newer_than(candidate: &SessionInfo, current: &SessionInfo) -> bool {
+    if candidate.restored != current.restored {
+        return !candidate.restored;
+    }
     recency_key(candidate) > recency_key(current)
+}
+
+/// Preserve a concrete mode observation while two instances reconcile the
+/// same root session. Activity provenance and recency are selected separately.
+pub fn reconcile_rainbow_mode(candidate: &mut SessionInfo, current: &mut SessionInfo) {
+    if candidate.session_id != current.session_id {
+        return;
+    }
+
+    let candidate_wins = match (
+        candidate.rainbow_name_known,
+        current.rainbow_name_known,
+    ) {
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => return,
+        (true, true) => {
+            let candidate_key = (
+                candidate.rainbow_mode_ts_ms,
+                !candidate.rainbow_name,
+                candidate.rainbow_mode_marker.as_deref().unwrap_or(""),
+            );
+            let current_key = (
+                current.rainbow_mode_ts_ms,
+                !current.rainbow_name,
+                current.rainbow_mode_marker.as_deref().unwrap_or(""),
+            );
+            candidate_key > current_key
+        }
+    };
+
+    if candidate_wins {
+        copy_rainbow_mode(current, candidate);
+    } else {
+        copy_rainbow_mode(candidate, current);
+    }
+}
+
+fn copy_rainbow_mode(target: &mut SessionInfo, source: &SessionInfo) {
+    target.rainbow_name = source.rainbow_name;
+    target.rainbow_name_known = source.rainbow_name_known;
+    target.rainbow_mode_ts_ms = source.rainbow_mode_ts_ms;
+    target.rainbow_mode_marker = source.rainbow_mode_marker.clone();
 }
 
 /// Choose the session whose activity should represent a tab in the status bar.
@@ -86,7 +132,10 @@ mod tests {
             cwd: None,
             last_ts_ms,
             rainbow_name: false,
+            rainbow_name_known: true,
+            rainbow_mode_ts_ms: last_ts_ms,
             rainbow_mode_marker: None,
+            restored: false,
         }
     }
 
@@ -148,5 +197,60 @@ mod tests {
 
         assert!(is_newer_than(&candidate, &current));
         assert!(!is_newer_than(&current, &candidate));
+    }
+
+    #[test]
+    fn reconciliation_carries_a_known_mode_across_provenance_selection() {
+        let mut restored = session(1, Activity::Idle, 10, 10_000);
+        restored.restored = true;
+        restored.rainbow_name = true;
+        restored.rainbow_mode_marker = Some("ultra".to_string());
+
+        let mut live = session(1, Activity::Thinking, 20, 20_000);
+        live.rainbow_name_known = false;
+
+        reconcile_rainbow_mode(&mut live, &mut restored);
+
+        assert!(live.rainbow_name);
+        assert!(live.rainbow_name_known);
+        assert_eq!(live.rainbow_mode_marker.as_deref(), Some("ultra"));
+        assert!(is_newer_than(&live, &restored));
+    }
+
+    #[test]
+    fn reconciliation_uses_the_newest_mode_observation_independently_of_activity() {
+        let mut newer_activity = session(1, Activity::Thinking, 20, 20_000);
+        newer_activity.rainbow_mode_ts_ms = 10_000;
+
+        let mut newer_mode = session(1, Activity::Idle, 10, 10_000);
+        newer_mode.rainbow_name = true;
+        newer_mode.rainbow_mode_ts_ms = 30_000;
+        newer_mode.rainbow_mode_marker = Some("ultra".to_string());
+
+        reconcile_rainbow_mode(&mut newer_mode, &mut newer_activity);
+
+        assert!(newer_activity.rainbow_name);
+        assert_eq!(newer_activity.rainbow_mode_ts_ms, 30_000);
+        assert_eq!(
+            newer_activity.rainbow_mode_marker.as_deref(),
+            Some("ultra")
+        );
+        assert!(is_newer_than(&newer_activity, &newer_mode));
+    }
+
+    #[test]
+    fn reconciliation_fails_closed_on_an_exact_timestamp_conflict() {
+        let mut rainbow = session(1, Activity::Idle, 10, 10_000);
+        rainbow.rainbow_name = true;
+        rainbow.rainbow_mode_marker = Some("z-marker".to_string());
+
+        let mut standard = session(1, Activity::Idle, 10, 10_000);
+        standard.rainbow_mode_marker = Some("a-marker".to_string());
+
+        reconcile_rainbow_mode(&mut rainbow, &mut standard);
+
+        assert!(!rainbow.rainbow_name);
+        assert!(!standard.rainbow_name);
+        assert_eq!(rainbow.rainbow_mode_marker.as_deref(), Some("a-marker"));
     }
 }
