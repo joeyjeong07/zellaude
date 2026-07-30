@@ -1,8 +1,12 @@
 mod event_handler;
 mod installer;
+mod rainbow;
 mod render;
+mod session_selection;
 mod state;
 mod tab_pane_map;
+mod tool_symbol;
+mod theme;
 
 use state::{unix_now, unix_now_ms, HookPayload, MenuAction, SessionInfo, Settings, State, ViewMode};
 use std::collections::BTreeMap;
@@ -61,6 +65,7 @@ impl ZellijPlugin for State {
             }
             Event::ModeUpdate(mode_info) => {
                 self.input_mode = mode_info.mode;
+                self.zellij_styling = Some(mode_info.style.colors);
                 if let Some(name) = mode_info.session_name {
                     self.zellij_session_name = Some(name);
                 }
@@ -84,8 +89,8 @@ impl ZellijPlugin for State {
                     ViewMode::Normal => {
                         for region in &self.click_regions {
                             if col >= region.start_col && col < region.end_col {
-                                if region.is_waiting {
-                                    focus_terminal_pane(region.pane_id, false);
+                                if let Some(pane_id) = region.focus_pane_id {
+                                    focus_terminal_pane(pane_id, false);
                                 } else {
                                     switch_tab_to(region.tab_index as u32 + 1);
                                 }
@@ -140,7 +145,7 @@ impl ZellijPlugin for State {
                         self.config_loaded = true;
                         true
                     }
-                    Some("install_hooks") => {
+                    Some("install_hooks") if exit_code == Some(0) => {
                         self.hooks_installed = true;
                         false
                     }
@@ -151,12 +156,19 @@ impl ZellijPlugin for State {
                 let stale_changed = self.cleanup_stale_sessions();
                 let flash_changed = self.cleanup_expired_flashes();
                 let has_flashes = self.has_active_flashes();
-                if has_flashes {
+                let has_rainbows = self.has_rainbow_sessions();
+                if has_rainbows {
+                    set_timeout(rainbow::ANIMATION_TICK_SECONDS);
+                } else if has_flashes {
                     set_timeout(FLASH_TICK);
                 } else {
                     set_timeout(TIMER_INTERVAL);
                 }
-                has_flashes || stale_changed || flash_changed || self.has_elapsed_display()
+                has_rainbows
+                    || has_flashes
+                    || stale_changed
+                    || flash_changed
+                    || self.has_elapsed_display()
             }
             Event::PermissionRequestResult(_) => {
                 // Now that permissions are granted, mark as non-selectable
@@ -169,7 +181,7 @@ impl ZellijPlugin for State {
                 if !self.config_loaded {
                     self.load_config();
                 }
-                // Auto-install hook script and register Claude Code hooks
+                // Auto-install the bridge and register Claude Code/Codex hooks
                 if !self.hooks_installed {
                     installer::run_install();
                 }
@@ -296,6 +308,10 @@ impl State {
         self.flash_deadlines.values().any(|&deadline| now < deadline)
     }
 
+    fn has_rainbow_sessions(&self) -> bool {
+        self.sessions.values().any(|session| session.rainbow_name)
+    }
+
     fn cleanup_expired_flashes(&mut self) -> bool {
         let before = self.flash_deadlines.len();
         let now = unix_now_ms();
@@ -365,7 +381,7 @@ impl State {
             let dominated = self
                 .sessions
                 .get(&pane_id)
-                .map(|existing| session.last_event_ts > existing.last_event_ts)
+                .map(|existing| session_selection::is_newer_than(&session, existing))
                 .unwrap_or(true);
             if dominated {
                 // Refresh tab name from our local pane map
@@ -378,3 +394,13 @@ impl State {
         }
     }
 }
+
+/// zellij-tile links against a wasm host import that does not exist when the
+/// crate is built for the host triple, so `cargo test` could not link the binary
+/// at all and the test suite was unrunnable. Stub it for non-wasm builds —
+/// `#[cfg(test)]` is not enough, because the presence of a `tests/` directory
+/// makes cargo build the plain binary too. Never reached: the pure logic under
+/// test does not call into the host.
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+extern "C" fn host_run_plugin_command() {}
