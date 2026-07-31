@@ -383,12 +383,11 @@ fn render_tabs(
             });
 
         let is_active = tab.active;
-        let has_rainbow_name = !is_flash_bright
-            && state
-                .sessions
-                .values()
-                .filter(|s| s.tab_index == Some(tab.position))
-                .any(|s| s.rainbow_name);
+        let has_rainbow_name = state
+            .sessions
+            .values()
+            .filter(|s| s.tab_index == Some(tab.position))
+            .any(|s| s.rainbow_name);
 
         // Pick the complete theme declaration for this tab state so its
         // foreground and background remain a deliberate pair.

@@ -1,3 +1,4 @@
+mod attach;
 mod event_handler;
 mod installer;
 mod rainbow;
@@ -37,10 +38,6 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
         ]);
         set_timeout(TIMER_INTERVAL);
-
-        // Load persisted settings (may be retried in PermissionRequestResult
-        // if this fires before permissions are granted)
-        self.load_config();
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -56,11 +53,13 @@ impl ZellijPlugin for State {
                 self.active_tab_index = new_active;
                 self.tabs = tabs;
                 self.rebuild_pane_map();
+                self.maybe_start_attach_scan();
                 true
             }
             Event::PaneUpdate(manifest) => {
                 self.pane_manifest = Some(manifest);
                 self.rebuild_pane_map();
+                self.maybe_start_attach_scan();
                 true
             }
             Event::ModeUpdate(mode_info) => {
@@ -69,6 +68,7 @@ impl ZellijPlugin for State {
                 if let Some(name) = mode_info.session_name {
                     self.zellij_session_name = Some(name);
                 }
+                self.maybe_start_attach_scan();
                 true
             }
             Event::Mouse(Mouse::LeftClick(_, col)) => {
@@ -90,7 +90,7 @@ impl ZellijPlugin for State {
                         for region in &self.click_regions {
                             if col >= region.start_col && col < region.end_col {
                                 if let Some(pane_id) = region.focus_pane_id {
-                                    focus_terminal_pane(pane_id, false);
+                                    focus_terminal_pane(pane_id, false, false);
                                 } else {
                                     switch_tab_to(region.tab_index as u32 + 1);
                                 }
@@ -143,11 +143,118 @@ impl ZellijPlugin for State {
                             self.settings = settings;
                         }
                         self.config_loaded = true;
+                        self.on_command_permissions_granted();
                         true
                     }
                     Some("install_hooks") if exit_code == Some(0) => {
                         self.hooks_installed = true;
+                        self.maybe_start_attach_scan();
                         false
+                    }
+                    Some("attach_scan") => {
+                        if exit_code != Some(0) {
+                            self.attach_scan_requested = false;
+                            return false;
+                        }
+
+                        let allowed_panes: Vec<u32> = context
+                            .get("pane_ids")
+                            .into_iter()
+                            .flat_map(|pane_ids| pane_ids.split(','))
+                            .filter_map(|pane_id| pane_id.parse().ok())
+                            .collect();
+                        let pane_leaders: BTreeMap<u32, i32> = context
+                            .get("pane_leaders")
+                            .into_iter()
+                            .flat_map(|pane_leaders| pane_leaders.split(','))
+                            .filter_map(|record| {
+                                let (pane_id, leader_pid) = record.split_once(':')?;
+                                Some((pane_id.parse().ok()?, leader_pid.parse().ok()?))
+                            })
+                            .collect();
+                        let scan_started_ms = context
+                            .get("scan_started_ms")
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let introspection_supported = context
+                            .get("introspection_supported")
+                            .is_some_and(|value| value == "true");
+                        let expected_session = self.zellij_session_name.clone();
+                        let raw = String::from_utf8_lossy(&stdout);
+                        let mut discovered_by_pane: BTreeMap<u32, HookPayload> =
+                            BTreeMap::new();
+                        for line in raw.lines() {
+                            let Ok(mut payload) = serde_json::from_str::<HookPayload>(line) else {
+                                continue;
+                            };
+                            if !allowed_panes.contains(&payload.pane_id)
+                                || payload.zellij_session.as_ref() != expected_session.as_ref()
+                            {
+                                continue;
+                            }
+                            payload.hook_event = "SessionRestore".to_string();
+                            payload.tool_name = None;
+                            if payload.is_subagent {
+                                continue;
+                            }
+                            if let Some(previous) = discovered_by_pane.get(&payload.pane_id) {
+                                if payload.session_id == previous.session_id
+                                    && payload.rainbow_name.is_none()
+                                {
+                                    payload.rainbow_name = previous.rainbow_name;
+                                    payload.rainbow_mode_ts_ms = previous
+                                        .rainbow_mode_ts_ms
+                                        .or(previous.ts_ms);
+                                    payload.rainbow_mode_marker =
+                                        previous.rainbow_mode_marker.clone();
+                                }
+                            }
+                            discovered_by_pane.insert(payload.pane_id, payload);
+                        }
+
+                        let mut changed = false;
+                        for (pane_id, payload) in discovered_by_pane {
+                            if !self.pane_to_tab.contains_key(&pane_id) {
+                                continue;
+                            }
+                            if introspection_supported {
+                                let Some(expected_leader) = pane_leaders.get(&pane_id)
+                                else {
+                                    continue;
+                                };
+                                if get_pane_pid(PaneId::Terminal(pane_id)).ok()
+                                    != Some(*expected_leader)
+                                {
+                                    continue;
+                                }
+                            }
+
+                            let discovered_id = payload
+                                .session_id
+                                .as_deref()
+                                .filter(|session_id| !session_id.is_empty());
+                            if let Some(existing) = self.sessions.get(&pane_id) {
+                                let different_owner =
+                                    discovered_id != Some(existing.session_id.as_str());
+                                let existing_ts_ms = if existing.last_ts_ms > 0 {
+                                    existing.last_ts_ms
+                                } else {
+                                    existing.last_event_ts.saturating_mul(1000)
+                                };
+                                if different_owner
+                                    && !existing.restored
+                                    && (scan_started_ms == 0 || existing_ts_ms >= scan_started_ms)
+                                {
+                                    continue;
+                                }
+                            }
+
+                            changed |= event_handler::handle_discovered_session(self, payload);
+                        }
+                        if changed {
+                            self.broadcast_sessions();
+                        }
+                        changed
                     }
                     _ => false,
                 }
@@ -170,21 +277,12 @@ impl ZellijPlugin for State {
                     || flash_changed
                     || self.has_elapsed_display()
             }
-            Event::PermissionRequestResult(_) => {
-                // Now that permissions are granted, mark as non-selectable
-                // so the plugin stays visible during fullscreen
-                set_selectable(false);
-                // Permissions granted — ask existing instances for their state
-                self.request_sync();
-                // Retry config load (the one in load() may have been dropped
-                // because it ran before permissions were granted)
-                if !self.config_loaded {
-                    self.load_config();
-                }
-                // Auto-install the bridge and register Claude Code/Codex hooks
-                if !self.hooks_installed {
-                    installer::run_install();
-                }
+            Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                self.on_command_permissions_granted();
+                false
+            }
+            Event::PermissionRequestResult(PermissionStatus::Denied) => {
+                self.command_permissions_granted = false;
                 false
             }
             _ => false,
@@ -210,7 +308,7 @@ impl ZellijPlugin for State {
                 // Notification click — focus the requested pane
                 if let Some(ref payload) = pipe_message.payload {
                     if let Ok(pane_id) = payload.trim().parse::<u32>() {
-                        focus_terminal_pane(pane_id, false);
+                        focus_terminal_pane(pane_id, false, false);
                     }
                 }
                 false
@@ -252,6 +350,50 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    fn on_command_permissions_granted(&mut self) {
+        let newly_granted = !self.command_permissions_granted;
+        self.command_permissions_granted = true;
+
+        // Keep the plugin visible during fullscreen once application-state
+        // changes are allowed.
+        set_selectable(false);
+
+        if newly_granted {
+            self.request_sync();
+            if !self.hooks_installed {
+                installer::run_install();
+            }
+        }
+        if !self.config_loaded {
+            self.load_config();
+        }
+    }
+
+    fn maybe_start_attach_scan(&mut self) {
+        if self.attach_scan_requested
+            || !self.command_permissions_granted
+            || !self.hooks_installed
+        {
+            return;
+        }
+        let Some(session_name) = self.zellij_session_name.as_deref() else {
+            return;
+        };
+        let Some(manifest) = self.pane_manifest.as_ref() else {
+            return;
+        };
+        if self.tabs.is_empty()
+            || self.pane_to_tab.is_empty()
+            || !attach::is_active_instance(manifest, &self.tabs)
+        {
+            return;
+        }
+
+        if attach::run(session_name, &self.pane_to_tab) {
+            self.attach_scan_requested = true;
+        }
+    }
+
     fn rebuild_pane_map(&mut self) {
         if let Some(ref manifest) = self.pane_manifest {
             self.pane_to_tab = tab_pane_map::build_pane_to_tab_map(&self.tabs, manifest);
@@ -378,11 +520,27 @@ impl State {
 
     fn merge_sessions(&mut self, incoming: BTreeMap<u32, SessionInfo>) {
         for (pane_id, mut session) in incoming {
-            let dominated = self
-                .sessions
-                .get(&pane_id)
-                .map(|existing| session_selection::is_newer_than(&session, existing))
-                .unwrap_or(true);
+            let incoming_ts_ms = if session.last_ts_ms > 0 {
+                session.last_ts_ms
+            } else {
+                session.last_event_ts.saturating_mul(1000)
+            };
+            let tombstone_key = (pane_id, session.session_id.clone());
+            let newer_than_tombstone =
+                match self.session_end_tombstones.get(&tombstone_key).copied() {
+                    Some(ended_at) if incoming_ts_ms <= ended_at => continue,
+                    Some(_) => true,
+                    None => false,
+                };
+
+            let mut same_current_owner = false;
+            let dominated = if let Some(existing) = self.sessions.get_mut(&pane_id) {
+                same_current_owner = existing.session_id == session.session_id;
+                session_selection::reconcile_rainbow_mode(&mut session, existing);
+                session_selection::is_newer_than(&session, existing)
+            } else {
+                true
+            };
             if dominated {
                 // Refresh tab name from our local pane map
                 if let Some((idx, name)) = self.pane_to_tab.get(&pane_id) {
@@ -391,7 +549,101 @@ impl State {
                 }
                 self.sessions.insert(pane_id, session);
             }
+            if newer_than_tombstone {
+                if dominated || same_current_owner {
+                    self.session_end_tombstones.remove(&tombstone_key);
+                } else {
+                    self.session_end_tombstones
+                        .entry(tombstone_key)
+                        .and_modify(|blocked_at| {
+                            *blocked_at = (*blocked_at).max(incoming_ts_ms)
+                        })
+                        .or_insert(incoming_ts_ms);
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use state::Activity;
+
+    fn session(session_id: &str, ts_ms: u64, restored: bool) -> SessionInfo {
+        SessionInfo {
+            session_id: session_id.to_string(),
+            pane_id: 7,
+            activity: Activity::Idle,
+            tab_name: None,
+            tab_index: None,
+            last_event_ts: ts_ms / 1000,
+            cwd: None,
+            last_ts_ms: ts_ms,
+            rainbow_name: false,
+            rainbow_name_known: true,
+            rainbow_mode_ts_ms: ts_ms,
+            rainbow_mode_marker: None,
+            restored,
+        }
+    }
+
+    #[test]
+    fn peer_sync_cannot_resurrect_a_session_older_than_its_end() {
+        let mut state = State::default();
+        state
+            .session_end_tombstones
+            .insert((7, "ended".to_string()), 30);
+
+        state.merge_sessions(BTreeMap::from([(7, session("ended", 20, false))]));
+        assert!(state.sessions.is_empty());
+
+        state.merge_sessions(BTreeMap::from([(7, session("ended", 40, false))]));
+        assert_eq!(state.sessions.get(&7).unwrap().last_ts_ms, 40);
+        assert!(state.session_end_tombstones.is_empty());
+    }
+
+    #[test]
+    fn rejected_peer_does_not_clear_its_ended_owner_tombstone() {
+        let mut state = State::default();
+        state
+            .session_end_tombstones
+            .insert((7, "ended".to_string()), 30);
+        state
+            .sessions
+            .insert(7, session("current", 100, false));
+
+        state.merge_sessions(BTreeMap::from([(7, session("ended", 40, false))]));
+
+        assert_eq!(state.sessions.get(&7).unwrap().session_id, "current");
+        assert_eq!(
+            state
+                .session_end_tombstones
+                .get(&(7, "ended".to_string())),
+            Some(&40)
+        );
+    }
+
+    #[test]
+    fn legacy_synced_mode_is_treated_as_unknown_but_keeps_its_rendered_value() {
+        let legacy: SessionInfo = serde_json::from_str(
+            r#"{
+                "session_id":"legacy",
+                "pane_id":7,
+                "activity":"Idle",
+                "tab_name":null,
+                "tab_index":null,
+                "last_event_ts":1,
+                "cwd":null,
+                "last_ts_ms":1000,
+                "rainbow_name":true,
+                "rainbow_mode_marker":null
+            }"#,
+        )
+        .unwrap();
+
+        assert!(legacy.rainbow_name);
+        assert!(!legacy.rainbow_name_known);
     }
 }
 

@@ -9,6 +9,7 @@ A Zellij status bar plugin that replaces the default tab bar with Claude Code an
 - **Full tab bar** — shows all Zellij tabs (not just agent sessions), replacing the native tab bar
 - **Session & mode display** — shows the Zellij session name and current input mode (NORMAL, LOCKED, PANE, etc.) with color-coded indicators
 - **Live activity indicators** — see what every Claude Code and Codex session is doing at a glance; non-agent tabs remain visible without activity glyphs
+- **Attach-time recovery** — recognizes agent sessions and effort modes that were already running when the status bar attached
 - **Theme-aware palette** — follows Zellij's live theme colors; Gruvbox Dark is explicitly verified
 - **Ultra-mode rainbow** — tab names shimmer through rainbow colors for Codex `ultra` sessions and Claude Code `ultracode` sessions
 - **Clickable tabs** — click any tab to switch to it
@@ -51,7 +52,7 @@ Click the **Zellaude** prefix on the left side of the bar to open the settings m
 
 ### Prerequisites
 
-- [Zellij](https://zellij.dev)
+- [Zellij 0.44 or newer](https://zellij.dev)
 - [jq](https://jqlang.github.io/jq/) — used by the hook script at runtime
 
 ### Quick install
@@ -118,10 +119,11 @@ Without it, notifications still appear via osascript but clicking them won't foc
 
 ## How it works
 
-Two components:
+Three components:
 
 1. **WASM plugin** — runs inside Zellij, receives events, maintains state in memory, renders the status bar, and sends desktop notifications. On first load, it writes the hook script to `~/.config/zellij/plugins/zellaude-hook.sh` and registers it in `~/.claude/settings.json` and `~/.codex/hooks.json`.
 2. **Hook script** — a thin bash bridge that forwards Claude Code and Codex hook events to the plugin via `zellij pipe`
+3. **Attach probe** — runs once when the plugin attaches, maps live agent processes to their real Zellij pane IDs, and restores their current effort modes without waiting for another prompt
 
 ```
 Claude Code / Codex hook → zellaude-hook.sh → zellij pipe → plugin → render
@@ -132,7 +134,12 @@ The registered hook command uses `${HOME}/.config/zellij/plugins/zellaude-hook.s
 
 Codex currently records its active reasoning effort in the hook transcript rather than hook input, while Claude Code reports `ultracode` as ordinary `xhigh` effort. Zellaude resolves both best-effort from the live session transcript and launch flags. Custom Claude launchers that hide `--effort ultracode` can export `ZELLAUDE_CLAUDE_MODE=ultracode` when Claude's active effort remains `xhigh`.
 
-All state lives in WASM memory. No temp files, no race conditions. Multiple plugin instances (one per tab) sync state automatically via inter-plugin messaging. Sessions are cleaned up automatically when tabs are closed.
+The hook also keeps the last root-session state in a private per-user cache so a
+new plugin instance can restore it. On Linux, attach recovery additionally uses
+Zellij's pane PID and procfs to identify an already-running root session exactly;
+ambiguous matches are ignored. Multiple plugin instances (one per tab) sync
+state automatically via inter-plugin messaging. Cache entries are removed on a
+normal session end, and sessions are cleaned up automatically when tabs close.
 
 ## License
 
