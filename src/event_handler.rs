@@ -136,7 +136,14 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     // session's activity but must never create pane ownership. This also lets
     // a freshly loaded plugin accept synchronized root state without a
     // child-created placeholder winning on an equal timestamp.
-    if payload.is_subagent && !state.sessions.contains_key(&payload.pane_id) {
+    // A poll-derived placeholder is not a root session, so it cannot confer
+    // the ownership this guard withholds.
+    if payload.is_subagent
+        && state
+            .sessions
+            .get(&payload.pane_id)
+            .is_none_or(|session| session.placeholder)
+    {
         return;
     }
 
@@ -204,6 +211,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
                 }
                 if !payload.is_subagent {
                     session.restored = false;
+                    session.placeholder = false;
                     if let Some(key) = tombstone_to_clear {
                         state.session_end_tombstones.remove(&key);
                     }
@@ -243,6 +251,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
             },
             rainbow_mode_marker: payload.rainbow_mode_marker.clone(),
             restored: false,
+            placeholder: false,
         });
 
     if matches!(activity, Activity::Waiting) {
@@ -275,6 +284,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     update_rainbow_mode(session, &payload, new_session || event == "SessionStart");
     if !payload.is_subagent {
         session.restored = false;
+        session.placeholder = false;
         if let Some(key) = tombstone_to_clear {
             state.session_end_tombstones.remove(&key);
         }

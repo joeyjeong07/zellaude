@@ -52,6 +52,7 @@ mod state {
         pub rainbow_mode_ts_ms: u64,
         pub rainbow_mode_marker: Option<String>,
         pub restored: bool,
+        pub placeholder: bool,
     }
 
     pub struct HookPayload {
@@ -418,4 +419,47 @@ fn rejected_newer_event_does_not_clear_an_ended_owner_tombstone() {
             .get(&(7, "ended-owner".to_string())),
         Some(&40)
     );
+}
+
+fn placeholder_session(pane_id: u32) -> state::SessionInfo {
+    state::SessionInfo {
+        session_id: String::new(),
+        pane_id,
+        activity: Activity::Idle,
+        tab_name: None,
+        tab_index: None,
+        last_event_ts: 0,
+        cwd: None,
+        last_ts_ms: 0,
+        rainbow_name: false,
+        rainbow_name_known: false,
+        rainbow_mode_ts_ms: 0,
+        rainbow_mode_marker: None,
+        restored: true,
+        placeholder: true,
+    }
+}
+
+#[test]
+fn subagent_events_cannot_claim_a_placeholder_pane() {
+    let mut state = State::default();
+    state.sessions.insert(7, placeholder_session(7));
+
+    let mut subagent = payload("child", None, None, 1_000);
+    subagent.hook_event = "PermissionRequest".to_string();
+    subagent.is_subagent = true;
+    event_handler::handle_hook_event(&mut state, subagent);
+
+    let session = state.sessions.get(&7).unwrap();
+    assert_eq!(session.activity, Activity::Idle);
+    assert!(state.flash_deadlines.is_empty());
+}
+
+#[test]
+fn a_hook_event_without_a_session_id_creates_a_real_session() {
+    let mut state = State::default();
+
+    event_handler::handle_hook_event(&mut state, payload("", None, None, 1_000));
+
+    assert!(!state.sessions.get(&7).unwrap().placeholder);
 }

@@ -136,6 +136,7 @@ mod tests {
             rainbow_mode_ts_ms: last_ts_ms,
             rainbow_mode_marker: None,
             restored: false,
+            placeholder: false,
         }
     }
 

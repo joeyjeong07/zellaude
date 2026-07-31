@@ -382,22 +382,42 @@ impl State {
         {
             return;
         }
-        let Some(session_name) = self.zellij_session_name.as_deref() else {
-            return;
-        };
-        let Some(manifest) = self.pane_manifest.as_ref() else {
-            return;
-        };
-        if self.tabs.is_empty()
-            || self.pane_to_tab.is_empty()
-            || !attach::is_active_instance(manifest, &self.tabs)
-        {
+        if self.pane_to_tab.is_empty() || !self.is_on_active_tab() {
             return;
         }
+        let supports_introspection = self.introspection_supported();
+        let Some(session_name) = self.zellij_session_name.clone() else {
+            return;
+        };
 
-        if attach::run(session_name, &self.pane_to_tab) {
+        if attach::run(&session_name, &self.pane_to_tab, supports_introspection) {
             self.attach_scan_requested = true;
         }
+    }
+
+    /// Only the instance whose tab is visible should spend host calls on
+    /// discovery or polling.
+    fn is_on_active_tab(&self) -> bool {
+        self.pane_manifest.as_ref().is_some_and(|manifest| {
+            !self.tabs.is_empty() && attach::is_active_instance(manifest, &self.tabs)
+        })
+    }
+
+    fn introspection_supported(&mut self) -> bool {
+        *self
+            .pane_introspection_supported
+            .get_or_insert_with(|| attach::supports_pane_introspection(&get_zellij_version()))
+    }
+
+    /// Bounds how often the pane-introspection poll runs. Stamping inside the
+    /// check keeps a tick that a later gate rejects from re-running the gates
+    /// on every timer fire.
+    fn agent_poll_due(&mut self, now_ms: u64) -> bool {
+        if now_ms.saturating_sub(self.last_agent_poll_ms) < AGENT_POLL_INTERVAL_MS {
+            return false;
+        }
+        self.last_agent_poll_ms = now_ms;
+        true
     }
 
     /// Recognize agent TUIs that have not produced a hook event yet (Codex
@@ -410,24 +430,14 @@ impl State {
             return false;
         }
         let now = unix_now_ms();
-        if now.saturating_sub(self.last_agent_poll_ms) < AGENT_POLL_INTERVAL_MS {
+        if !self.agent_poll_due(now) {
             return false;
         }
-        let Some(manifest) = self.pane_manifest.as_ref() else {
-            return false;
-        };
-        if self.tabs.is_empty() || !attach::is_active_instance(manifest, &self.tabs) {
+        if !self.is_on_active_tab() || !self.introspection_supported() {
             return false;
         }
-        let introspection_supported = *self.pane_introspection_supported.get_or_insert_with(
-            || attach::supports_pane_introspection(&get_zellij_version()),
-        );
-        if !introspection_supported {
-            return false;
-        }
-        self.last_agent_poll_ms = now;
 
-        let observed: Vec<(u32, Option<&'static str>)> = self
+        let observed: Vec<(u32, placeholder::PaneAgent)> = self
             .pane_to_tab
             .keys()
             .filter(|pane_id| {
@@ -436,10 +446,23 @@ impl State {
                     .is_none_or(placeholder::is_placeholder)
             })
             .map(|&pane_id| {
-                let client = get_pane_running_command(PaneId::Terminal(pane_id))
-                    .ok()
-                    .and_then(|command| attach::client_for_command(&command));
-                (pane_id, client)
+                let observation = if placeholder::ended_recently(
+                    &self.session_end_tombstones,
+                    pane_id,
+                    now,
+                ) {
+                    placeholder::PaneAgent::Unknown
+                } else {
+                    match get_pane_running_command(PaneId::Terminal(pane_id)) {
+                        Ok(command) if attach::client_for_command(&command).is_some() => {
+                            placeholder::PaneAgent::Running
+                        }
+                        Ok(_) => placeholder::PaneAgent::Absent,
+                        // A failed query says nothing about the pane.
+                        Err(_) => placeholder::PaneAgent::Unknown,
+                    }
+                };
+                (pane_id, observation)
             })
             .collect();
         let changed = placeholder::reconcile_agent_panes(&mut self.sessions, observed);
@@ -650,6 +673,7 @@ mod tests {
             rainbow_mode_ts_ms: ts_ms,
             rainbow_mode_marker: None,
             restored,
+            placeholder: false,
         }
     }
 
@@ -730,6 +754,24 @@ mod tests {
         assert_eq!(session.session_id, "real");
         assert_eq!(session.activity, Activity::Thinking);
         assert!(!placeholder::is_placeholder(session));
+    }
+
+    #[test]
+    fn the_agent_poll_throttle_consumes_a_window_it_has_stamped() {
+        let mut state = State::default();
+
+        assert!(state.agent_poll_due(10_000));
+        assert!(!state.agent_poll_due(10_001));
+        assert!(state.agent_poll_due(10_000 + AGENT_POLL_INTERVAL_MS));
+    }
+
+    #[test]
+    fn peer_sync_imports_a_real_session_whose_id_is_empty() {
+        let mut state = State::default();
+
+        state.merge_sessions(BTreeMap::from([(7, session("", 1000, false))]));
+
+        assert_eq!(state.sessions.get(&7).map(|s| s.last_ts_ms), Some(1000));
     }
 
     #[test]

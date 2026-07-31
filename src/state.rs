@@ -58,6 +58,11 @@ pub struct SessionInfo {
     /// observed from a real hook or synchronized from a live peer.
     #[serde(default)]
     pub restored: bool,
+    /// Derived locally from pane introspection rather than observed from an
+    /// agent. An empty `session_id` cannot stand in for this: hook payloads
+    /// legitimately omit the id, and those sessions are real.
+    #[serde(default)]
+    pub placeholder: bool,
 }
 
 fn default_rainbow_name_known() -> bool {
