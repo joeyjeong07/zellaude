@@ -112,6 +112,15 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
+pub(crate) fn elapsed_suffix(session: &SessionInfo, now_s: u64) -> Option<String> {
+    // A placeholder has no observed event to measure from.
+    if session.placeholder {
+        return None;
+    }
+    let elapsed = now_s.saturating_sub(session.last_event_ts);
+    (elapsed >= ELAPSED_THRESHOLD).then(|| format_elapsed(elapsed))
+}
+
 fn mode_style(mode: InputMode, theme: BarTheme) -> (SegmentStyle, &'static str) {
     match mode {
         InputMode::Normal => (theme.settings_prefix, "NORMAL"),
@@ -315,14 +324,7 @@ fn render_tabs(
             if !state.settings.elapsed_time {
                 return None;
             }
-            session.and_then(|s| {
-                let elapsed = now_s.saturating_sub(s.last_event_ts);
-                if elapsed >= ELAPSED_THRESHOLD {
-                    Some(format_elapsed(elapsed))
-                } else {
-                    None
-                }
-            })
+            session.and_then(|s| elapsed_suffix(s, now_s))
         })
         .collect();
 

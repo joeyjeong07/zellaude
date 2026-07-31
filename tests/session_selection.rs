@@ -29,6 +29,7 @@ mod state {
         pub rainbow_mode_ts_ms: u64,
         pub rainbow_mode_marker: Option<String>,
         pub restored: bool,
+        pub placeholder: bool,
     }
 }
 
@@ -52,6 +53,7 @@ fn session(session_id: &str, activity: Activity, last_ts_ms: u64) -> SessionInfo
         rainbow_mode_ts_ms: last_ts_ms,
         rainbow_mode_marker: None,
         restored: false,
+        placeholder: false,
     }
 }
 

@@ -168,6 +168,7 @@ mod state {
         pub rainbow_mode_ts_ms: u64,
         pub rainbow_mode_marker: Option<String>,
         pub restored: bool,
+        pub placeholder: bool,
     }
 
     pub struct State {
@@ -367,6 +368,7 @@ fn rainbow_letters_are_contrast_checked_against_the_gruvbox_tab_pair() {
             rainbow_mode_ts_ms: 1_000,
             rainbow_mode_marker: Some("ultra".to_string()),
             restored: false,
+            placeholder: false,
         },
     );
 
@@ -405,6 +407,7 @@ fn permission_flash_uses_gruvbox_error_background_and_preserves_rainbow() {
             rainbow_mode_ts_ms: 1_000,
             rainbow_mode_marker: Some("ultra".to_string()),
             restored: false,
+            placeholder: false,
         },
     );
     state.flash_deadlines.insert(7, 2_000);
@@ -448,4 +451,36 @@ fn settings_surface_uses_gruvbox_text_and_accent_colors() {
     assert!(output.contains("\x1b[38;2;104;157;106m●"));
     assert!(output.contains("\x1b[38;2;214;93;14m◐"));
     assert!(output.contains("\x1b[38;2;204;36;29m×"));
+}
+
+fn idle_agent_session(pane_id: u32) -> SessionInfo {
+    SessionInfo {
+        session_id: "session".to_string(),
+        pane_id,
+        activity: Activity::Idle,
+        tab_name: Some("agent".to_string()),
+        tab_index: Some(0),
+        last_event_ts: 0,
+        cwd: None,
+        last_ts_ms: 0,
+        rainbow_name: false,
+        rainbow_name_known: false,
+        rainbow_mode_ts_ms: 0,
+        rainbow_mode_marker: None,
+        restored: false,
+        placeholder: false,
+    }
+}
+
+#[test]
+fn a_placeholder_never_renders_an_elapsed_suffix() {
+    let observed = idle_agent_session(7);
+    let placeholder = SessionInfo {
+        placeholder: true,
+        ..idle_agent_session(7)
+    };
+
+    // The control proves the timestamp would otherwise cross the threshold.
+    assert!(render::elapsed_suffix(&observed, 1_000_000).is_some());
+    assert_eq!(render::elapsed_suffix(&placeholder, 1_000_000), None);
 }

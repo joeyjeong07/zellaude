@@ -58,6 +58,11 @@ pub struct SessionInfo {
     /// observed from a real hook or synchronized from a live peer.
     #[serde(default)]
     pub restored: bool,
+    /// Derived locally from pane introspection rather than observed from an
+    /// agent. An empty `session_id` cannot stand in for this: hook payloads
+    /// legitimately omit the id, and those sessions are real.
+    #[serde(default)]
+    pub placeholder: bool,
 }
 
 fn default_rainbow_name_known() -> bool {
@@ -201,4 +206,10 @@ pub struct State {
     pub attach_scan_requested: bool,
     pub last_agent_poll_ms: u64,
     pub pane_introspection_supported: Option<bool>,
+    pub plugin_id: Option<u32>,
+    /// pane_id -> when its agent session last ended. Kept apart from
+    /// `session_end_tombstones`, which also records merely blocked events.
+    pub pane_session_ended_ms: HashMap<u32, u64>,
+    /// Where the next bounded introspection sweep resumes.
+    pub agent_poll_cursor: u32,
 }

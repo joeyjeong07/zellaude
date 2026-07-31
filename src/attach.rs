@@ -26,8 +26,7 @@ pub fn client_for_command(command: &[String]) -> Option<&'static str> {
     }
 }
 
-pub fn is_active_instance(manifest: &PaneManifest, tabs: &[TabInfo]) -> bool {
-    let current_id = get_plugin_ids().plugin_id;
+pub fn is_active_instance(manifest: &PaneManifest, tabs: &[TabInfo], current_id: u32) -> bool {
     let current_tab = manifest
         .panes
         .iter()
@@ -47,12 +46,15 @@ pub fn is_active_instance(manifest: &PaneManifest, tabs: &[TabInfo]) -> bool {
     }
 }
 
-pub fn run(session_name: &str, pane_to_tab: &HashMap<u32, (usize, String)>) -> bool {
+pub fn run(
+    session_name: &str,
+    pane_to_tab: &HashMap<u32, (usize, String)>,
+    supports_introspection: bool,
+) -> bool {
     let mut pane_ids: Vec<u32> = pane_to_tab.keys().copied().collect();
     pane_ids.sort_unstable();
 
     let scan_started_ms = unix_now_ms();
-    let supports_introspection = supports_pane_introspection(&get_zellij_version());
     let mut records = Vec::new();
     let mut pane_leaders = Vec::new();
     if supports_introspection {

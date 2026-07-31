@@ -1,5 +1,5 @@
 use crate::state::{Activity, SessionInfo};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Codex-family TUIs start their session lazily on the first prompt, so no
 /// hook fires at launch and the pane would stay invisible until the user
@@ -22,29 +22,91 @@ pub fn placeholder_session(pane_id: u32) -> SessionInfo {
         rainbow_mode_ts_ms: 0,
         rainbow_mode_marker: None,
         restored: true,
+        placeholder: true,
     }
 }
 
 pub fn is_placeholder(session: &SessionInfo) -> bool {
-    session.session_id.is_empty()
+    session.placeholder
+}
+
+/// A pane whose agent session just ended may still report the exiting binary
+/// as its foreground command. Ignore introspection for a moment so a dying
+/// agent is not immediately resurrected as an idle placeholder.
+pub const PLACEHOLDER_GRACE_MS: u64 = 5_000;
+
+/// Querying every unclaimed pane on every cycle scales with session size, so
+/// each cycle spends at most this many host calls. Sessions smaller than the
+/// budget are unaffected; larger ones sweep across consecutive cycles.
+pub const AGENT_POLL_BUDGET: usize = 12;
+
+pub fn ended_recently(ended_ms: &HashMap<u32, u64>, pane_id: u32, now_ms: u64) -> bool {
+    ended_ms
+        .get(&pane_id)
+        .is_some_and(|&ended_at| now_ms.saturating_sub(ended_at) < PLACEHOLDER_GRACE_MS)
+}
+
+/// Pick the panes to query this cycle, and the cursor the next cycle resumes
+/// from. Panes already holding a placeholder are always included so an exited
+/// agent disappears promptly; the rest rotate through the remaining budget.
+pub fn panes_to_poll(
+    sessions: &BTreeMap<u32, SessionInfo>,
+    mut candidates: Vec<u32>,
+    cursor: u32,
+    budget: usize,
+) -> (Vec<u32>, u32) {
+    candidates.sort_unstable();
+    let (mut selected, rotating): (Vec<u32>, Vec<u32>) = candidates
+        .into_iter()
+        .partition(|pane_id| sessions.contains_key(pane_id));
+
+    let remaining = budget.saturating_sub(selected.len());
+    if rotating.is_empty() || remaining == 0 {
+        return (selected, cursor);
+    }
+
+    let start = rotating
+        .iter()
+        .position(|&pane_id| pane_id >= cursor)
+        .unwrap_or(0);
+    let taken: Vec<u32> = rotating
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(remaining.min(rotating.len()))
+        .copied()
+        .collect();
+    let next_cursor = taken
+        .last()
+        .and_then(|last| last.checked_add(1))
+        .unwrap_or(0);
+    selected.extend(taken);
+    (selected, next_cursor)
+}
+
+/// What pane introspection saw running in a pane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PaneAgent {
+    Running,
+    Absent,
+    /// Not readable, or too soon after a session end to trust.
+    Unknown,
 }
 
 /// Reconcile the session map with the observed foreground commands of panes
-/// that have no real session. `observed` maps pane id to the classified agent
-/// client (`client_for_command`) of its currently running command. Returns
-/// true when an entry was added or removed.
+/// that have no real session. Returns true when an entry was added or removed.
 pub fn reconcile_agent_panes(
     sessions: &mut BTreeMap<u32, SessionInfo>,
-    observed: impl IntoIterator<Item = (u32, Option<&'static str>)>,
+    observed: impl IntoIterator<Item = (u32, PaneAgent)>,
 ) -> bool {
     let mut changed = false;
-    for (pane_id, client) in observed {
-        match (sessions.get(&pane_id), client) {
-            (None, Some(_)) => {
+    for (pane_id, observation) in observed {
+        match (sessions.get(&pane_id), observation) {
+            (None, PaneAgent::Running) => {
                 sessions.insert(pane_id, placeholder_session(pane_id));
                 changed = true;
             }
-            (Some(session), None) if is_placeholder(session) => {
+            (Some(session), PaneAgent::Absent) if is_placeholder(session) => {
                 sessions.remove(&pane_id);
                 changed = true;
             }
@@ -63,6 +125,7 @@ mod tests {
             session_id: "real".to_string(),
             last_ts_ms: 1000,
             last_event_ts: 1,
+            placeholder: false,
             ..placeholder_session(pane_id)
         }
     }
@@ -71,7 +134,7 @@ mod tests {
     fn agent_pane_without_session_gains_a_placeholder() {
         let mut sessions = BTreeMap::new();
 
-        assert!(reconcile_agent_panes(&mut sessions, [(7, Some("codex"))]));
+        assert!(reconcile_agent_panes(&mut sessions, [(7, PaneAgent::Running)]));
 
         let session = sessions.get(&7).unwrap();
         assert!(is_placeholder(session));
@@ -83,7 +146,7 @@ mod tests {
     fn placeholder_is_removed_when_the_agent_exits() {
         let mut sessions = BTreeMap::from([(7, placeholder_session(7))]);
 
-        assert!(reconcile_agent_panes(&mut sessions, [(7, None)]));
+        assert!(reconcile_agent_panes(&mut sessions, [(7, PaneAgent::Absent)]));
 
         assert!(sessions.is_empty());
     }
@@ -94,7 +157,7 @@ mod tests {
 
         assert!(!reconcile_agent_panes(
             &mut sessions,
-            [(7, Some("codex")), (8, None)]
+            [(7, PaneAgent::Running), (8, PaneAgent::Absent)]
         ));
 
         assert!(sessions.contains_key(&7));
@@ -105,8 +168,73 @@ mod tests {
     fn a_real_session_is_never_touched() {
         let mut sessions = BTreeMap::from([(7, real_session(7))]);
 
-        assert!(!reconcile_agent_panes(&mut sessions, [(7, None)]));
+        assert!(!reconcile_agent_panes(&mut sessions, [(7, PaneAgent::Absent)]));
 
         assert_eq!(sessions.get(&7).unwrap().session_id, "real");
+    }
+
+    #[test]
+    fn an_unreadable_pane_command_keeps_the_placeholder() {
+        let mut sessions = BTreeMap::from([(7, placeholder_session(7))]);
+
+        assert!(!reconcile_agent_panes(&mut sessions, [(7, PaneAgent::Unknown)]));
+
+        assert!(sessions.contains_key(&7));
+    }
+
+    #[test]
+    fn a_pane_whose_session_just_ended_is_still_within_the_grace_window() {
+        let ended = HashMap::from([(7, 10_000)]);
+
+        assert!(ended_recently(&ended, 7, 11_000));
+    }
+
+    #[test]
+    fn the_grace_window_expires_and_other_panes_are_unaffected() {
+        let ended = HashMap::from([(7, 10_000)]);
+
+        assert!(!ended_recently(&ended, 7, 10_000 + PLACEHOLDER_GRACE_MS));
+        assert!(!ended_recently(&ended, 8, 11_000));
+    }
+
+    fn placeholders(pane_ids: [u32; 2]) -> BTreeMap<u32, SessionInfo> {
+        pane_ids
+            .into_iter()
+            .map(|pane_id| (pane_id, placeholder_session(pane_id)))
+            .collect()
+    }
+
+    #[test]
+    fn every_pane_is_polled_when_the_session_fits_the_budget() {
+        let (selected, cursor) = panes_to_poll(&BTreeMap::new(), vec![3, 1, 2], 0, 12);
+
+        assert_eq!(selected, vec![1, 2, 3]);
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn a_large_session_sweeps_across_cycles_without_missing_a_pane() {
+        let mut seen = Vec::new();
+        let mut cursor = 0;
+        for _ in 0..5 {
+            let (selected, next) =
+                panes_to_poll(&BTreeMap::new(), (1..=10).collect(), cursor, 2);
+            assert_eq!(selected.len(), 2);
+            seen.extend(selected);
+            cursor = next;
+        }
+
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn existing_placeholders_are_always_polled_and_do_not_move_the_cursor() {
+        let sessions = placeholders([8, 9]);
+
+        let (selected, cursor) =
+            panes_to_poll(&sessions, vec![1, 2, 8, 9], 0, 2);
+
+        assert_eq!(selected, vec![8, 9]);
+        assert_eq!(cursor, 0);
     }
 }
