@@ -199,4 +199,6 @@ pub struct State {
     pub command_permissions_granted: bool,
     pub hooks_installed: bool,
     pub attach_scan_requested: bool,
+    pub last_agent_poll_ms: u64,
+    pub pane_introspection_supported: Option<bool>,
 }

@@ -1,6 +1,7 @@
 mod attach;
 mod event_handler;
 mod installer;
+mod placeholder;
 mod rainbow;
 mod render;
 mod session_selection;
@@ -16,6 +17,9 @@ use zellij_tile::prelude::*;
 const DONE_TIMEOUT: u64 = 30;
 const TIMER_INTERVAL: f64 = 1.0;
 const FLASH_TICK: f64 = 0.25;
+/// Foreground-command polling for pre-prompt agent TUIs; keeps host queries
+/// bounded when the timer runs at flash/rainbow cadence.
+const AGENT_POLL_INTERVAL_MS: u64 = 2000;
 
 register_plugin!(State);
 
@@ -262,6 +266,7 @@ impl ZellijPlugin for State {
             Event::Timer(_) => {
                 let stale_changed = self.cleanup_stale_sessions();
                 let flash_changed = self.cleanup_expired_flashes();
+                let placeholder_changed = self.poll_agent_panes();
                 let has_flashes = self.has_active_flashes();
                 let has_rainbows = self.has_rainbow_sessions();
                 if has_rainbows {
@@ -275,6 +280,7 @@ impl ZellijPlugin for State {
                     || has_flashes
                     || stale_changed
                     || flash_changed
+                    || placeholder_changed
                     || self.has_elapsed_display()
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
@@ -394,6 +400,55 @@ impl State {
         }
     }
 
+    /// Recognize agent TUIs that have not produced a hook event yet (Codex
+    /// starts its session lazily on the first prompt) by classifying each
+    /// unclaimed pane's current foreground command. Only the instance on the
+    /// active tab polls: inactive instances are not visible and re-derive
+    /// placeholders when their tab regains focus.
+    fn poll_agent_panes(&mut self) -> bool {
+        if !self.command_permissions_granted {
+            return false;
+        }
+        let now = unix_now_ms();
+        if now.saturating_sub(self.last_agent_poll_ms) < AGENT_POLL_INTERVAL_MS {
+            return false;
+        }
+        let Some(manifest) = self.pane_manifest.as_ref() else {
+            return false;
+        };
+        if self.tabs.is_empty() || !attach::is_active_instance(manifest, &self.tabs) {
+            return false;
+        }
+        let introspection_supported = *self.pane_introspection_supported.get_or_insert_with(
+            || attach::supports_pane_introspection(&get_zellij_version()),
+        );
+        if !introspection_supported {
+            return false;
+        }
+        self.last_agent_poll_ms = now;
+
+        let observed: Vec<(u32, Option<&'static str>)> = self
+            .pane_to_tab
+            .keys()
+            .filter(|pane_id| {
+                self.sessions
+                    .get(pane_id)
+                    .is_none_or(placeholder::is_placeholder)
+            })
+            .map(|&pane_id| {
+                let client = get_pane_running_command(PaneId::Terminal(pane_id))
+                    .ok()
+                    .and_then(|command| attach::client_for_command(&command));
+                (pane_id, client)
+            })
+            .collect();
+        let changed = placeholder::reconcile_agent_panes(&mut self.sessions, observed);
+        if changed {
+            self.refresh_session_tab_names();
+        }
+        changed
+    }
+
     fn rebuild_pane_map(&mut self) {
         if let Some(ref manifest) = self.pane_manifest {
             self.pane_to_tab = tab_pane_map::build_pane_to_tab_map(&self.tabs, manifest);
@@ -477,9 +532,16 @@ impl State {
     }
 
     fn broadcast_sessions(&self) {
+        // Placeholders are derived locally from pane introspection; syncing
+        // them could resurrect one an instance already removed.
+        let shared: BTreeMap<u32, &SessionInfo> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| !placeholder::is_placeholder(session))
+            .map(|(pane_id, session)| (*pane_id, session))
+            .collect();
         let mut msg = MessageToPlugin::new("zellaude:sync");
-        msg.message_payload =
-            Some(serde_json::to_string(&self.sessions).unwrap_or_default());
+        msg.message_payload = Some(serde_json::to_string(&shared).unwrap_or_default());
         pipe_message_to_plugin(msg);
     }
 
@@ -520,6 +582,9 @@ impl State {
 
     fn merge_sessions(&mut self, incoming: BTreeMap<u32, SessionInfo>) {
         for (pane_id, mut session) in incoming {
+            if placeholder::is_placeholder(&session) {
+                continue;
+            }
             let incoming_ts_ms = if session.last_ts_ms > 0 {
                 session.last_ts_ms
             } else {
@@ -622,6 +687,49 @@ mod tests {
                 .get(&(7, "ended".to_string())),
             Some(&40)
         );
+    }
+
+    #[test]
+    fn peer_sync_never_imports_placeholders() {
+        let mut state = State::default();
+
+        state.merge_sessions(BTreeMap::from([(
+            7,
+            placeholder::placeholder_session(7),
+        )]));
+
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn a_placeholder_is_promoted_in_place_by_the_first_hook_event() {
+        let mut state = State::default();
+        state
+            .sessions
+            .insert(7, placeholder::placeholder_session(7));
+
+        event_handler::handle_hook_event(
+            &mut state,
+            HookPayload {
+                session_id: Some("real".to_string()),
+                pane_id: 7,
+                hook_event: "UserPromptSubmit".to_string(),
+                tool_name: None,
+                cwd: None,
+                zellij_session: None,
+                term_program: None,
+                ts_ms: Some(1000),
+                is_subagent: false,
+                rainbow_name: Some(false),
+                rainbow_mode_ts_ms: None,
+                rainbow_mode_marker: None,
+            },
+        );
+
+        let session = state.sessions.get(&7).unwrap();
+        assert_eq!(session.session_id, "real");
+        assert_eq!(session.activity, Activity::Thinking);
+        assert!(!placeholder::is_placeholder(session));
     }
 
     #[test]

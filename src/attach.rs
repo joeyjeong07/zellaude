@@ -5,7 +5,7 @@ use zellij_tile::prelude::*;
 
 const ATTACH_SCRIPT: &str = include_str!("../scripts/zellaude-attach.sh");
 
-fn supports_pane_introspection(version: &str) -> bool {
+pub fn supports_pane_introspection(version: &str) -> bool {
     let mut parts = version.trim_start_matches('v').split('.');
     let major = parts.next().and_then(|part| part.parse::<u64>().ok());
     let minor = parts.next().and_then(|part| part.parse::<u64>().ok());
@@ -13,11 +13,14 @@ fn supports_pane_introspection(version: &str) -> bool {
         || matches!((major, minor), (Some(0), Some(minor)) if minor >= 44)
 }
 
-fn client_for_command(command: &[String]) -> Option<&'static str> {
+pub fn client_for_command(command: &[String]) -> Option<&'static str> {
     let executable = command.first()?;
     let name = Path::new(executable).file_name()?.to_str()?;
     match name {
-        "codex" => Some("codex"),
+        // better-codex is a Codex fork whose wrapper execs a binary named
+        // `codex`; the mapping covers the pre-exec window and directly-named
+        // binaries.
+        "codex" | "better-codex" => Some("codex"),
         "claude" => Some("claude"),
         _ => None,
     }
@@ -126,6 +129,10 @@ mod tests {
         assert_eq!(
             client_for_command(&["claude".to_string(), "--resume".to_string()]),
             Some("claude")
+        );
+        assert_eq!(
+            client_for_command(&["/root/.local/bin/better-codex".to_string()]),
+            Some("codex")
         );
         assert_eq!(client_for_command(&["bash".to_string()]), None);
         assert_eq!(client_for_command(&[]), None);
