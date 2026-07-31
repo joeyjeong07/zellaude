@@ -105,12 +105,19 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
         if payload.is_subagent {
             return;
         }
+        let ts_ms = payload.ts_ms.unwrap_or_else(crate::state::unix_now_ms);
+        // Recorded even when the payload omits an id, so the introspection
+        // poll can still hold off on resurrecting the pane it just left.
+        state
+            .pane_session_ended_ms
+            .entry(payload.pane_id)
+            .and_modify(|ended_at| *ended_at = (*ended_at).max(ts_ms))
+            .or_insert(ts_ms);
         if let Some(session_id) = payload
             .session_id
             .as_deref()
             .filter(|session_id| !session_id.is_empty())
         {
-            let ts_ms = payload.ts_ms.unwrap_or_else(crate::state::unix_now_ms);
             state
                 .session_end_tombstones
                 .entry((payload.pane_id, session_id.to_string()))
@@ -121,9 +128,12 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
             .sessions
             .get(&payload.pane_id)
             .map(|session| {
-                payload.session_id.as_deref().unwrap_or_default().is_empty()
-                    || session.session_id.is_empty()
-                    || payload.session_id.as_deref() == Some(session.session_id.as_str())
+                // A placeholder tracks a process that introspection still sees
+                // running, so only the poll may retire it.
+                !session.placeholder
+                    && (payload.session_id.as_deref().unwrap_or_default().is_empty()
+                        || session.session_id.is_empty()
+                        || payload.session_id.as_deref() == Some(session.session_id.as_str()))
             })
             .unwrap_or(false);
         if should_remove {

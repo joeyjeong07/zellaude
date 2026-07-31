@@ -206,4 +206,10 @@ pub struct State {
     pub attach_scan_requested: bool,
     pub last_agent_poll_ms: u64,
     pub pane_introspection_supported: Option<bool>,
+    pub plugin_id: Option<u32>,
+    /// pane_id -> when its agent session last ended. Kept apart from
+    /// `session_end_tombstones`, which also records merely blocked events.
+    pub pane_session_ended_ms: HashMap<u32, u64>,
+    /// Where the next bounded introspection sweep resumes.
+    pub agent_poll_cursor: u32,
 }

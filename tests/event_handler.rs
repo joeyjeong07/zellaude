@@ -73,6 +73,7 @@ mod state {
     pub struct State {
         pub sessions: BTreeMap<u32, SessionInfo>,
         pub session_end_tombstones: BTreeMap<(u32, String), u64>,
+        pub pane_session_ended_ms: HashMap<u32, u64>,
         pub pane_to_tab: HashMap<u32, (usize, String)>,
         pub flash_deadlines: HashMap<u32, u64>,
         pub zellij_session_name: Option<String>,
@@ -85,6 +86,7 @@ mod state {
             Self {
                 sessions: BTreeMap::new(),
                 session_end_tombstones: BTreeMap::new(),
+                pane_session_ended_ms: HashMap::new(),
                 pane_to_tab: HashMap::new(),
                 flash_deadlines: HashMap::new(),
                 zellij_session_name: None,
@@ -99,6 +101,9 @@ mod state {
 
 #[path = "../src/event_handler.rs"]
 mod event_handler;
+
+#[path = "../src/placeholder.rs"]
+mod placeholder;
 
 use state::{Activity, HookPayload, State};
 
@@ -421,29 +426,11 @@ fn rejected_newer_event_does_not_clear_an_ended_owner_tombstone() {
     );
 }
 
-fn placeholder_session(pane_id: u32) -> state::SessionInfo {
-    state::SessionInfo {
-        session_id: String::new(),
-        pane_id,
-        activity: Activity::Idle,
-        tab_name: None,
-        tab_index: None,
-        last_event_ts: 0,
-        cwd: None,
-        last_ts_ms: 0,
-        rainbow_name: false,
-        rainbow_name_known: false,
-        rainbow_mode_ts_ms: 0,
-        rainbow_mode_marker: None,
-        restored: true,
-        placeholder: true,
-    }
-}
 
 #[test]
 fn subagent_events_cannot_claim_a_placeholder_pane() {
     let mut state = State::default();
-    state.sessions.insert(7, placeholder_session(7));
+    state.sessions.insert(7, placeholder::placeholder_session(7));
 
     let mut subagent = payload("child", None, None, 1_000);
     subagent.hook_event = "PermissionRequest".to_string();
@@ -462,4 +449,27 @@ fn a_hook_event_without_a_session_id_creates_a_real_session() {
     event_handler::handle_hook_event(&mut state, payload("", None, None, 1_000));
 
     assert!(!state.sessions.get(&7).unwrap().placeholder);
+}
+
+#[test]
+fn a_stale_session_end_cannot_retire_a_running_agents_placeholder() {
+    let mut state = State::default();
+    state.sessions.insert(7, placeholder::placeholder_session(7));
+
+    let mut ended = payload("previous-agent", None, None, 2_000);
+    ended.hook_event = "SessionEnd".to_string();
+    event_handler::handle_hook_event(&mut state, ended);
+
+    assert!(state.sessions.contains_key(&7));
+}
+
+#[test]
+fn a_session_end_without_an_id_still_records_when_the_pane_ended() {
+    let mut state = State::default();
+
+    let mut ended = payload("", None, None, 2_000);
+    ended.hook_event = "SessionEnd".to_string();
+    event_handler::handle_hook_event(&mut state, ended);
+
+    assert_eq!(state.pane_session_ended_ms.get(&7), Some(&2_000));
 }

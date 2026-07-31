@@ -53,6 +53,9 @@ impl ZellijPlugin for State {
                     if let Some(idx) = new_active {
                         self.clear_flashes_on_tab(idx);
                     }
+                    // This instance stopped polling while its tab was hidden,
+                    // so its placeholders may be stale. Poll on the next tick.
+                    self.last_agent_poll_ms = 0;
                 }
                 self.active_tab_index = new_active;
                 self.tabs = tabs;
@@ -386,21 +389,27 @@ impl State {
             return;
         }
         let supports_introspection = self.introspection_supported();
-        let Some(session_name) = self.zellij_session_name.clone() else {
+        let Some(session_name) = self.zellij_session_name.as_deref() else {
             return;
         };
 
-        if attach::run(&session_name, &self.pane_to_tab, supports_introspection) {
+        if attach::run(session_name, &self.pane_to_tab, supports_introspection) {
             self.attach_scan_requested = true;
         }
     }
 
     /// Only the instance whose tab is visible should spend host calls on
     /// discovery or polling.
-    fn is_on_active_tab(&self) -> bool {
-        self.pane_manifest.as_ref().is_some_and(|manifest| {
-            !self.tabs.is_empty() && attach::is_active_instance(manifest, &self.tabs)
-        })
+    fn is_on_active_tab(&mut self) -> bool {
+        let plugin_id = *self
+            .plugin_id
+            .get_or_insert_with(|| get_plugin_ids().plugin_id);
+        let tabs = &self.tabs;
+        self.pane_manifest
+            .as_ref()
+            .is_some_and(|manifest| {
+                !tabs.is_empty() && attach::is_active_instance(manifest, tabs, plugin_id)
+            })
     }
 
     fn introspection_supported(&mut self) -> bool {
@@ -409,11 +418,13 @@ impl State {
             .get_or_insert_with(|| attach::supports_pane_introspection(&get_zellij_version()))
     }
 
-    /// Bounds how often the pane-introspection poll runs. Stamping inside the
-    /// check keeps a tick that a later gate rejects from re-running the gates
-    /// on every timer fire.
+    /// Bounds how often the pane-introspection poll runs. Runs after the cheap
+    /// gates so an instance that cannot poll does not consume its own window,
+    /// and treats a backward clock step as due so polling cannot latch off.
     fn agent_poll_due(&mut self, now_ms: u64) -> bool {
-        if now_ms.saturating_sub(self.last_agent_poll_ms) < AGENT_POLL_INTERVAL_MS {
+        if now_ms >= self.last_agent_poll_ms
+            && now_ms - self.last_agent_poll_ms < AGENT_POLL_INTERVAL_MS
+        {
             return false;
         }
         self.last_agent_poll_ms = now_ms;
@@ -426,28 +437,40 @@ impl State {
     /// active tab polls: inactive instances are not visible and re-derive
     /// placeholders when their tab regains focus.
     fn poll_agent_panes(&mut self) -> bool {
-        if !self.command_permissions_granted {
+        if !self.command_permissions_granted || !self.hooks_installed {
+            return false;
+        }
+        if !self.is_on_active_tab() || !self.introspection_supported() {
             return false;
         }
         let now = unix_now_ms();
         if !self.agent_poll_due(now) {
             return false;
         }
-        if !self.is_on_active_tab() || !self.introspection_supported() {
-            return false;
-        }
 
-        let observed: Vec<(u32, placeholder::PaneAgent)> = self
+        let candidates: Vec<u32> = self
             .pane_to_tab
             .keys()
+            .copied()
             .filter(|pane_id| {
                 self.sessions
                     .get(pane_id)
                     .is_none_or(placeholder::is_placeholder)
             })
-            .map(|&pane_id| {
+            .collect();
+        let (to_poll, next_cursor) = placeholder::panes_to_poll(
+            &self.sessions,
+            candidates,
+            self.agent_poll_cursor,
+            placeholder::AGENT_POLL_BUDGET,
+        );
+        self.agent_poll_cursor = next_cursor;
+
+        let observed: Vec<(u32, placeholder::PaneAgent)> = to_poll
+            .into_iter()
+            .map(|pane_id| {
                 let observation = if placeholder::ended_recently(
-                    &self.session_end_tombstones,
+                    &self.pane_session_ended_ms,
                     pane_id,
                     now,
                 ) {
@@ -763,6 +786,16 @@ mod tests {
         assert!(state.agent_poll_due(10_000));
         assert!(!state.agent_poll_due(10_001));
         assert!(state.agent_poll_due(10_000 + AGENT_POLL_INTERVAL_MS));
+    }
+
+    #[test]
+    fn a_backward_clock_step_cannot_latch_the_agent_poll_off() {
+        let mut state = State::default();
+        assert!(state.agent_poll_due(100_000));
+
+        // The clock steps back; the stale future stamp must not block polling.
+        assert!(state.agent_poll_due(40_000));
+        assert!(!state.agent_poll_due(40_001));
     }
 
     #[test]

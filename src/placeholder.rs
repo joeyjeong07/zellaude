@@ -1,5 +1,5 @@
 use crate::state::{Activity, SessionInfo};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Codex-family TUIs start their session lazily on the first prompt, so no
 /// hook fires at launch and the pane would stay invisible until the user
@@ -35,25 +35,61 @@ pub fn is_placeholder(session: &SessionInfo) -> bool {
 /// agent is not immediately resurrected as an idle placeholder.
 pub const PLACEHOLDER_GRACE_MS: u64 = 5_000;
 
-pub fn ended_recently(
-    tombstones: &BTreeMap<(u32, String), u64>,
-    pane_id: u32,
-    now_ms: u64,
-) -> bool {
-    tombstones
-        .range((pane_id, String::new())..)
-        .take_while(|((tombstone_pane, _), _)| *tombstone_pane == pane_id)
-        .any(|(_, &ended_at)| now_ms.saturating_sub(ended_at) < PLACEHOLDER_GRACE_MS)
+/// Querying every unclaimed pane on every cycle scales with session size, so
+/// each cycle spends at most this many host calls. Sessions smaller than the
+/// budget are unaffected; larger ones sweep across consecutive cycles.
+pub const AGENT_POLL_BUDGET: usize = 12;
+
+pub fn ended_recently(ended_ms: &HashMap<u32, u64>, pane_id: u32, now_ms: u64) -> bool {
+    ended_ms
+        .get(&pane_id)
+        .is_some_and(|&ended_at| now_ms.saturating_sub(ended_at) < PLACEHOLDER_GRACE_MS)
+}
+
+/// Pick the panes to query this cycle, and the cursor the next cycle resumes
+/// from. Panes already holding a placeholder are always included so an exited
+/// agent disappears promptly; the rest rotate through the remaining budget.
+pub fn panes_to_poll(
+    sessions: &BTreeMap<u32, SessionInfo>,
+    mut candidates: Vec<u32>,
+    cursor: u32,
+    budget: usize,
+) -> (Vec<u32>, u32) {
+    candidates.sort_unstable();
+    let (mut selected, rotating): (Vec<u32>, Vec<u32>) = candidates
+        .into_iter()
+        .partition(|pane_id| sessions.contains_key(pane_id));
+
+    let remaining = budget.saturating_sub(selected.len());
+    if rotating.is_empty() || remaining == 0 {
+        return (selected, cursor);
+    }
+
+    let start = rotating
+        .iter()
+        .position(|&pane_id| pane_id >= cursor)
+        .unwrap_or(0);
+    let taken: Vec<u32> = rotating
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(remaining.min(rotating.len()))
+        .copied()
+        .collect();
+    let next_cursor = taken
+        .last()
+        .and_then(|last| last.checked_add(1))
+        .unwrap_or(0);
+    selected.extend(taken);
+    (selected, next_cursor)
 }
 
 /// What pane introspection saw running in a pane.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PaneAgent {
-    /// The foreground command is a known agent client.
     Running,
-    /// The foreground command is something else.
     Absent,
-    /// The command could not be read, or is not trustworthy yet.
+    /// Not readable, or too soon after a session end to trust.
     Unknown,
 }
 
@@ -136,11 +172,6 @@ mod tests {
 
         assert_eq!(sessions.get(&7).unwrap().session_id, "real");
     }
-}
-
-#[cfg(test)]
-mod unreadable_tests {
-    use super::*;
 
     #[test]
     fn an_unreadable_pane_command_keeps_the_placeholder() {
@@ -150,24 +181,60 @@ mod unreadable_tests {
 
         assert!(sessions.contains_key(&7));
     }
-}
-
-#[cfg(test)]
-mod grace_tests {
-    use super::*;
 
     #[test]
     fn a_pane_whose_session_just_ended_is_still_within_the_grace_window() {
-        let tombstones = BTreeMap::from([((7, "gone".to_string()), 10_000)]);
+        let ended = HashMap::from([(7, 10_000)]);
 
-        assert!(ended_recently(&tombstones, 7, 11_000));
+        assert!(ended_recently(&ended, 7, 11_000));
     }
 
     #[test]
     fn the_grace_window_expires_and_other_panes_are_unaffected() {
-        let tombstones = BTreeMap::from([((7, "gone".to_string()), 10_000)]);
+        let ended = HashMap::from([(7, 10_000)]);
 
-        assert!(!ended_recently(&tombstones, 7, 10_000 + PLACEHOLDER_GRACE_MS));
-        assert!(!ended_recently(&tombstones, 8, 11_000));
+        assert!(!ended_recently(&ended, 7, 10_000 + PLACEHOLDER_GRACE_MS));
+        assert!(!ended_recently(&ended, 8, 11_000));
+    }
+
+    fn placeholders(pane_ids: [u32; 2]) -> BTreeMap<u32, SessionInfo> {
+        pane_ids
+            .into_iter()
+            .map(|pane_id| (pane_id, placeholder_session(pane_id)))
+            .collect()
+    }
+
+    #[test]
+    fn every_pane_is_polled_when_the_session_fits_the_budget() {
+        let (selected, cursor) = panes_to_poll(&BTreeMap::new(), vec![3, 1, 2], 0, 12);
+
+        assert_eq!(selected, vec![1, 2, 3]);
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn a_large_session_sweeps_across_cycles_without_missing_a_pane() {
+        let mut seen = Vec::new();
+        let mut cursor = 0;
+        for _ in 0..5 {
+            let (selected, next) =
+                panes_to_poll(&BTreeMap::new(), (1..=10).collect(), cursor, 2);
+            assert_eq!(selected.len(), 2);
+            seen.extend(selected);
+            cursor = next;
+        }
+
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn existing_placeholders_are_always_polled_and_do_not_move_the_cursor() {
+        let sessions = placeholders([8, 9]);
+
+        let (selected, cursor) =
+            panes_to_poll(&sessions, vec![1, 2, 8, 9], 0, 2);
+
+        assert_eq!(selected, vec![8, 9]);
+        assert_eq!(cursor, 0);
     }
 }
