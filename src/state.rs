@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zellij_tile::prelude::*;
 
+use crate::split_three;
+
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -207,6 +209,12 @@ pub struct State {
     /// the plugin is left permanently inert and indistinguishable from a working
     /// one — no hooks installed, no config, no explanation.
     pub permissions_denied: bool,
+    pub split_three_bindings_installed: bool,
+    pub split_three_uses_legacy_keybinds: bool,
+    pub initial_keybinds: Option<KeybindsVec>,
+    pub split_three_operation: Option<split_three::Operation>,
+    pub split_three_next_operation_id: u64,
+    pub split_three_action_started_ms: u64,
     pub hooks_installed: bool,
     pub attach_scan_requested: bool,
     pub last_agent_poll_ms: u64,
