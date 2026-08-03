@@ -239,6 +239,38 @@ pub(crate) fn build_status_bar(state: &mut State, _rows: usize, cols: usize) -> 
     };
     let prefix_used = col;
 
+    // A denied permission leaves the plugin unable to do anything: no hooks, no
+    // config, no activity. Say so instead of rendering a bar that looks healthy.
+    // This replaces the tabs rather than sharing the row because the whole point
+    // is that it must not be mistaken for normal output.
+    if col < cols && state.permissions_denied {
+        arrow(&mut buf, &mut col, last_prefix_bg, theme.error.background);
+        let notice = " Zellaude needs permission — click here, or focus this pane and press y ";
+        let short = " Zellaude needs permission: press y ";
+        let text = if col + display_width(notice) <= cols {
+            notice
+        } else {
+            short
+        };
+        let width = display_width(text);
+        if col + width <= cols {
+            let _ = write!(
+                buf,
+                "{}{}{BOLD}{text}{RESET}",
+                bg(theme.error.background),
+                fg(theme.error.base),
+            );
+            col += width;
+        }
+        let _ = write!(buf, "{bar_bg_str}");
+        if col < cols {
+            let remaining = cols - col;
+            let _ = write!(buf, "{bar_bg_str}{:width$}", "", width = remaining);
+        }
+        let _ = write!(buf, "{RESET}");
+        return buf;
+    }
+
     if col < cols {
         match state.view_mode {
             ViewMode::Normal => {

@@ -183,6 +183,7 @@ mod state {
         pub view_mode: ViewMode,
         pub prefix_click_region: Option<(usize, usize)>,
         pub menu_click_regions: Vec<MenuClickRegion>,
+        pub permissions_denied: bool,
     }
 
     impl Default for State {
@@ -204,6 +205,7 @@ mod state {
                 view_mode: ViewMode::Normal,
                 prefix_click_region: None,
                 menu_click_regions: Vec::new(),
+                permissions_denied: false,
             }
         }
     }
@@ -483,4 +485,42 @@ fn a_placeholder_never_renders_an_elapsed_suffix() {
     // The control proves the timestamp would otherwise cross the threshold.
     assert!(render::elapsed_suffix(&observed, 1_000_000).is_some());
     assert_eq!(render::elapsed_suffix(&placeholder, 1_000_000), None);
+}
+
+#[test]
+fn a_denied_permission_tells_the_user_how_to_grant_it() {
+    // Zellij draws the y/n prompt itself, and once it is dismissed the plugin
+    // gets no second chance to explain: it just sits there inert. The bar is the
+    // only surface left, so it has to say what is wrong and what to press —
+    // otherwise the failure is indistinguishable from the plugin working.
+    let mut state = State {
+        zellij_styling: Some(gruvbox_dark()),
+        tabs: vec![tab(0, "work", true)],
+        permissions_denied: true,
+        ..State::default()
+    };
+
+    let output = render::build_status_bar(&mut state, 1, 100);
+
+    assert!(
+        output.contains("needs permission"),
+        "the bar should say what is wrong: {output}"
+    );
+    assert!(
+        output.contains("press y"),
+        "the bar should say which key grants it: {output}"
+    );
+}
+
+#[test]
+fn a_granted_bar_says_nothing_about_permissions() {
+    let mut state = State {
+        zellij_styling: Some(gruvbox_dark()),
+        tabs: vec![tab(0, "work", true)],
+        ..State::default()
+    };
+
+    let output = render::build_status_bar(&mut state, 1, 100);
+
+    assert!(!output.contains("needs permission"), "{output}");
 }
