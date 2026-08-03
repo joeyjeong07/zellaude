@@ -473,3 +473,34 @@ fn a_session_end_without_an_id_still_records_when_the_pane_ended() {
 
     assert_eq!(state.pane_session_ended_ms.get(&7), Some(&2_000));
 }
+
+#[test]
+fn a_late_event_cannot_resurrect_a_pane_whose_end_carried_no_session_id() {
+    // A hook script that predates the session_id field — or one whose jq
+    // extraction came back empty — sends SessionEnd with no id. Both the
+    // tombstone write and the tombstone lookup were gated on a non-empty id, so
+    // the empty-id path recorded nothing and consulted nothing: a tool event
+    // that raced the end recreated the pane as a *real* session, and the
+    // introspection poll only ever retires placeholders, so it stayed on the bar
+    // for the life of the session.
+    let mut state = State::default();
+    event_handler::handle_hook_event(&mut state, payload("s1", None, None, 100));
+    assert!(state.sessions.contains_key(&7));
+
+    let mut end = payload("s1", None, None, 200);
+    end.hook_event = "SessionEnd".to_string();
+    end.session_id = None;
+    event_handler::handle_hook_event(&mut state, end);
+    assert!(!state.sessions.contains_key(&7), "the end should evict it");
+
+    // A tool event from before the end, delivered afterwards.
+    let mut late = payload("s1", None, None, 150);
+    late.hook_event = "PostToolUse".to_string();
+    late.session_id = None;
+    event_handler::handle_hook_event(&mut state, late);
+
+    assert!(
+        !state.sessions.contains_key(&7),
+        "a pre-end event resurrected the pane"
+    );
+}

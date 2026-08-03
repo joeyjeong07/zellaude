@@ -41,47 +41,48 @@ pub const PLACEHOLDER_GRACE_MS: u64 = 5_000;
 pub const AGENT_POLL_BUDGET: usize = 12;
 
 pub fn ended_recently(ended_ms: &HashMap<u32, u64>, pane_id: u32, now_ms: u64) -> bool {
-    ended_ms
-        .get(&pane_id)
-        .is_some_and(|&ended_at| now_ms.saturating_sub(ended_at) < PLACEHOLDER_GRACE_MS)
+    ended_ms.get(&pane_id).is_some_and(|&ended_at| {
+        // A backward clock step has to expire the window, not hold it open.
+        // `saturating_sub` returns zero for every `now_ms` before `ended_at`,
+        // which kept the grace active until the clock caught up — potentially
+        // hours, blocking both placeholder removal and discovery.
+        now_ms >= ended_at && now_ms - ended_at < PLACEHOLDER_GRACE_MS
+    })
 }
 
 /// Pick the panes to query this cycle, and the cursor the next cycle resumes
-/// from. Panes already holding a placeholder are always included so an exited
-/// agent disappears promptly; the rest rotate through the remaining budget.
-pub fn panes_to_poll(
-    sessions: &BTreeMap<u32, SessionInfo>,
-    mut candidates: Vec<u32>,
-    cursor: u32,
-    budget: usize,
-) -> (Vec<u32>, u32) {
+/// from: one rotation over every candidate, bounded by the budget.
+///
+/// An earlier version polled panes already holding a placeholder
+/// unconditionally and gave the remainder to the rest. Once the placeholders
+/// alone reached the budget there was no remainder and the cursor never
+/// advanced, so a pane that had just started an agent was never discovered —
+/// and with more placeholders than the budget the cycle also made more host
+/// calls than the budget it documents. A single rotation keeps both bounds by
+/// construction, at the cost of an exited agent's placeholder surviving a few
+/// extra cycles in a session large enough to need sweeping.
+pub fn panes_to_poll(mut candidates: Vec<u32>, cursor: u32, budget: usize) -> (Vec<u32>, u32) {
     candidates.sort_unstable();
-    let (mut selected, rotating): (Vec<u32>, Vec<u32>) = candidates
-        .into_iter()
-        .partition(|pane_id| sessions.contains_key(pane_id));
-
-    let remaining = budget.saturating_sub(selected.len());
-    if rotating.is_empty() || remaining == 0 {
-        return (selected, cursor);
+    if candidates.is_empty() || budget == 0 {
+        return (Vec::new(), cursor);
     }
 
-    let start = rotating
+    let start = candidates
         .iter()
         .position(|&pane_id| pane_id >= cursor)
         .unwrap_or(0);
-    let taken: Vec<u32> = rotating
+    let taken: Vec<u32> = candidates
         .iter()
         .cycle()
         .skip(start)
-        .take(remaining.min(rotating.len()))
+        .take(budget.min(candidates.len()))
         .copied()
         .collect();
     let next_cursor = taken
         .last()
         .and_then(|last| last.checked_add(1))
         .unwrap_or(0);
-    selected.extend(taken);
-    (selected, next_cursor)
+    (taken, next_cursor)
 }
 
 /// What pane introspection saw running in a pane.
@@ -197,16 +198,9 @@ mod tests {
         assert!(!ended_recently(&ended, 8, 11_000));
     }
 
-    fn placeholders(pane_ids: [u32; 2]) -> BTreeMap<u32, SessionInfo> {
-        pane_ids
-            .into_iter()
-            .map(|pane_id| (pane_id, placeholder_session(pane_id)))
-            .collect()
-    }
-
     #[test]
     fn every_pane_is_polled_when_the_session_fits_the_budget() {
-        let (selected, cursor) = panes_to_poll(&BTreeMap::new(), vec![3, 1, 2], 0, 12);
+        let (selected, cursor) = panes_to_poll(vec![3, 1, 2], 0, 12);
 
         assert_eq!(selected, vec![1, 2, 3]);
         assert_eq!(cursor, 4);
@@ -218,7 +212,7 @@ mod tests {
         let mut cursor = 0;
         for _ in 0..5 {
             let (selected, next) =
-                panes_to_poll(&BTreeMap::new(), (1..=10).collect(), cursor, 2);
+                panes_to_poll((1..=10).collect(), cursor, 2);
             assert_eq!(selected.len(), 2);
             seen.extend(selected);
             cursor = next;
@@ -228,13 +222,39 @@ mod tests {
     }
 
     #[test]
-    fn existing_placeholders_are_always_polled_and_do_not_move_the_cursor() {
-        let sessions = placeholders([8, 9]);
+    fn discovery_is_not_starved_when_placeholders_fill_the_budget() {
+        // Placeholders used to be polled unconditionally and the rest given the
+        // remainder. Once the placeholders alone reached the budget there was no
+        // remainder and the cursor never advanced, so a pane that had just
+        // started an agent was never looked at again.
+        let mut seen = Vec::new();
+        let mut cursor = 0;
 
-        let (selected, cursor) =
-            panes_to_poll(&sessions, vec![1, 2, 8, 9], 0, 2);
+        for _ in 0..2 {
+            let (selected, next) = panes_to_poll(vec![1, 2, 8, 9], cursor, 2);
+            seen.extend(selected);
+            cursor = next;
+        }
 
-        assert_eq!(selected, vec![8, 9]);
-        assert_eq!(cursor, 0);
+        assert!(seen.contains(&1), "pane 1 was never polled: {seen:?}");
+        assert!(seen.contains(&2), "pane 2 was never polled: {seen:?}");
+    }
+
+    #[test]
+    fn a_cycle_never_exceeds_its_host_call_budget() {
+        let (selected, _) = panes_to_poll((1..=20).collect(), 0, 12);
+
+        assert_eq!(selected.len(), 12);
+    }
+
+    #[test]
+    fn a_backward_clock_step_expires_the_grace_window() {
+        // saturating_sub returns 0 while now < ended_at, which held the window
+        // open until the clock caught up — hours, for a real backward step.
+        let mut ended = HashMap::new();
+        ended.insert(4, 100_000);
+
+        assert!(ended_recently(&ended, 4, 100_001));
+        assert!(!ended_recently(&ended, 4, 40_000));
     }
 }

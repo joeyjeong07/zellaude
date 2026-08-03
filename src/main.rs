@@ -502,7 +502,6 @@ impl State {
             })
             .collect();
         let (to_poll, next_cursor) = placeholder::panes_to_poll(
-            &self.sessions,
             candidates,
             self.agent_poll_cursor,
             placeholder::AGENT_POLL_BUDGET,
