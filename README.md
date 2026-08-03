@@ -13,6 +13,7 @@ A Zellij status bar plugin that replaces the default tab bar with Claude Code an
 - **Theme-aware palette** — follows Zellij's live theme colors; Gruvbox Dark is explicitly verified
 - **Ultra-mode rainbow** — tab names shimmer through rainbow colors for Codex `ultra` sessions and Claude Code `ultracode` sessions
 - **Split Three** — upgraded Pane-mode versions of Split Right and Split Down create three equal panes at once
+- **Custom states** — open a named command grid in a new tab with `Ctrl+t`, `Shift+n`
 - **Clickable tabs** — click any tab to switch to it
 - **Smart pane focus** — clicking an agent-aware tab focuses its most recently active Claude Code or Codex pane, revealing it inside a stack; waiting (⚠) sessions retain priority
 - **Permission flash** — sessions pulse with the theme's error color for 2 seconds when a permission request arrives
@@ -50,6 +51,44 @@ Open Pane mode with `Ctrl+p`, then use:
 
 Both commands focus the newest pane and return to Normal mode, matching Zellij's built-in Split Right (`r`) and Split Down (`d`) flow. When the available cells are not divisible by three, pane sizes differ by at most one cell. Zellaude installs the uppercase bindings for the running client without writing to `config.kdl`. If either key already has a custom Pane-mode binding, Zellaude leaves it untouched. Approve Zellij's **Change runtime configuration** and **Execute actions as the user** permissions when prompted so the session-only bindings and exact resize sequence can run.
 
+### Custom states
+
+Add one or more named states to `~/.config/zellij/plugins/zellaude.json`:
+
+```json
+{
+  "custom_states": [
+    {
+      "id": "claude6",
+      "width": 3,
+      "height": 2,
+      "commands": [
+        "claude -n A1 \"/implementing-agent I'm A1\"",
+        "claude -n A2 \"/implementing-agent I'm A2\"",
+        "claude -n A3 \"/implementing-agent I'm A3\"",
+        "claude -n A4 \"/implementing-agent I'm A4\"",
+        "claude -n A5 \"/implementing-agent I'm A5\"",
+        "claude -n A6 \"/implementing-agent I'm A6\""
+      ]
+    }
+  ]
+}
+```
+
+Reload the plugin (or restart the Zellij session) after editing the file. Then press `Ctrl+t`, `Shift+n`, type the state ID, and press `Enter`. Zellaude opens a new tab with the configured grid, mapping the command array to panes from left to right, top to bottom. Press `Esc` or `Ctrl+c` to cancel the prompt.
+
+`width` and `height` may be JSON numbers or numeric strings. A state needs at least one command, the command count may not exceed `width × height`, and a state may contain at most 64 panes; the resulting grid must also fit the current terminal. When there are fewer commands than cells, the unused bottom-right cells open as normal shell panes. Commands run through `sh -lc` in the directory of the pane where the prompt was opened when Zellij can resolve it, falling back to Zellij's default working directory otherwise. Custom-state configuration should therefore be treated as trusted local shell code.
+
+The settings file may also contain a single state object or an array of states, although the `custom_states` wrapper is recommended because it coexists with Zellaude's UI settings. As an alternative, states can be supplied directly in the plugin block; this takes precedence over the settings file:
+
+```kdl
+plugin location="file:~/.config/zellij/plugins/zellaude.wasm" {
+    custom_states r#"[{"id":"shells","width":2,"height":1,"commands":["htop","git status"]}]"#
+}
+```
+
+Zellaude installs `Shift+n` in Tab mode for the running client without changing `config.kdl`. If that key already has a user binding, the user binding wins and the custom-state shortcut remains unavailable.
+
 ### Settings
 
 Click the **Zellaude** prefix on the left side of the bar to open the settings menu. Click it again (or the `×` button) to close. Settings are persisted to `~/.config/zellij/plugins/zellaude.json`.
@@ -65,7 +104,7 @@ Click the **Zellaude** prefix on the left side of the bar to open the settings m
 ### Prerequisites
 
 - [Zellij 0.44 or newer](https://zellij.dev)
-- [jq](https://jqlang.github.io/jq/) — used by the hook script at runtime
+- [jq](https://jqlang.github.io/jq/) — used by hooks and settings persistence at runtime
 
 ### Quick install
 

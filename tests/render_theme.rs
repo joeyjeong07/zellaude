@@ -2,6 +2,15 @@
 
 extern crate self as zellij_tile;
 
+mod custom_layouts {
+    #[derive(Debug, Clone)]
+    pub struct Prompt {
+        pub input: String,
+        pub cursor: usize,
+        pub error: Option<String>,
+    }
+}
+
 pub mod prelude {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum PaletteColor {
@@ -184,6 +193,7 @@ mod state {
         pub prefix_click_region: Option<(usize, usize)>,
         pub menu_click_regions: Vec<MenuClickRegion>,
         pub permissions_denied: bool,
+        pub custom_layout_prompt: Option<crate::custom_layouts::Prompt>,
     }
 
     impl Default for State {
@@ -206,6 +216,7 @@ mod state {
                 prefix_click_region: None,
                 menu_click_regions: Vec::new(),
                 permissions_denied: false,
+                custom_layout_prompt: None,
             }
         }
     }
@@ -586,4 +597,70 @@ fn a_granted_bar_says_nothing_about_permissions() {
     let output = render::build_status_bar(&mut state, 1, 100);
 
     assert!(!output.contains("permission"), "{output}");
+}
+
+#[test]
+fn custom_state_prompt_replaces_tabs_and_clears_stale_click_targets() {
+    let mut state = State {
+        zellij_styling: Some(gruvbox_dark()),
+        tabs: vec![tab(0, "work", true)],
+        custom_layout_prompt: Some(custom_layouts::Prompt {
+            input: "claude6".to_string(),
+            cursor: 7,
+            error: None,
+        }),
+        prefix_click_region: Some((0, 20)),
+        ..State::default()
+    };
+
+    let output = render::build_status_bar(&mut state, 1, 100);
+    let visible = strip_ansi(&output);
+
+    assert!(visible.contains("Custom state"), "{visible}");
+    assert!(visible.contains("claude6"), "{visible}");
+    assert!(visible.contains("Enter: open"), "{visible}");
+    assert!(!visible.contains("work"), "{visible}");
+    assert!(state.click_regions.is_empty());
+    assert!(state.menu_click_regions.is_empty());
+    assert_eq!(state.prefix_click_region, None);
+}
+
+#[test]
+fn custom_state_prompt_surfaces_lookup_errors() {
+    let mut state = State {
+        custom_layout_prompt: Some(custom_layouts::Prompt {
+            input: "missing".to_string(),
+            cursor: 7,
+            error: Some("Unknown custom state \"missing\"".to_string()),
+        }),
+        ..State::default()
+    };
+
+    let visible = strip_ansi(&render::build_status_bar(&mut state, 1, 100));
+
+    assert!(visible.contains("Unknown custom state"), "{visible}");
+}
+
+#[test]
+fn custom_state_prompt_clips_wide_unicode_to_the_terminal_width() {
+    let mut state = State {
+        custom_layout_prompt: Some(custom_layouts::Prompt {
+            input: "状態状態状態状態状態".to_string(),
+            cursor: 10,
+            error: None,
+        }),
+        ..State::default()
+    };
+
+    for cols in 1..40 {
+        let visible = strip_ansi(&render::build_status_bar(&mut state, 1, cols));
+        assert!(
+            unicode_width::UnicodeWidthStr::width(visible.as_str()) <= cols,
+            "cols={cols} overran the bar: {visible:?}"
+        );
+        assert!(
+            visible.contains('▌'),
+            "cols={cols} hid the prompt: {visible:?}"
+        );
+    }
 }
