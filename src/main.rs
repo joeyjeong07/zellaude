@@ -21,23 +21,29 @@ const FLASH_TICK: f64 = 0.25;
 /// bounded when the timer runs at flash/rainbow cadence.
 const AGENT_POLL_INTERVAL_MS: u64 = 2000;
 
+/// Everything the plugin needs to function at all. Named once so the initial
+/// request and the retry cannot drift apart — a retry asking for a smaller set
+/// would be granted and still leave the plugin unable to work.
+const REQUIRED_PERMISSIONS: [PermissionType; 5] = [
+    PermissionType::ReadApplicationState,
+    PermissionType::ChangeApplicationState,
+    PermissionType::RunCommands,
+    PermissionType::ReadCliPipes,
+    PermissionType::MessageAndLaunchOtherPlugins,
+];
+
 register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::ChangeApplicationState,
-            PermissionType::RunCommands,
-            PermissionType::ReadCliPipes,
-            PermissionType::MessageAndLaunchOtherPlugins,
-        ]);
+        request_permission(&REQUIRED_PERMISSIONS);
         subscribe(&[
             EventType::TabUpdate,
             EventType::PaneUpdate,
             EventType::ModeUpdate,
             EventType::Timer,
             EventType::Mouse,
+            EventType::Key,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
@@ -78,8 +84,34 @@ impl ZellijPlugin for State {
                 self.maybe_start_attach_scan();
                 true
             }
+            // The notice tells the user to press `y`. Zellij's own prompt is
+            // gone by the time this state exists, so nothing else would act on
+            // that keystroke — the instruction has to be honoured here or it is
+            // a lie. Only reachable when the pane has focus, which is exactly
+            // the case the click path cannot cover.
+            Event::Key(key) if self.permissions_denied => {
+                if key.bare_key == BareKey::Char('y') && key.key_modifiers.is_empty() {
+                    request_permission(&REQUIRED_PERMISSIONS);
+                }
+                false
+            }
             Event::Mouse(Mouse::LeftClick(_, col)) => {
                 let col = col as usize;
+
+                // While denied, the whole bar is a retry button. Answering
+                // Zellij's prompt otherwise means focusing a one-row borderless
+                // pane by keyboard before y does anything, which is the part
+                // people get stuck on; a click re-raises the prompt instead.
+                //
+                // The flag stays set until a grant actually arrives. Clearing it
+                // here would spend the affordance on a single click: a second
+                // click would fall through to the prefix region below and open
+                // the settings menu, and a prompt dismissed without a Denied
+                // event would leave the bar looking healthy while inert.
+                if self.permissions_denied {
+                    request_permission(&REQUIRED_PERMISSIONS);
+                    return true;
+                }
 
                 // Check prefix click region first → toggle ViewMode
                 if let Some((start, end)) = self.prefix_click_region {
@@ -288,11 +320,21 @@ impl ZellijPlugin for State {
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.on_command_permissions_granted();
-                false
+                // The grant clears the denial notice, so it has to repaint.
+                // Relying on load_config's RunCommandResult to do it leaves the
+                // banner painted over the tabs whenever that path is skipped —
+                // config_loaded already set, or the command never round-trips.
+                true
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
                 self.command_permissions_granted = false;
-                false
+                // Zellij will not offer its prompt again on its own, and every
+                // path that makes this plugin useful — config, hook install,
+                // pane scanning — is behind these permissions. Record it so the
+                // bar can say so, and re-render immediately: a silent inert bar
+                // is indistinguishable from a working one.
+                self.permissions_denied = true;
+                true
             }
             _ => false,
         }
@@ -362,6 +404,7 @@ impl State {
     fn on_command_permissions_granted(&mut self) {
         let newly_granted = !self.command_permissions_granted;
         self.command_permissions_granted = true;
+        self.permissions_denied = false;
 
         // Keep the plugin visible during fullscreen once application-state
         // changes are allowed.
@@ -459,7 +502,6 @@ impl State {
             })
             .collect();
         let (to_poll, next_cursor) = placeholder::panes_to_poll(
-            &self.sessions,
             candidates,
             self.agent_poll_cursor,
             placeholder::AGENT_POLL_BUDGET,

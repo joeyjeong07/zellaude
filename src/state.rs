@@ -202,6 +202,11 @@ pub struct State {
     pub menu_click_regions: Vec<MenuClickRegion>,
     pub config_loaded: bool,
     pub command_permissions_granted: bool,
+    /// The user dismissed or refused Zellij's permission prompt. Zellij draws
+    /// that prompt itself and does not offer it again, so without surfacing this
+    /// the plugin is left permanently inert and indistinguishable from a working
+    /// one — no hooks installed, no config, no explanation.
+    pub permissions_denied: bool,
     pub hooks_installed: bool,
     pub attach_scan_requested: bool,
     pub last_agent_poll_ms: u64,

@@ -113,17 +113,19 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
             .entry(payload.pane_id)
             .and_modify(|ended_at| *ended_at = (*ended_at).max(ts_ms))
             .or_insert(ts_ms);
-        if let Some(session_id) = payload
-            .session_id
-            .as_deref()
-            .filter(|session_id| !session_id.is_empty())
-        {
-            state
-                .session_end_tombstones
-                .entry((payload.pane_id, session_id.to_string()))
-                .and_modify(|ended_at| *ended_at = (*ended_at).max(ts_ms))
-                .or_insert(ts_ms);
-        }
+        // Keyed by the id as sent, empty included. An end that carries no id
+        // still has to block the events that raced it: gating the tombstone on
+        // a non-empty id left that path recording nothing, so a pre-end tool
+        // event recreated the pane as a real session — and the introspection
+        // poll only retires placeholders, so it never left again.
+        state
+            .session_end_tombstones
+            .entry((
+                payload.pane_id,
+                payload.session_id.clone().unwrap_or_default(),
+            ))
+            .and_modify(|ended_at| *ended_at = (*ended_at).max(ts_ms))
+            .or_insert(ts_ms);
         let should_remove = state
             .sessions
             .get(&payload.pane_id)
@@ -158,18 +160,18 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     }
 
     if !payload.is_subagent {
-        if let Some(session_id) = payload
-            .session_id
-            .as_deref()
-            .filter(|session_id| !session_id.is_empty())
-        {
-            let key = (payload.pane_id, session_id.to_string());
-            if let Some(&ended_at) = state.session_end_tombstones.get(&key) {
-                if payload.ts_ms.is_some_and(|ts_ms| ts_ms <= ended_at) {
-                    return;
-                }
-                tombstone_to_clear = Some(key);
+        // Looked up by the id as sent, empty included, to match how the end
+        // recorded it. An event with no id belongs to the no-id slot rather than
+        // to no slot at all.
+        let key = (
+            payload.pane_id,
+            payload.session_id.clone().unwrap_or_default(),
+        );
+        if let Some(&ended_at) = state.session_end_tombstones.get(&key) {
+            if payload.ts_ms.is_some_and(|ts_ms| ts_ms <= ended_at) {
+                return;
             }
+            tombstone_to_clear = Some(key);
         }
     }
 

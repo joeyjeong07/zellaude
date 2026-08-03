@@ -121,6 +121,71 @@ pub(crate) fn elapsed_suffix(session: &SessionInfo, now_s: u64) -> Option<String
     (elapsed >= ELAPSED_THRESHOLD).then(|| format_elapsed(elapsed))
 }
 
+/// Permission notices, widest first.
+///
+/// Every one of them names the click, because that is the only recovery that
+/// needs no focus — telling a user to "press y" while their shell has focus
+/// sends the keystroke to whatever is running there. Only the widest names the
+/// keys, and it names Zellij's defaults: the keybinds live on `ModeUpdate`,
+/// which Zellij gates behind the very permission that was just denied, so the
+/// plugin cannot know a remapped binding in this state.
+///
+/// ASCII only. `display_width` counts chars, so an East-Asian-Ambiguous glyph
+/// like `↑` would be measured one column narrower than it renders and overrun a
+/// bar that has auto-wrap disabled.
+/// Every variant keeps the word "permission" — naming what is missing is the
+/// part that turns a strange-looking bar into something the user can act on.
+const PERMISSION_NOTICES: [&str; 4] = [
+    " Zellaude needs permission - click here, or Ctrl p then Up, then y ",
+    " Zellaude needs permission - click here ",
+    " permission needed - click ",
+    " perms: click ",
+];
+
+/// The widest notice fitting `available` columns, truncated when even the
+/// narrowest does not fit. Never empty for a non-zero width: a denied plugin
+/// that renders an ordinary-looking bar is the exact failure this prevents.
+fn permission_notice(available: usize) -> String {
+    if available == 0 {
+        return String::new();
+    }
+    PERMISSION_NOTICES
+        .iter()
+        .find(|notice| display_width(notice) <= available)
+        .map(|notice| (*notice).to_string())
+        .unwrap_or_else(|| {
+            PERMISSION_NOTICES[PERMISSION_NOTICES.len() - 1]
+                .chars()
+                .take(available)
+                .collect()
+        })
+}
+
+fn render_permission_notice(
+    buf: &mut String,
+    col: &mut usize,
+    cols: usize,
+    prefix_bg: PaletteColor,
+    theme: BarTheme,
+) {
+    // The arrow costs a column; skip it rather than spend the last one on
+    // decoration when that would leave no room for the message itself.
+    if *col + 1 < cols {
+        arrow(buf, col, prefix_bg, theme.flash.background);
+    }
+    let text = permission_notice(cols.saturating_sub(*col));
+    if text.is_empty() {
+        return;
+    }
+    let _ = write!(
+        buf,
+        "{}{}{BOLD}{text}{RESET}",
+        bg(theme.flash.background),
+        fg(theme.flash.base),
+    );
+    *col += display_width(&text);
+}
+
 fn mode_style(mode: InputMode, theme: BarTheme) -> (SegmentStyle, &'static str) {
     match mode {
         InputMode::Normal => (theme.settings_prefix, "NORMAL"),
@@ -177,10 +242,13 @@ pub(crate) fn build_status_bar(state: &mut State, _rows: usize, cols: usize) -> 
 
     // Build prefix: " Zellaude (session) MODE "
     let (mode_style, mode_text) = mode_style(state.input_mode, theme);
-    let show_mode = state.settings.mode_indicator;
+    // An inert bar has no mode worth reporting and no session worth naming, and
+    // on a narrow split the prefix is what crowds the notice off the row. Give
+    // the width to the message instead.
+    let show_mode = state.settings.mode_indicator && !state.permissions_denied;
     let session_part = match state.zellij_session_name.as_deref() {
-        Some(name) => format!(" ({name})"),
-        None => String::new(),
+        Some(name) if !state.permissions_denied => format!(" ({name})"),
+        _ => String::new(),
     };
     let prefix_text = format!(" Zellaude{session_part} ");
     let prefix_width = display_width(&prefix_text);
@@ -240,22 +308,30 @@ pub(crate) fn build_status_bar(state: &mut State, _rows: usize, cols: usize) -> 
     let prefix_used = col;
 
     if col < cols {
-        match state.view_mode {
-            ViewMode::Normal => {
-                render_tabs(
-                    state,
-                    &mut buf,
-                    &mut col,
-                    cols,
-                    last_prefix_bg,
-                    prefix_used,
-                    theme,
-                );
-            }
-            ViewMode::Settings => {
-                arrow(&mut buf, &mut col, last_prefix_bg, theme.surface.background);
-                let _ = write!(buf, "{bar_bg_str}");
-                render_settings_menu(state, &mut buf, &mut col, theme);
+        // A denied permission leaves the plugin unable to do anything: no hooks,
+        // no config, no activity. Say so instead of rendering a bar that looks
+        // healthy. This replaces the tabs rather than sharing the row because
+        // the whole point is that it must not be mistaken for normal output.
+        if state.permissions_denied {
+            render_permission_notice(&mut buf, &mut col, cols, last_prefix_bg, theme);
+        } else {
+            match state.view_mode {
+                ViewMode::Normal => {
+                    render_tabs(
+                        state,
+                        &mut buf,
+                        &mut col,
+                        cols,
+                        last_prefix_bg,
+                        prefix_used,
+                        theme,
+                    );
+                }
+                ViewMode::Settings => {
+                    arrow(&mut buf, &mut col, last_prefix_bg, theme.surface.background);
+                    let _ = write!(buf, "{bar_bg_str}");
+                    render_settings_menu(state, &mut buf, &mut col, theme);
+                }
             }
         }
     }
