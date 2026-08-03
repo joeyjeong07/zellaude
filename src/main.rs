@@ -12,6 +12,7 @@ mod theme;
 
 use state::{unix_now, unix_now_ms, HookPayload, MenuAction, SessionInfo, Settings, State, ViewMode};
 use std::collections::BTreeMap;
+use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
 
 const DONE_TIMEOUT: u64 = 30;
@@ -31,6 +32,48 @@ const REQUIRED_PERMISSIONS: [PermissionType; 5] = [
     PermissionType::ReadCliPipes,
     PermissionType::MessageAndLaunchOtherPlugins,
 ];
+
+/// The keys that move focus onto this bar, taken from the user's own binds: the
+/// key that enters pane mode, then the one that moves focus up inside it.
+///
+/// Returns `None` when either action is unbound, so the caller can fall back to
+/// Zellij's defaults instead of printing half an instruction. The bar sits above
+/// its tab's panes in the documented layout, which is why "up" is the direction
+/// worth naming.
+fn focus_hint_from(keybinds: &[(InputMode, Vec<(KeyWithModifier, Vec<Action>)>)]) -> Option<String> {
+    fn key_for(
+        keybinds: &[(InputMode, Vec<(KeyWithModifier, Vec<Action>)>)],
+        mode: InputMode,
+        wanted: impl Fn(&Action) -> bool,
+    ) -> Option<String> {
+        keybinds
+            .iter()
+            .find(|(bound_mode, _)| *bound_mode == mode)?
+            .1
+            .iter()
+            .find(|(_, actions)| actions.iter().any(&wanted))
+            .map(|(key, _)| key.to_string())
+    }
+
+    let to_pane_mode = key_for(keybinds, InputMode::Normal, |action| {
+        matches!(
+            action,
+            Action::SwitchToMode {
+                input_mode: InputMode::Pane
+            }
+        )
+    })?;
+    let focus_up = key_for(keybinds, InputMode::Pane, |action| {
+        matches!(
+            action,
+            Action::MoveFocus {
+                direction: Direction::Up
+            }
+        )
+    })?;
+
+    Some(format!("{to_pane_mode} then {focus_up}"))
+}
 
 register_plugin!(State);
 
@@ -77,6 +120,7 @@ impl ZellijPlugin for State {
             Event::ModeUpdate(mode_info) => {
                 self.input_mode = mode_info.mode;
                 self.zellij_styling = Some(mode_info.style.colors);
+                self.focus_hint = focus_hint_from(&mode_info.keybinds);
                 if let Some(name) = mode_info.session_name {
                     self.zellij_session_name = Some(name);
                 }

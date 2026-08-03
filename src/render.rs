@@ -245,12 +245,16 @@ pub(crate) fn build_status_bar(state: &mut State, _rows: usize, cols: usize) -> 
     // is that it must not be mistaken for normal output.
     if col < cols && state.permissions_denied {
         arrow(&mut buf, &mut col, last_prefix_bg, theme.error.background);
-        let notice = " Zellaude needs permission — click here, or focus this pane and press y ";
-        let short = " Zellaude needs permission: press y ";
-        let text = if col + display_width(notice) <= cols {
-            notice
+        // Default to Zellij's own bindings when a ModeUpdate has not arrived yet
+        // or the actions are unbound: naming a key the user probably has beats
+        // telling them to "focus this pane" with no way to do it.
+        let hint = state.focus_hint.as_deref().unwrap_or("Ctrl p then ↑");
+        let notice = format!(" Zellaude needs permission — click here, or {hint} then y ");
+        let short = " Zellaude needs permission: press y ".to_string();
+        let text = if col + display_width(&notice) <= cols {
+            &notice
         } else {
-            short
+            &short
         };
         let width = display_width(text);
         if col + width <= cols {

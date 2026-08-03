@@ -184,6 +184,7 @@ mod state {
         pub prefix_click_region: Option<(usize, usize)>,
         pub menu_click_regions: Vec<MenuClickRegion>,
         pub permissions_denied: bool,
+        pub focus_hint: Option<String>,
     }
 
     impl Default for State {
@@ -206,6 +207,7 @@ mod state {
                 prefix_click_region: None,
                 menu_click_regions: Vec::new(),
                 permissions_denied: false,
+                focus_hint: None,
             }
         }
     }
@@ -507,7 +509,7 @@ fn a_denied_permission_tells_the_user_how_to_grant_it() {
         "the bar should say what is wrong: {output}"
     );
     assert!(
-        output.contains("press y"),
+        output.contains("then y"),
         "the bar should say which key grants it: {output}"
     );
 }
@@ -523,4 +525,44 @@ fn a_granted_bar_says_nothing_about_permissions() {
     let output = render::build_status_bar(&mut state, 1, 100);
 
     assert!(!output.contains("needs permission"), "{output}");
+}
+
+#[test]
+fn the_permission_notice_spells_out_the_keys_to_press() {
+    // "focus this pane" is not an instruction — the bar is a one-row borderless
+    // pane, and reaching it takes a mode switch and a direction key before `y`
+    // does anything. The hint is derived from the user's own keybinds, so a
+    // remapped config gets its own keys rather than the defaults.
+    let mut state = State {
+        zellij_styling: Some(gruvbox_dark()),
+        tabs: vec![tab(0, "work", true)],
+        permissions_denied: true,
+        focus_hint: Some("Alt f then k".into()),
+        ..State::default()
+    };
+
+    let output = render::build_status_bar(&mut state, 1, 120);
+
+    assert!(
+        output.contains("Alt f then k"),
+        "the notice should use the configured keys: {output}"
+    );
+    assert!(output.contains("then y"), "{output}");
+}
+
+#[test]
+fn the_permission_notice_falls_back_to_the_default_keys() {
+    let mut state = State {
+        zellij_styling: Some(gruvbox_dark()),
+        tabs: vec![tab(0, "work", true)],
+        permissions_denied: true,
+        ..State::default()
+    };
+
+    let output = render::build_status_bar(&mut state, 1, 120);
+
+    assert!(
+        output.contains("Ctrl p"),
+        "without keybind info the notice should still name a key: {output}"
+    );
 }
