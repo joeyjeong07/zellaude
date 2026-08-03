@@ -5,6 +5,7 @@ mod placeholder;
 mod rainbow;
 mod render;
 mod session_selection;
+mod split_three;
 mod state;
 mod tab_pane_map;
 mod tool_symbol;
@@ -12,6 +13,7 @@ mod theme;
 
 use state::{unix_now, unix_now_ms, HookPayload, MenuAction, SessionInfo, Settings, State, ViewMode};
 use std::collections::BTreeMap;
+use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
 
 const DONE_TIMEOUT: u64 = 30;
@@ -20,22 +22,35 @@ const FLASH_TICK: f64 = 0.25;
 /// Foreground-command polling for pre-prompt agent TUIs; keeps host queries
 /// bounded when the timer runs at flash/rainbow cadence.
 const AGENT_POLL_INTERVAL_MS: u64 = 2000;
+const SPLIT_THREE_ACTION_TIMEOUT_MS: u64 = 5000;
+
+fn split_three_focus_matches(tab_id: usize, pane_id: u32) -> bool {
+    matches!(
+        get_focused_pane_info(),
+        Ok((focused_tab_id, PaneId::Terminal(focused_pane_id)))
+            if focused_tab_id == tab_id && focused_pane_id == pane_id
+    )
+}
 
 /// Everything the plugin needs to function at all. Named once so the initial
 /// request and the retry cannot drift apart — a retry asking for a smaller set
 /// would be granted and still leave the plugin unable to work.
-const REQUIRED_PERMISSIONS: [PermissionType; 5] = [
+const REQUIRED_PERMISSIONS: [PermissionType; 7] = [
     PermissionType::ReadApplicationState,
     PermissionType::ChangeApplicationState,
     PermissionType::RunCommands,
     PermissionType::ReadCliPipes,
     PermissionType::MessageAndLaunchOtherPlugins,
+    PermissionType::Reconfigure,
+    PermissionType::RunActionsAsUser,
 ];
 
 register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
+        self.split_three_uses_legacy_keybinds =
+            split_three::uses_legacy_mode_keybinds(&get_zellij_version());
         request_permission(&REQUIRED_PERMISSIONS);
         subscribe(&[
             EventType::TabUpdate,
@@ -46,6 +61,8 @@ impl ZellijPlugin for State {
             EventType::Key,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
+            EventType::InitialKeybinds,
+            EventType::ActionComplete,
         ]);
         set_timeout(TIMER_INTERVAL);
     }
@@ -53,6 +70,10 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::TabUpdate(tabs) => {
+                // Inactive-tab plugins do not receive tab updates. Reset on
+                // every update delivered to the newly active instance so a
+                // returning tab always retargets the client-scoped binding.
+                self.split_three_bindings_installed = false;
                 let new_active = tabs.iter().find(|t| t.active).map(|t| t.position);
                 if new_active != self.active_tab_index {
                     // Tab focus changed — clear persist flashes on the newly focused tab
@@ -66,21 +87,27 @@ impl ZellijPlugin for State {
                 self.active_tab_index = new_active;
                 self.tabs = tabs;
                 self.rebuild_pane_map();
+                self.maybe_install_split_three_bindings();
                 self.maybe_start_attach_scan();
                 true
             }
             Event::PaneUpdate(manifest) => {
                 self.pane_manifest = Some(manifest);
                 self.rebuild_pane_map();
+                self.maybe_recover_pending_split_three_spawn();
+                self.maybe_finish_split_three_validation();
+                self.maybe_install_split_three_bindings();
                 self.maybe_start_attach_scan();
                 true
             }
             Event::ModeUpdate(mode_info) => {
+                let legacy_keybinds = mode_info.keybinds;
                 self.input_mode = mode_info.mode;
                 self.zellij_styling = Some(mode_info.style.colors);
                 if let Some(name) = mode_info.session_name {
                     self.zellij_session_name = Some(name);
                 }
+                self.maybe_capture_legacy_keybinds(legacy_keybinds);
                 self.maybe_start_attach_scan();
                 true
             }
@@ -299,6 +326,9 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_) => {
+                self.maybe_recover_pending_split_three_spawn();
+                self.maybe_finish_split_three_validation();
+                self.recover_stalled_split_three();
                 let stale_changed = self.cleanup_stale_sessions();
                 let flash_changed = self.cleanup_expired_flashes();
                 let placeholder_changed = self.poll_agent_panes();
@@ -335,6 +365,15 @@ impl ZellijPlugin for State {
                 // is indistinguishable from a working one.
                 self.permissions_denied = true;
                 true
+            }
+            Event::InitialKeybinds(keybinds) => {
+                self.initial_keybinds = Some(keybinds);
+                self.maybe_install_split_three_bindings();
+                false
+            }
+            Event::ActionComplete(_action, affected_pane_id, context) => {
+                self.handle_split_three_action_complete(affected_pane_id, context);
+                false
             }
             _ => false,
         }
@@ -391,6 +430,14 @@ impl ZellijPlugin for State {
                 }
                 false
             }
+            split_three::PIPE_NAME => {
+                if let Some(direction) =
+                    split_three::SplitDirection::from_payload(pipe_message.payload.as_deref())
+                {
+                    self.start_split_three(direction);
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -401,6 +448,692 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    fn split_three_instance_is_active(&mut self) -> bool {
+        let plugin_id = *self
+            .plugin_id
+            .get_or_insert_with(|| get_plugin_ids().plugin_id);
+        self.pane_manifest.as_ref().is_some_and(|manifest| {
+            split_three::is_active_instance(manifest, &self.tabs, plugin_id)
+        })
+    }
+
+    fn start_split_three(&mut self, direction: split_three::SplitDirection) {
+        if self.split_three_operation.is_some()
+            || !self.command_permissions_granted
+            || !self.split_three_instance_is_active()
+        {
+            return;
+        }
+
+        let Ok((tab_id, PaneId::Terminal(original_pane_id))) = get_focused_pane_info() else {
+            return;
+        };
+        let Some(original_pane) = get_pane_info(PaneId::Terminal(original_pane_id)) else {
+            return;
+        };
+        if !split_three::target_is_supported(&original_pane, direction) {
+            return;
+        }
+
+        self.split_three_next_operation_id = self.split_three_next_operation_id.wrapping_add(1);
+        if self.split_three_next_operation_id == 0 {
+            self.split_three_next_operation_id = 1;
+        }
+        let mut operation = split_three::Operation::new(
+            self.split_three_next_operation_id,
+            direction,
+            tab_id,
+            original_pane_id,
+            (&original_pane).into(),
+        );
+        if let Some(panes) = self.pane_manifest.as_ref().and_then(|manifest| {
+            manifest.panes.values().find(|panes| {
+                panes
+                    .iter()
+                    .any(|pane| !pane.is_plugin && pane.id == original_pane_id)
+            })
+        }) {
+            operation.initial_terminal_pane_count = panes
+                .iter()
+                .filter(|pane| !pane.is_plugin && !pane.is_suppressed)
+                .count();
+            operation.known_terminal_pane_ids = panes
+                .iter()
+                .filter(|pane| !pane.is_plugin)
+                .map(|pane| pane.id)
+                .collect();
+        }
+        operation.known_terminal_pane_ids.insert(original_pane_id);
+        self.dispatch_split_three(operation, split_three::focus_pane_action(original_pane_id));
+    }
+
+    fn handle_split_three_action_complete(
+        &mut self,
+        affected_pane_id: Option<PaneId>,
+        context: BTreeMap<String, String>,
+    ) {
+        let Some(mut operation) = self.split_three_operation.take() else {
+            return;
+        };
+        if !operation.matches_context(&context) {
+            let late_first = operation.stage == split_three::OperationStage::RecoverFirstSplit
+                && operation
+                    .matches_context_for_stage(&context, split_three::OperationStage::FirstSplit);
+            let late_second = operation.stage == split_three::OperationStage::RecoverSecondSplit
+                && operation
+                    .matches_context_for_stage(&context, split_three::OperationStage::SecondSplit);
+            if let Some(PaneId::Terminal(pane_id)) = affected_pane_id {
+                if late_first
+                    && pane_id != operation.original_pane_id
+                    && !operation.known_terminal_pane_ids.contains(&pane_id)
+                {
+                    operation.first_new_pane_id = Some(pane_id);
+                    rename_terminal_pane(pane_id, "");
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+                if late_second
+                    && pane_id != operation.original_pane_id
+                    && Some(pane_id) != operation.first_new_pane_id
+                    && !operation.known_terminal_pane_ids.contains(&pane_id)
+                {
+                    operation.second_new_pane_id = Some(pane_id);
+                    self.wait_for_split_three_validation(operation);
+                    return;
+                }
+            }
+            self.split_three_operation = Some(operation);
+            return;
+        }
+
+        match operation.stage {
+            split_three::OperationStage::FocusOriginal => {
+                if !split_three_focus_matches(operation.tab_id, operation.original_pane_id) {
+                    self.finish_split_three_operation();
+                    return;
+                }
+                let Some(original_pane) =
+                    get_pane_info(PaneId::Terminal(operation.original_pane_id))
+                else {
+                    self.finish_split_three_operation();
+                    return;
+                };
+                if split_three::PaneRect::from(&original_pane) != operation.original_rect
+                    || !split_three::target_is_supported(&original_pane, operation.direction)
+                {
+                    self.finish_split_three_operation();
+                    return;
+                }
+
+                operation.stage = split_three::OperationStage::FirstSplit;
+                let direction = operation.direction;
+                let operation_id = operation.id;
+                let pane_index = operation.initial_terminal_pane_count + 1;
+                self.dispatch_split_three(
+                    operation,
+                    split_three::new_pane_action(direction, operation_id, 1, pane_index),
+                );
+            }
+            split_three::OperationStage::FirstSplit => {
+                let Some(PaneId::Terminal(first_new_pane_id)) = affected_pane_id else {
+                    operation.stage = split_three::OperationStage::RecoverFirstSplit;
+                    self.wait_for_split_three_spawn(operation);
+                    return;
+                };
+                if first_new_pane_id == operation.original_pane_id {
+                    operation.stage = split_three::OperationStage::RecoverFirstSplit;
+                    self.wait_for_split_three_spawn(operation);
+                    return;
+                }
+                operation.first_new_pane_id = Some(first_new_pane_id);
+                rename_terminal_pane(first_new_pane_id, "");
+                if !split_three_focus_matches(operation.tab_id, first_new_pane_id) {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+                self.prepare_split_three_drag(operation);
+            }
+            split_three::OperationStage::FocusForDrag => {
+                let Some(first_new_pane_id) = operation.first_new_pane_id else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                if !split_three_focus_matches(operation.tab_id, first_new_pane_id) {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+                let Some(original_pane) =
+                    get_pane_info(PaneId::Terminal(operation.original_pane_id))
+                else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                let Some(first_new_pane) = get_pane_info(PaneId::Terminal(first_new_pane_id))
+                else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                let Some(drag) = split_three::plan_first_boundary_drag(
+                    operation.original_rect,
+                    &original_pane,
+                    &first_new_pane,
+                    operation.direction,
+                ) else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                operation.drag = Some(drag);
+                // Mark before dispatch: if completion is lost, a timeout will
+                // still send a harmless release before closing any pane.
+                operation.mouse_maybe_down = true;
+                operation.stage = split_three::OperationStage::DragPress;
+                self.dispatch_split_three(operation, split_three::drag_press_action(drag));
+            }
+            split_three::OperationStage::DragPress => {
+                let (Some(first_new_pane_id), Some(_drag)) =
+                    (operation.first_new_pane_id, operation.drag)
+                else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                // Re-focus by pane ID after the press. This returns the client
+                // to the intended tab before the release if focus changed
+                // during the short asynchronous action sequence.
+                operation.stage = split_three::OperationStage::FocusForRelease;
+                self.dispatch_split_three(
+                    operation,
+                    split_three::focus_pane_action(first_new_pane_id),
+                );
+            }
+            split_three::OperationStage::FocusForRelease => {
+                let (Some(first_new_pane_id), Some(drag)) =
+                    (operation.first_new_pane_id, operation.drag)
+                else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                if !split_three_focus_matches(operation.tab_id, first_new_pane_id) {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+                // A release applies the outstanding cell delta even without a
+                // separate motion event, and immediately clears Zellij's
+                // mouse-resize state.
+                operation.stage = split_three::OperationStage::DragRelease;
+                self.dispatch_split_three(operation, split_three::drag_release_action(drag));
+            }
+            split_three::OperationStage::DragRelease => {
+                operation.mouse_maybe_down = false;
+                let (Some(first_new_pane_id), Some(drag)) =
+                    (operation.first_new_pane_id, operation.drag)
+                else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                if !split_three_focus_matches(operation.tab_id, first_new_pane_id) {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+                let Some(original_pane) =
+                    get_pane_info(PaneId::Terminal(operation.original_pane_id))
+                else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                let Some(first_new_pane) = get_pane_info(PaneId::Terminal(first_new_pane_id))
+                else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                if !split_three::ready_for_second_split(
+                    operation.original_rect,
+                    &original_pane,
+                    &first_new_pane,
+                    operation.direction,
+                    drag.first_span,
+                ) {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+
+                operation.stage = split_three::OperationStage::FocusForSecondSplit;
+                self.dispatch_split_three(
+                    operation,
+                    split_three::focus_pane_action(first_new_pane_id),
+                );
+            }
+            split_three::OperationStage::FocusForSecondSplit => {
+                let (Some(first_new_pane_id), Some(drag)) =
+                    (operation.first_new_pane_id, operation.drag)
+                else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                if !split_three_focus_matches(operation.tab_id, first_new_pane_id) {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+                let (Some(original_pane), Some(first_new_pane)) = (
+                    get_pane_info(PaneId::Terminal(operation.original_pane_id)),
+                    get_pane_info(PaneId::Terminal(first_new_pane_id)),
+                ) else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                if !split_three::ready_for_second_split(
+                    operation.original_rect,
+                    &original_pane,
+                    &first_new_pane,
+                    operation.direction,
+                    drag.first_span,
+                ) {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+
+                operation.stage = split_three::OperationStage::SecondSplit;
+                let direction = operation.direction;
+                let operation_id = operation.id;
+                let pane_index = operation.initial_terminal_pane_count + 2;
+                self.dispatch_split_three(
+                    operation,
+                    split_three::new_pane_action(direction, operation_id, 2, pane_index),
+                );
+            }
+            split_three::OperationStage::SecondSplit => {
+                let Some(PaneId::Terminal(second_new_pane_id)) = affected_pane_id else {
+                    operation.stage = split_three::OperationStage::RecoverSecondSplit;
+                    self.wait_for_split_three_spawn(operation);
+                    return;
+                };
+                let Some(first_new_pane_id) = operation.first_new_pane_id else {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                };
+                if second_new_pane_id == operation.original_pane_id
+                    || second_new_pane_id == first_new_pane_id
+                {
+                    operation.stage = split_three::OperationStage::RecoverSecondSplit;
+                    self.wait_for_split_three_spawn(operation);
+                    return;
+                }
+                operation.second_new_pane_id = Some(second_new_pane_id);
+                if !split_three_focus_matches(operation.tab_id, second_new_pane_id) {
+                    self.begin_split_three_rollback(operation);
+                    return;
+                }
+                self.wait_for_split_three_validation(operation);
+            }
+            split_three::OperationStage::RollbackFocusForRelease => {
+                let Some(drag) = operation.drag else {
+                    operation.mouse_maybe_down = false;
+                    self.continue_split_three_rollback(operation);
+                    return;
+                };
+                // Advance even if focus did not land: a release must always
+                // follow a dispatched press, and is harmless on another pane.
+                operation.stage = split_three::OperationStage::RollbackRelease;
+                self.dispatch_split_three(operation, split_three::drag_cancel_action(drag));
+            }
+            split_three::OperationStage::RollbackRelease => {
+                operation.mouse_maybe_down = false;
+                self.continue_split_three_rollback(operation);
+            }
+            split_three::OperationStage::RollbackSecond => {
+                operation.second_new_pane_id = None;
+                self.continue_split_three_rollback(operation);
+            }
+            split_three::OperationStage::RollbackFirst => {
+                operation.first_new_pane_id = None;
+                self.continue_split_three_rollback(operation);
+            }
+            split_three::OperationStage::RollbackFocus => {
+                self.finish_split_three_operation();
+            }
+            split_three::OperationStage::RecoverFirstSplit
+            | split_three::OperationStage::RecoverSecondSplit
+            | split_three::OperationStage::ValidateFinal => {
+                // These stages wait for PaneUpdate or the recovery timer and
+                // do not dispatch actions that can complete normally.
+                self.split_three_operation = Some(operation);
+            }
+        }
+    }
+
+    fn prepare_split_three_drag(&mut self, mut operation: split_three::Operation) {
+        let Some(first_new_pane_id) = operation.first_new_pane_id else {
+            self.begin_split_three_rollback(operation);
+            return;
+        };
+        let Some(original_pane) = get_pane_info(PaneId::Terminal(operation.original_pane_id))
+        else {
+            self.begin_split_three_rollback(operation);
+            return;
+        };
+        let Some(first_new_pane) = get_pane_info(PaneId::Terminal(first_new_pane_id)) else {
+            self.begin_split_three_rollback(operation);
+            return;
+        };
+
+        if let Some(drag) = split_three::plan_first_boundary_drag(
+            operation.original_rect,
+            &original_pane,
+            &first_new_pane,
+            operation.direction,
+        ) {
+            operation.drag = Some(drag);
+            operation.stage = split_three::OperationStage::FocusForDrag;
+            self.dispatch_split_three(operation, split_three::focus_pane_action(first_new_pane_id));
+        } else {
+            self.begin_split_three_rollback(operation);
+        }
+    }
+
+    fn wait_for_split_three_spawn(&mut self, mut operation: split_three::Operation) {
+        operation.recovery_attempts = 0;
+        self.split_three_operation = Some(operation);
+        self.split_three_action_started_ms = unix_now_ms();
+        self.maybe_recover_pending_split_three_spawn();
+    }
+
+    fn wait_for_split_three_validation(&mut self, mut operation: split_three::Operation) {
+        operation.stage = split_three::OperationStage::ValidateFinal;
+        operation.recovery_attempts = 0;
+        self.split_three_operation = Some(operation);
+        self.split_three_action_started_ms = unix_now_ms();
+        self.maybe_finish_split_three_validation();
+    }
+
+    fn maybe_finish_split_three_validation(&mut self) {
+        let Some(operation) = self.split_three_operation.take() else {
+            return;
+        };
+        if operation.stage != split_three::OperationStage::ValidateFinal {
+            self.split_three_operation = Some(operation);
+            return;
+        }
+
+        let (Some(first_new_pane_id), Some(second_new_pane_id)) =
+            (operation.first_new_pane_id, operation.second_new_pane_id)
+        else {
+            self.begin_split_three_rollback(operation);
+            return;
+        };
+        let geometry_status = self
+            .pane_manifest
+            .as_ref()
+            .map(|manifest| {
+                split_three::final_geometry_status_in_manifest(
+                    manifest,
+                    operation.original_rect,
+                    operation.original_pane_id,
+                    first_new_pane_id,
+                    second_new_pane_id,
+                    operation.direction,
+                )
+            })
+            .unwrap_or(split_three::FinalGeometryStatus::StillSettling);
+        match geometry_status {
+            split_three::FinalGeometryStatus::Settled => {
+                rename_terminal_pane(second_new_pane_id, "");
+                self.finish_split_three_operation();
+            }
+            split_three::FinalGeometryStatus::StillSettling => {
+                self.split_three_operation = Some(operation);
+            }
+            split_three::FinalGeometryStatus::Invalid => {
+                eprintln!(
+                    "Split Three rolled back invalid settled geometry in tab {}",
+                    operation.tab_id
+                );
+                self.begin_split_three_rollback(operation);
+            }
+        }
+    }
+
+    fn maybe_recover_pending_split_three_spawn(&mut self) {
+        let Some(mut operation) = self.split_three_operation.take() else {
+            return;
+        };
+        let recovering_first = match operation.stage {
+            split_three::OperationStage::RecoverFirstSplit => true,
+            split_three::OperationStage::RecoverSecondSplit => false,
+            _ => {
+                self.split_three_operation = Some(operation);
+                return;
+            }
+        };
+
+        let ordinal = if recovering_first { 1 } else { 2 };
+        let pane_index = operation.initial_terminal_pane_count + usize::from(ordinal);
+        let expected_marker = split_three::pane_marker(operation.id, ordinal, pane_index);
+        let mut candidates = self
+            .pane_manifest
+            .as_ref()
+            .and_then(|manifest| {
+                manifest.panes.values().find(|panes| {
+                    panes
+                        .iter()
+                        .any(|pane| !pane.is_plugin && pane.id == operation.original_pane_id)
+                })
+            })
+            .into_iter()
+            .flatten()
+            .filter(|pane| {
+                !pane.is_plugin
+                    && pane.title == expected_marker
+                    && !operation.known_terminal_pane_ids.contains(&pane.id)
+                    && Some(pane.id) != operation.first_new_pane_id
+                    && Some(pane.id) != operation.second_new_pane_id
+                    && split_three::pane_is_within(
+                        operation.original_rect,
+                        pane,
+                        operation.direction,
+                    )
+            })
+            .map(|pane| pane.id);
+        let recovered_pane_id = candidates.next().filter(|_| candidates.next().is_none());
+
+        if let Some(pane_id) = recovered_pane_id {
+            if recovering_first {
+                operation.first_new_pane_id = Some(pane_id);
+                rename_terminal_pane(pane_id, "");
+                self.begin_split_three_rollback(operation);
+            } else {
+                operation.second_new_pane_id = Some(pane_id);
+                self.wait_for_split_three_validation(operation);
+            }
+        } else {
+            self.split_three_operation = Some(operation);
+        }
+    }
+
+    fn begin_split_three_rollback(&mut self, mut operation: split_three::Operation) {
+        operation.recovery_attempts = 0;
+        if operation.mouse_maybe_down {
+            let focus_anchor = operation
+                .first_new_pane_id
+                .into_iter()
+                .chain(std::iter::once(operation.original_pane_id))
+                .chain(operation.second_new_pane_id)
+                .find(|pane_id| get_pane_info(PaneId::Terminal(*pane_id)).is_some());
+            if let Some(pane_id) = focus_anchor {
+                operation.stage = split_three::OperationStage::RollbackFocusForRelease;
+                self.dispatch_split_three(operation, split_three::focus_pane_action(pane_id));
+                return;
+            }
+            if let Some(drag) = operation.drag {
+                operation.stage = split_three::OperationStage::RollbackRelease;
+                self.dispatch_split_three(operation, split_three::drag_cancel_action(drag));
+                return;
+            }
+            operation.mouse_maybe_down = false;
+        }
+        self.continue_split_three_rollback(operation);
+    }
+
+    fn continue_split_three_rollback(&mut self, mut operation: split_three::Operation) {
+        operation.recovery_attempts = 0;
+        loop {
+            if let Some(second_new_pane_id) = operation.second_new_pane_id {
+                if get_pane_info(PaneId::Terminal(second_new_pane_id)).is_some() {
+                    operation.stage = split_three::OperationStage::RollbackSecond;
+                    self.dispatch_split_three(
+                        operation,
+                        split_three::close_pane_action(second_new_pane_id),
+                    );
+                    return;
+                }
+                operation.second_new_pane_id = None;
+                continue;
+            }
+            if let Some(first_new_pane_id) = operation.first_new_pane_id {
+                if get_pane_info(PaneId::Terminal(first_new_pane_id)).is_some() {
+                    operation.stage = split_three::OperationStage::RollbackFirst;
+                    self.dispatch_split_three(
+                        operation,
+                        split_three::close_pane_action(first_new_pane_id),
+                    );
+                    return;
+                }
+                operation.first_new_pane_id = None;
+                continue;
+            }
+            if get_pane_info(PaneId::Terminal(operation.original_pane_id)).is_some() {
+                operation.stage = split_three::OperationStage::RollbackFocus;
+                let original_pane_id = operation.original_pane_id;
+                self.dispatch_split_three(
+                    operation,
+                    split_three::focus_pane_action(original_pane_id),
+                );
+            } else {
+                self.finish_split_three_operation();
+            }
+            return;
+        }
+    }
+
+    fn finish_split_three_operation(&mut self) {
+        self.split_three_operation = None;
+        self.split_three_action_started_ms = 0;
+    }
+
+    fn recover_stalled_split_three(&mut self) {
+        let Some(mut operation) = self.split_three_operation.take() else {
+            return;
+        };
+        if unix_now_ms().saturating_sub(self.split_three_action_started_ms)
+            < SPLIT_THREE_ACTION_TIMEOUT_MS
+        {
+            self.split_three_operation = Some(operation);
+            return;
+        }
+
+        operation.recovery_attempts = operation.recovery_attempts.saturating_add(1);
+        match operation.stage {
+            split_three::OperationStage::FirstSplit => {
+                operation.stage = split_three::OperationStage::RecoverFirstSplit;
+                self.wait_for_split_three_spawn(operation);
+            }
+            split_three::OperationStage::SecondSplit => {
+                operation.stage = split_three::OperationStage::RecoverSecondSplit;
+                self.wait_for_split_three_spawn(operation);
+            }
+            split_three::OperationStage::RecoverFirstSplit => {
+                if operation.recovery_attempts < 3 {
+                    self.split_three_action_started_ms = unix_now_ms();
+                    self.split_three_operation = Some(operation);
+                } else {
+                    self.finish_split_three_operation();
+                }
+            }
+            split_three::OperationStage::RecoverSecondSplit => {
+                if operation.recovery_attempts < 3 {
+                    self.split_three_action_started_ms = unix_now_ms();
+                    self.split_three_operation = Some(operation);
+                } else {
+                    operation.recovery_attempts = 0;
+                    self.begin_split_three_rollback(operation);
+                }
+            }
+            split_three::OperationStage::ValidateFinal => {
+                eprintln!(
+                    "Split Three rolled back geometry that did not settle in tab {}",
+                    operation.tab_id
+                );
+                operation.recovery_attempts = 0;
+                self.begin_split_three_rollback(operation);
+            }
+            split_three::OperationStage::RollbackFocusForRelease => {
+                operation.recovery_attempts = 0;
+                if let Some(drag) = operation.drag {
+                    operation.stage = split_three::OperationStage::RollbackRelease;
+                    self.dispatch_split_three(operation, split_three::drag_cancel_action(drag));
+                } else {
+                    operation.mouse_maybe_down = false;
+                    self.continue_split_three_rollback(operation);
+                }
+            }
+            split_three::OperationStage::RollbackRelease => {
+                if operation.recovery_attempts < 2 {
+                    let Some(drag) = operation.drag else {
+                        operation.mouse_maybe_down = false;
+                        operation.recovery_attempts = 0;
+                        self.continue_split_three_rollback(operation);
+                        return;
+                    };
+                    self.dispatch_split_three(operation, split_three::drag_cancel_action(drag));
+                } else {
+                    operation.mouse_maybe_down = false;
+                    operation.recovery_attempts = 0;
+                    self.continue_split_three_rollback(operation);
+                }
+            }
+            split_three::OperationStage::RollbackSecond => {
+                if operation.recovery_attempts < 2 {
+                    let Some(pane_id) = operation.second_new_pane_id else {
+                        operation.recovery_attempts = 0;
+                        self.continue_split_three_rollback(operation);
+                        return;
+                    };
+                    self.dispatch_split_three(operation, split_three::close_pane_action(pane_id));
+                } else {
+                    operation.second_new_pane_id = None;
+                    operation.recovery_attempts = 0;
+                    self.continue_split_three_rollback(operation);
+                }
+            }
+            split_three::OperationStage::RollbackFirst => {
+                if operation.recovery_attempts < 2 {
+                    let Some(pane_id) = operation.first_new_pane_id else {
+                        operation.recovery_attempts = 0;
+                        self.continue_split_three_rollback(operation);
+                        return;
+                    };
+                    self.dispatch_split_three(operation, split_three::close_pane_action(pane_id));
+                } else {
+                    operation.first_new_pane_id = None;
+                    operation.recovery_attempts = 0;
+                    self.continue_split_three_rollback(operation);
+                }
+            }
+            split_three::OperationStage::RollbackFocus => {
+                self.finish_split_three_operation();
+            }
+            _ => {
+                operation.recovery_attempts = 0;
+                self.begin_split_three_rollback(operation);
+            }
+        }
+    }
+
+    fn dispatch_split_three(&mut self, operation: split_three::Operation, action: Action) {
+        let context = operation.context();
+        self.split_three_operation = Some(operation);
+        self.split_three_action_started_ms = unix_now_ms();
+        run_action(action, context);
+    }
+
     fn on_command_permissions_granted(&mut self) {
         let newly_granted = !self.command_permissions_granted;
         self.command_permissions_granted = true;
@@ -409,6 +1142,7 @@ impl State {
         // Keep the plugin visible during fullscreen once application-state
         // changes are allowed.
         set_selectable(false);
+        self.maybe_install_split_three_bindings();
 
         if newly_granted {
             self.request_sync();
@@ -419,6 +1153,41 @@ impl State {
         if !self.config_loaded {
             self.load_config();
         }
+    }
+
+    fn maybe_install_split_three_bindings(&mut self) {
+        if !self.command_permissions_granted {
+            return;
+        }
+        if !self.split_three_instance_is_active() {
+            // Each tab owns a plugin instance. Reset while inactive so this
+            // instance retargets the client binding when its tab is revisited.
+            self.split_three_bindings_installed = false;
+            return;
+        }
+        if self.split_three_bindings_installed {
+            return;
+        }
+        let plugin_id = self.plugin_id.unwrap_or_else(|| get_plugin_ids().plugin_id);
+        let Some(keybinds) = self.initial_keybinds.as_ref() else {
+            return;
+        };
+
+        // Mark first: reconfiguration emits another InitialKeybinds event.
+        // Becoming inactive resets this flag so tab switches retarget it.
+        self.split_three_bindings_installed = true;
+        split_three::install(keybinds, plugin_id);
+    }
+
+    fn maybe_capture_legacy_keybinds(&mut self, keybinds: KeybindsVec) {
+        if !self.split_three_uses_legacy_keybinds {
+            return;
+        }
+
+        // Zellij 0.44.0 includes the full snapshot in every ModeUpdate. Keep
+        // refreshing it until permission arrives so late user rebinds win.
+        self.initial_keybinds = Some(keybinds);
+        self.maybe_install_split_three_bindings();
     }
 
     fn maybe_start_attach_scan(&mut self) {
@@ -838,6 +1607,81 @@ mod tests {
         // The clock steps back; the stale future stamp must not block polling.
         assert!(state.agent_poll_due(40_000));
         assert!(!state.agent_poll_due(40_001));
+    }
+
+    #[test]
+    fn split_three_install_waits_for_permission_and_keybind_snapshot() {
+        let mut state = active_split_three_state();
+        state.initial_keybinds = Some(vec![]);
+
+        state.maybe_install_split_three_bindings();
+        assert!(!state.split_three_bindings_installed);
+
+        state.command_permissions_granted = true;
+        state.maybe_install_split_three_bindings();
+        assert!(state.split_three_bindings_installed);
+    }
+
+    #[test]
+    fn split_three_accepts_an_empty_legacy_mode_update_snapshot() {
+        let mut state = active_split_three_state();
+        state.command_permissions_granted = true;
+        state.split_three_uses_legacy_keybinds = true;
+
+        state.maybe_capture_legacy_keybinds(vec![]);
+
+        assert_eq!(state.initial_keybinds, Some(vec![]));
+        assert!(state.split_three_bindings_installed);
+    }
+
+    #[test]
+    fn split_three_refreshes_legacy_keybinds_until_permission_arrives() {
+        let mut state = active_split_three_state();
+        state.split_three_uses_legacy_keybinds = true;
+        state.maybe_capture_legacy_keybinds(vec![]);
+
+        let custom_right: KeybindsVec = vec![(
+            InputMode::Pane,
+            vec![(
+                KeyWithModifier::new(BareKey::Char(split_three::SPLIT_THREE_RIGHT_KEY))
+                    .with_shift_modifier(),
+                vec![],
+            )],
+        )];
+        state.maybe_capture_legacy_keybinds(custom_right.clone());
+
+        assert_eq!(state.initial_keybinds, Some(custom_right));
+        assert!(!state.split_three_bindings_installed);
+        assert_eq!(
+            split_three::available_bindings(state.initial_keybinds.as_ref().unwrap(), 42).len(),
+            1
+        );
+
+        state.command_permissions_granted = true;
+        state.maybe_install_split_three_bindings();
+        assert!(state.split_three_bindings_installed);
+    }
+
+    fn active_split_three_state() -> State {
+        let mut manifest = PaneManifest::default();
+        manifest.panes.insert(
+            0,
+            vec![PaneInfo {
+                id: 42,
+                is_plugin: true,
+                ..PaneInfo::default()
+            }],
+        );
+        State {
+            plugin_id: Some(42),
+            pane_manifest: Some(manifest),
+            tabs: vec![TabInfo {
+                position: 0,
+                active: true,
+                ..TabInfo::default()
+            }],
+            ..State::default()
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ A Zellij status bar plugin that replaces the default tab bar with Claude Code an
 - **Attach-time recovery** — recognizes agent sessions and effort modes that were already running when the status bar attached
 - **Theme-aware palette** — follows Zellij's live theme colors; Gruvbox Dark is explicitly verified
 - **Ultra-mode rainbow** — tab names shimmer through rainbow colors for Codex `ultra` sessions and Claude Code `ultracode` sessions
+- **Split Three** — upgraded Pane-mode versions of Split Right and Split Down create three equal panes at once
 - **Clickable tabs** — click any tab to switch to it
 - **Smart pane focus** — clicking an agent-aware tab focuses its most recently active Claude Code or Codex pane, revealing it inside a stack; waiting (⚠) sessions retain priority
 - **Permission flash** — sessions pulse with the theme's error color for 2 seconds when a permission request arrives
@@ -37,6 +38,17 @@ A Zellij status bar plugin that replaces the default tab bar with Claude Code an
 | ○ | Idle |
 
 Indicator colors come from the active Zellij theme. Ultra-mode tab names remain an intentional animated RGB exception.
+
+### Pane mode bindings
+
+Open Pane mode with `Ctrl+p`, then use:
+
+| Key | Action |
+|-----|--------|
+| `Shift+r` | **Split Three Right** — split the current pane into three equal-width columns |
+| `Shift+d` | **Split Three Down** — split the current pane into three equal-height rows |
+
+Both commands focus the newest pane and return to Normal mode, matching Zellij's built-in Split Right (`r`) and Split Down (`d`) flow. When the available cells are not divisible by three, pane sizes differ by at most one cell. Zellaude installs the uppercase bindings for the running client without writing to `config.kdl`. If either key already has a custom Pane-mode binding, Zellaude leaves it untouched. Approve Zellij's **Change runtime configuration** and **Execute actions as the user** permissions when prompted so the session-only bindings and exact resize sequence can run.
 
 ### Settings
 
