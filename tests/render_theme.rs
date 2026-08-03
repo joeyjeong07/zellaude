@@ -184,7 +184,6 @@ mod state {
         pub prefix_click_region: Option<(usize, usize)>,
         pub menu_click_regions: Vec<MenuClickRegion>,
         pub permissions_denied: bool,
-        pub focus_hint: Option<String>,
     }
 
     impl Default for State {
@@ -207,7 +206,6 @@ mod state {
                 prefix_click_region: None,
                 menu_click_regions: Vec::new(),
                 permissions_denied: false,
-                focus_hint: None,
             }
         }
     }
@@ -489,28 +487,91 @@ fn a_placeholder_never_renders_an_elapsed_suffix() {
     assert_eq!(render::elapsed_suffix(&placeholder, 1_000_000), None);
 }
 
-#[test]
-fn a_denied_permission_tells_the_user_how_to_grant_it() {
-    // Zellij draws the y/n prompt itself, and once it is dismissed the plugin
-    // gets no second chance to explain: it just sits there inert. The bar is the
-    // only surface left, so it has to say what is wrong and what to press —
-    // otherwise the failure is indistinguishable from the plugin working.
-    let mut state = State {
+/// Visible text with SGR sequences removed, for asserting what the user sees
+/// and how many columns it occupies.
+fn strip_ansi(rendered: &str) -> String {
+    let mut out = String::new();
+    let mut chars = rendered.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // Consume the escape: '[' then parameters then a final alphabetic byte.
+        for c in chars.by_ref() {
+            if c.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn denied_state() -> State {
+    State {
         zellij_styling: Some(gruvbox_dark()),
         tabs: vec![tab(0, "work", true)],
         permissions_denied: true,
         ..State::default()
-    };
+    }
+}
 
-    let output = render::build_status_bar(&mut state, 1, 100);
+#[test]
+fn a_denied_permission_is_never_rendered_as_a_healthy_bar() {
+    // The notice exists because a denied plugin is inert and looks fine. If the
+    // text does not fit it must shrink, not vanish — dropping it reproduces the
+    // exact failure the notice was added to remove, and worse, because the tabs
+    // are suppressed too.
+    for cols in [20usize, 30, 40, 55, 60, 68, 80, 120] {
+        let output = render::build_status_bar(&mut denied_state(), 1, cols);
+        let visible = strip_ansi(&output);
+
+        assert!(
+            visible.contains("perm"),
+            "cols={cols} rendered no notice: {visible:?}"
+        );
+        assert!(
+            visible.chars().count() <= cols,
+            "cols={cols} overran the bar: {visible:?}"
+        );
+    }
+}
+
+#[test]
+fn every_permission_notice_offers_the_click() {
+    // Clicking is the only recovery that needs no focus, so it has to survive
+    // every width. A notice that says "press y" alone sends the keystroke to
+    // whatever pane is focused instead — a running agent, or a shell.
+    for cols in [30usize, 45, 60, 80, 120] {
+        let output = render::build_status_bar(&mut denied_state(), 1, cols);
+        let visible = strip_ansi(&output);
+
+        assert!(
+            visible.contains("click"),
+            "cols={cols} dropped the click affordance: {visible:?}"
+        );
+    }
+}
+
+#[test]
+fn the_widest_permission_notice_names_the_keys() {
+    let output = render::build_status_bar(&mut denied_state(), 1, 120);
+
+    assert!(output.contains("Ctrl p"), "{output}");
+    assert!(output.contains("then y"), "{output}");
+}
+
+#[test]
+fn the_permission_notice_uses_the_theme_flash_background() {
+    // theme.rs derives `flash` by inverting error.base into the background
+    // precisely because Zellij keeps the semantic error color in `base`.
+    // Painting on error.background instead can equal the bar's own surface —
+    // for a Styling built from a legacy Palette both are EightBit(0).
+    let output = render::build_status_bar(&mut denied_state(), 1, 120);
 
     assert!(
-        output.contains("needs permission"),
-        "the bar should say what is wrong: {output}"
-    );
-    assert!(
-        output.contains("then y"),
-        "the bar should say which key grants it: {output}"
+        output.contains("\x1b[48;2;204;36;29m"),
+        "the notice should use the flash background: {output}"
     );
 }
 
@@ -524,45 +585,5 @@ fn a_granted_bar_says_nothing_about_permissions() {
 
     let output = render::build_status_bar(&mut state, 1, 100);
 
-    assert!(!output.contains("needs permission"), "{output}");
-}
-
-#[test]
-fn the_permission_notice_spells_out_the_keys_to_press() {
-    // "focus this pane" is not an instruction — the bar is a one-row borderless
-    // pane, and reaching it takes a mode switch and a direction key before `y`
-    // does anything. The hint is derived from the user's own keybinds, so a
-    // remapped config gets its own keys rather than the defaults.
-    let mut state = State {
-        zellij_styling: Some(gruvbox_dark()),
-        tabs: vec![tab(0, "work", true)],
-        permissions_denied: true,
-        focus_hint: Some("Alt f then k".into()),
-        ..State::default()
-    };
-
-    let output = render::build_status_bar(&mut state, 1, 120);
-
-    assert!(
-        output.contains("Alt f then k"),
-        "the notice should use the configured keys: {output}"
-    );
-    assert!(output.contains("then y"), "{output}");
-}
-
-#[test]
-fn the_permission_notice_falls_back_to_the_default_keys() {
-    let mut state = State {
-        zellij_styling: Some(gruvbox_dark()),
-        tabs: vec![tab(0, "work", true)],
-        permissions_denied: true,
-        ..State::default()
-    };
-
-    let output = render::build_status_bar(&mut state, 1, 120);
-
-    assert!(
-        output.contains("Ctrl p"),
-        "without keybind info the notice should still name a key: {output}"
-    );
+    assert!(!output.contains("permission"), "{output}");
 }

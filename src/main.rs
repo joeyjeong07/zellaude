@@ -12,7 +12,6 @@ mod theme;
 
 use state::{unix_now, unix_now_ms, HookPayload, MenuAction, SessionInfo, Settings, State, ViewMode};
 use std::collections::BTreeMap;
-use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
 
 const DONE_TIMEOUT: u64 = 30;
@@ -33,48 +32,6 @@ const REQUIRED_PERMISSIONS: [PermissionType; 5] = [
     PermissionType::MessageAndLaunchOtherPlugins,
 ];
 
-/// The keys that move focus onto this bar, taken from the user's own binds: the
-/// key that enters pane mode, then the one that moves focus up inside it.
-///
-/// Returns `None` when either action is unbound, so the caller can fall back to
-/// Zellij's defaults instead of printing half an instruction. The bar sits above
-/// its tab's panes in the documented layout, which is why "up" is the direction
-/// worth naming.
-fn focus_hint_from(keybinds: &[(InputMode, Vec<(KeyWithModifier, Vec<Action>)>)]) -> Option<String> {
-    fn key_for(
-        keybinds: &[(InputMode, Vec<(KeyWithModifier, Vec<Action>)>)],
-        mode: InputMode,
-        wanted: impl Fn(&Action) -> bool,
-    ) -> Option<String> {
-        keybinds
-            .iter()
-            .find(|(bound_mode, _)| *bound_mode == mode)?
-            .1
-            .iter()
-            .find(|(_, actions)| actions.iter().any(&wanted))
-            .map(|(key, _)| key.to_string())
-    }
-
-    let to_pane_mode = key_for(keybinds, InputMode::Normal, |action| {
-        matches!(
-            action,
-            Action::SwitchToMode {
-                input_mode: InputMode::Pane
-            }
-        )
-    })?;
-    let focus_up = key_for(keybinds, InputMode::Pane, |action| {
-        matches!(
-            action,
-            Action::MoveFocus {
-                direction: Direction::Up
-            }
-        )
-    })?;
-
-    Some(format!("{to_pane_mode} then {focus_up}"))
-}
-
 register_plugin!(State);
 
 impl ZellijPlugin for State {
@@ -86,6 +43,7 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::Timer,
             EventType::Mouse,
+            EventType::Key,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
@@ -120,12 +78,22 @@ impl ZellijPlugin for State {
             Event::ModeUpdate(mode_info) => {
                 self.input_mode = mode_info.mode;
                 self.zellij_styling = Some(mode_info.style.colors);
-                self.focus_hint = focus_hint_from(&mode_info.keybinds);
                 if let Some(name) = mode_info.session_name {
                     self.zellij_session_name = Some(name);
                 }
                 self.maybe_start_attach_scan();
                 true
+            }
+            // The notice tells the user to press `y`. Zellij's own prompt is
+            // gone by the time this state exists, so nothing else would act on
+            // that keystroke — the instruction has to be honoured here or it is
+            // a lie. Only reachable when the pane has focus, which is exactly
+            // the case the click path cannot cover.
+            Event::Key(key) if self.permissions_denied => {
+                if key.bare_key == BareKey::Char('y') && key.key_modifiers.is_empty() {
+                    request_permission(&REQUIRED_PERMISSIONS);
+                }
+                false
             }
             Event::Mouse(Mouse::LeftClick(_, col)) => {
                 let col = col as usize;
@@ -134,9 +102,14 @@ impl ZellijPlugin for State {
                 // Zellij's prompt otherwise means focusing a one-row borderless
                 // pane by keyboard before y does anything, which is the part
                 // people get stuck on; a click re-raises the prompt instead.
+                //
+                // The flag stays set until a grant actually arrives. Clearing it
+                // here would spend the affordance on a single click: a second
+                // click would fall through to the prefix region below and open
+                // the settings menu, and a prompt dismissed without a Denied
+                // event would leave the bar looking healthy while inert.
                 if self.permissions_denied {
                     request_permission(&REQUIRED_PERMISSIONS);
-                    self.permissions_denied = false;
                     return true;
                 }
 
@@ -347,7 +320,11 @@ impl ZellijPlugin for State {
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.on_command_permissions_granted();
-                false
+                // The grant clears the denial notice, so it has to repaint.
+                // Relying on load_config's RunCommandResult to do it leaves the
+                // banner painted over the tabs whenever that path is skipped —
+                // config_loaded already set, or the command never round-trips.
+                true
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
                 self.command_permissions_granted = false;

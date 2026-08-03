@@ -207,11 +207,6 @@ pub struct State {
     /// the plugin is left permanently inert and indistinguishable from a working
     /// one — no hooks installed, no config, no explanation.
     pub permissions_denied: bool,
-    /// Keys that move focus onto this bar, formatted from the user's own
-    /// keybinds (e.g. "Ctrl p then ↑"). Derived rather than hardcoded because a
-    /// remapped config would otherwise be told to press keys it does not bind.
-    /// `None` until a ModeUpdate arrives, or when the actions cannot be found.
-    pub focus_hint: Option<String>,
     pub hooks_installed: bool,
     pub attach_scan_requested: bool,
     pub last_agent_poll_ms: u64,
