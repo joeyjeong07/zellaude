@@ -8,8 +8,6 @@ zellij-tile = "0.44.3"
 zellij-utils = "0.44.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
 unicode-width = "0.1.8"
 
 [profile.release]

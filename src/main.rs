@@ -1,4 +1,5 @@
 mod attach;
+mod custom_layouts;
 mod event_handler;
 mod installer;
 mod placeholder;
@@ -23,6 +24,55 @@ const FLASH_TICK: f64 = 0.25;
 /// bounded when the timer runs at flash/rainbow cadence.
 const AGENT_POLL_INTERVAL_MS: u64 = 2000;
 const SPLIT_THREE_ACTION_TIMEOUT_MS: u64 = 5000;
+const SAVE_CONFIG_SCRIPT: &str = r#"
+set -eu
+if [ "$#" -ge 2 ]; then
+    config_path=$2
+else
+    config_path="$HOME/.config/zellij/plugins/zellaude.json"
+fi
+symlink_hops=0
+while [ -L "$config_path" ]; do
+    symlink_hops=$((symlink_hops + 1))
+    if [ "$symlink_hops" -gt 40 ]; then
+        printf '%s\n' 'too many symlinks in zellaude config path' >&2
+        exit 1
+    fi
+    link_target=$(readlink "$config_path")
+    case "$link_target" in
+        /*) config_path=$link_target ;;
+        *) config_path=$(dirname "$config_path")/$link_target ;;
+    esac
+done
+config_dir=$(dirname "$config_path")
+mkdir -p "$config_dir"
+umask 077
+tmp_path=$(mktemp "$config_dir/.zellaude.json.XXXXXX")
+trap 'rm -f "$tmp_path"' 0 HUP INT TERM
+
+if [ -s "$config_path" ]; then
+    jq --slurp --argjson settings "$1" '
+        if length != 1 then
+            error("zellaude configuration must contain exactly one JSON value")
+        else .[0] |
+        if type == "array" then
+            $settings + {custom_states: .}
+        elif type == "object" and has("id") then
+            $settings + {custom_states: [.]}
+        elif type == "object" then
+            . + $settings
+        else
+            error("zellaude configuration must be a JSON object or array")
+        end
+        end
+    ' "$config_path" > "$tmp_path"
+else
+    printf '%s\n' "$1" > "$tmp_path"
+fi
+
+mv "$tmp_path" "$config_path"
+trap - 0 HUP INT TERM
+"#;
 
 fn split_three_focus_matches(tab_id: usize, pane_id: u32) -> bool {
     matches!(
@@ -48,7 +98,17 @@ const REQUIRED_PERMISSIONS: [PermissionType; 7] = [
 register_plugin!(State);
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _configuration: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.plugin_configuration = configuration.clone();
+        self.custom_layouts_from_plugin_configuration =
+            custom_layouts::has_plugin_configuration(&configuration);
+        match custom_layouts::parse_plugin_configuration(&configuration) {
+            Ok(Some(layouts)) => {
+                self.custom_layouts = custom_layouts::index(layouts);
+            }
+            Ok(None) => {}
+            Err(error) => self.custom_layout_config_error = Some(error),
+        }
         self.split_three_uses_legacy_keybinds =
             split_three::uses_legacy_mode_keybinds(&get_zellij_version());
         request_permission(&REQUIRED_PERMISSIONS);
@@ -59,6 +119,7 @@ impl ZellijPlugin for State {
             EventType::Timer,
             EventType::Mouse,
             EventType::Key,
+            EventType::PastedText,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
             EventType::InitialKeybinds,
@@ -74,6 +135,7 @@ impl ZellijPlugin for State {
                 // every update delivered to the newly active instance so a
                 // returning tab always retargets the client-scoped binding.
                 self.split_three_bindings_installed = false;
+                self.custom_layout_bindings_installed = false;
                 let new_active = tabs.iter().find(|t| t.active).map(|t| t.position);
                 if new_active != self.active_tab_index {
                     // Tab focus changed — clear persist flashes on the newly focused tab
@@ -87,16 +149,18 @@ impl ZellijPlugin for State {
                 self.active_tab_index = new_active;
                 self.tabs = tabs;
                 self.rebuild_pane_map();
-                self.maybe_install_split_three_bindings();
+                self.maybe_cancel_custom_layout_prompt_on_focus_loss();
+                self.maybe_install_runtime_bindings();
                 self.maybe_start_attach_scan();
                 true
             }
             Event::PaneUpdate(manifest) => {
                 self.pane_manifest = Some(manifest);
                 self.rebuild_pane_map();
+                self.maybe_cancel_custom_layout_prompt_on_focus_loss();
                 self.maybe_recover_pending_split_three_spawn();
                 self.maybe_finish_split_three_validation();
-                self.maybe_install_split_three_bindings();
+                self.maybe_install_runtime_bindings();
                 self.maybe_start_attach_scan();
                 true
             }
@@ -111,6 +175,12 @@ impl ZellijPlugin for State {
                 self.maybe_start_attach_scan();
                 true
             }
+            Event::Key(key) if self.custom_layout_prompt.is_some() => {
+                self.handle_custom_layout_prompt_key(key)
+            }
+            Event::PastedText(pasted) if self.custom_layout_prompt.is_some() => {
+                self.handle_custom_layout_paste(&pasted)
+            }
             // The notice tells the user to press `y`. Zellij's own prompt is
             // gone by the time this state exists, so nothing else would act on
             // that keystroke — the instruction has to be honoured here or it is
@@ -123,6 +193,10 @@ impl ZellijPlugin for State {
                 false
             }
             Event::Mouse(Mouse::LeftClick(_, col)) => {
+                if let Some(prompt) = self.custom_layout_prompt.as_mut() {
+                    prompt.note_input();
+                    return true;
+                }
                 let col = col as usize;
 
                 // While denied, the whole bar is a retry button. Answering
@@ -201,12 +275,23 @@ impl ZellijPlugin for State {
                     }
                 }
             }
-            Event::RunCommandResult(exit_code, stdout, _stderr, context) => {
+            Event::RunCommandResult(exit_code, stdout, stderr, context) => {
                 match context.get("type").map(|s| s.as_str()) {
                     Some("load_config") if exit_code == Some(0) => {
                         let raw = String::from_utf8_lossy(&stdout);
                         if let Ok(settings) = serde_json::from_str::<Settings>(raw.trim()) {
                             self.settings = settings;
+                        }
+                        match custom_layouts::parse_config_document(raw.trim()) {
+                            Ok(Some(layouts)) if !self.custom_layouts_from_plugin_configuration => {
+                                self.custom_layouts = custom_layouts::index(layouts);
+                                self.custom_layout_config_error = None;
+                            }
+                            Ok(Some(_)) | Ok(None) => {}
+                            Err(error) if !self.custom_layouts_from_plugin_configuration => {
+                                self.custom_layout_config_error = Some(error);
+                            }
+                            Err(_) => {}
                         }
                         self.config_loaded = true;
                         self.on_command_permissions_granted();
@@ -215,6 +300,15 @@ impl ZellijPlugin for State {
                     Some("install_hooks") if exit_code == Some(0) => {
                         self.hooks_installed = true;
                         self.maybe_start_attach_scan();
+                        false
+                    }
+                    Some("save_config") => {
+                        if exit_code != Some(0) {
+                            eprintln!(
+                                "Zellaude could not save settings: {}",
+                                String::from_utf8_lossy(&stderr).trim()
+                            );
+                        }
                         false
                     }
                     Some("attach_scan") => {
@@ -326,6 +420,8 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_) => {
+                let custom_layout_prompt_changed =
+                    self.maybe_cancel_custom_layout_prompt_on_focus_loss();
                 self.maybe_recover_pending_split_three_spawn();
                 self.maybe_finish_split_three_validation();
                 self.recover_stalled_split_three();
@@ -346,6 +442,7 @@ impl ZellijPlugin for State {
                     || stale_changed
                     || flash_changed
                     || placeholder_changed
+                    || custom_layout_prompt_changed
                     || self.has_elapsed_display()
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
@@ -368,7 +465,7 @@ impl ZellijPlugin for State {
             }
             Event::InitialKeybinds(keybinds) => {
                 self.initial_keybinds = Some(keybinds);
-                self.maybe_install_split_three_bindings();
+                self.maybe_install_runtime_bindings();
                 false
             }
             Event::ActionComplete(_action, affected_pane_id, context) => {
@@ -438,6 +535,12 @@ impl ZellijPlugin for State {
                 }
                 false
             }
+            custom_layouts::PIPE_NAME => {
+                if pipe_message.payload.as_deref() == Some("prompt") {
+                    self.start_custom_layout_prompt();
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -448,6 +551,156 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    fn start_custom_layout_prompt(&mut self) {
+        if self.custom_layout_prompt.is_some()
+            || self.split_three_operation.is_some()
+            || !self.command_permissions_granted
+            || !self.split_three_instance_is_active()
+        {
+            return;
+        }
+
+        let Ok((_tab_id, PaneId::Terminal(return_pane_id))) = get_focused_pane_info() else {
+            return;
+        };
+        let cwd = get_pane_cwd(PaneId::Terminal(return_pane_id))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let mut prompt = custom_layouts::Prompt::new(return_pane_id, cwd);
+        if let Some(error) = self.custom_layout_config_error.as_deref() {
+            prompt.error = Some(format!("Configuration error: {error}"));
+        } else if self.custom_layouts.is_empty() {
+            prompt.error = Some("No custom states configured".to_string());
+        }
+
+        self.view_mode = ViewMode::Normal;
+        self.custom_layout_prompt = Some(prompt);
+        set_selectable(true);
+        switch_to_input_mode(&InputMode::Normal);
+        let plugin_id = *self
+            .plugin_id
+            .get_or_insert_with(|| get_plugin_ids().plugin_id);
+        focus_plugin_pane(plugin_id, false, false);
+        // Do not mark focus as acquired until the host reports it. A pane
+        // update queued before this request may still describe the original
+        // terminal; the bounded acquisition window ignores that stale frame
+        // while still cleaning up a focus request the host never honors.
+        if let Some(prompt) = self.custom_layout_prompt.as_mut() {
+            prompt.begin_focus_acquisition(unix_now_ms());
+        }
+    }
+
+    fn handle_custom_layout_prompt_key(&mut self, key: KeyWithModifier) -> bool {
+        let action = self.custom_layout_prompt.as_mut().map(|prompt| {
+            prompt.note_input();
+            custom_layouts::handle_prompt_key(prompt, &key)
+        });
+        match action {
+            Some(custom_layouts::PromptKey::Submit(id)) => self.open_custom_layout(&id),
+            Some(custom_layouts::PromptKey::Cancel) => self.cancel_custom_layout_prompt(),
+            Some(custom_layouts::PromptKey::Updated) => true,
+            Some(custom_layouts::PromptKey::Ignored) | None => false,
+        }
+    }
+
+    fn handle_custom_layout_paste(&mut self, pasted: &str) -> bool {
+        self.custom_layout_prompt.as_mut().is_some_and(|prompt| {
+            prompt.note_input();
+            custom_layouts::handle_paste(prompt, pasted)
+        })
+    }
+
+    fn maybe_cancel_custom_layout_prompt_on_focus_loss(&mut self) -> bool {
+        let Some(prompt) = self.custom_layout_prompt.as_mut() else {
+            return false;
+        };
+        let plugin_id = *self
+            .plugin_id
+            .get_or_insert_with(|| get_plugin_ids().plugin_id);
+        let is_focused = match get_focused_pane_info() {
+            Ok((_tab_id, PaneId::Plugin(focused_plugin_id))) => focused_plugin_id == plugin_id,
+            Ok(_) => false,
+            // A host-query timeout says nothing about focus. The next targeted
+            // timer will retry, including while this plugin's tab is inactive.
+            Err(_) => return false,
+        };
+        if prompt.observe_focus(is_focused, unix_now_ms()) {
+            self.custom_layout_prompt = None;
+            set_selectable(false);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn open_custom_layout(&mut self, id: &str) -> bool {
+        if id.is_empty() {
+            if let Some(prompt) = self.custom_layout_prompt.as_mut() {
+                prompt.error = Some("Enter a custom state id".to_string());
+            }
+            return true;
+        }
+        let Some(layout) = self.custom_layouts.get(id).cloned() else {
+            if let Some(prompt) = self.custom_layout_prompt.as_mut() {
+                prompt.error = Some(format!("Unknown custom state {id:?}"));
+            }
+            return true;
+        };
+        let plugin_id = *self
+            .plugin_id
+            .get_or_insert_with(|| get_plugin_ids().plugin_id);
+        let plugin_location = self
+            .pane_manifest
+            .as_ref()
+            .into_iter()
+            .flat_map(|manifest| manifest.panes.values())
+            .flatten()
+            .find(|pane| pane.is_plugin && pane.id == plugin_id)
+            .and_then(|pane| pane.plugin_url.clone());
+        let Some(plugin_location) = plugin_location else {
+            if let Some(prompt) = self.custom_layout_prompt.as_mut() {
+                prompt.error = Some("Zellaude plugin location is unavailable".to_string());
+            }
+            return true;
+        };
+        let cwd = self
+            .custom_layout_prompt
+            .as_ref()
+            .and_then(|prompt| prompt.cwd.as_deref());
+        let kdl = match layout.to_kdl(&plugin_location, &self.plugin_configuration, cwd) {
+            Ok(kdl) => kdl,
+            Err(error) => {
+                if let Some(prompt) = self.custom_layout_prompt.as_mut() {
+                    prompt.error = Some(error);
+                }
+                return true;
+            }
+        };
+        // Zellij 0.44 waits at most one second for tab creation and returns an
+        // empty ID list on timeout without cancelling the queued action. The
+        // generated KDL has already been validated structurally, so treating
+        // an empty response as a retryable failure could launch every command
+        // twice when the original tab finishes opening a moment later.
+        let _tab_ids = new_tabs_with_layout(&kdl);
+
+        self.custom_layout_prompt = None;
+        set_selectable(false);
+        switch_to_input_mode(&InputMode::Normal);
+        true
+    }
+
+    fn cancel_custom_layout_prompt(&mut self) -> bool {
+        let Some(prompt) = self.custom_layout_prompt.take() else {
+            return false;
+        };
+        set_selectable(false);
+        switch_to_input_mode(&InputMode::Normal);
+        if get_pane_info(PaneId::Terminal(prompt.return_pane_id)).is_some() {
+            focus_terminal_pane(prompt.return_pane_id, false, false);
+        }
+        true
+    }
+
     fn split_three_instance_is_active(&mut self) -> bool {
         let plugin_id = *self
             .plugin_id
@@ -1142,7 +1395,7 @@ impl State {
         // Keep the plugin visible during fullscreen once application-state
         // changes are allowed.
         set_selectable(false);
-        self.maybe_install_split_three_bindings();
+        self.maybe_install_runtime_bindings();
 
         if newly_granted {
             self.request_sync();
@@ -1153,6 +1406,11 @@ impl State {
         if !self.config_loaded {
             self.load_config();
         }
+    }
+
+    fn maybe_install_runtime_bindings(&mut self) {
+        self.maybe_install_split_three_bindings();
+        self.maybe_install_custom_layout_bindings();
     }
 
     fn maybe_install_split_three_bindings(&mut self) {
@@ -1179,6 +1437,28 @@ impl State {
         split_three::install(keybinds, plugin_id);
     }
 
+    fn maybe_install_custom_layout_bindings(&mut self) {
+        if !self.command_permissions_granted {
+            return;
+        }
+        if !self.split_three_instance_is_active() {
+            self.custom_layout_bindings_installed = false;
+            return;
+        }
+        if self.custom_layout_bindings_installed {
+            return;
+        }
+        let plugin_id = self.plugin_id.unwrap_or_else(|| get_plugin_ids().plugin_id);
+        let Some(keybinds) = self.initial_keybinds.as_ref() else {
+            return;
+        };
+
+        // Reconfiguration emits another InitialKeybinds snapshot. Mark first
+        // and let a later tab activation reset this client-scoped target.
+        self.custom_layout_bindings_installed = true;
+        custom_layouts::install(keybinds, plugin_id);
+    }
+
     fn maybe_capture_legacy_keybinds(&mut self, keybinds: KeybindsVec) {
         if !self.split_three_uses_legacy_keybinds {
             return;
@@ -1187,7 +1467,7 @@ impl State {
         // Zellij 0.44.0 includes the full snapshot in every ModeUpdate. Keep
         // refreshing it until permission arrives so late user rebinds win.
         self.initial_keybinds = Some(keybinds);
-        self.maybe_install_split_three_bindings();
+        self.maybe_install_runtime_bindings();
     }
 
     fn maybe_start_attach_scan(&mut self) {
@@ -1427,14 +1707,27 @@ impl State {
             return;
         }
         self.broadcast_settings();
-        let json = serde_json::to_string(&self.settings).unwrap_or_default();
-        let json_esc = json.replace('\'', "'\\''");
-        let cmd = format!(
-            "mkdir -p \"$HOME/.config/zellij/plugins\" && printf '%s' '{json_esc}' > \"$HOME/.config/zellij/plugins/zellaude.json\""
-        );
+        // Merge the small settings object into the existing file on the host.
+        // Custom states can legitimately contain far more data than a single
+        // OS argument permits, and plugin-block states are higher-precedence
+        // runtime input that must never replace states owned by this file.
+        let json = self.serialized_settings();
         let mut ctx = BTreeMap::new();
         ctx.insert("type".into(), "save_config".into());
-        run_command(&["sh", "-c", &cmd], ctx);
+        run_command(
+            &[
+                "sh",
+                "-c",
+                SAVE_CONFIG_SCRIPT,
+                "zellaude-save-config",
+                &json,
+            ],
+            ctx,
+        );
+    }
+
+    fn serialized_settings(&self) -> String {
+        serde_json::to_string(&self.settings).unwrap_or_default()
     }
 
     fn merge_sessions(&mut self, incoming: BTreeMap<u32, SessionInfo>) {
@@ -1492,6 +1785,22 @@ mod tests {
     use super::*;
     use state::Activity;
 
+    fn run_save_config_script(
+        config_path: &std::path::Path,
+        settings_json: &str,
+    ) -> std::process::Output {
+        std::process::Command::new("sh")
+            .args([
+                "-c",
+                SAVE_CONFIG_SCRIPT,
+                "zellaude-save-config-test",
+                settings_json,
+            ])
+            .arg(config_path)
+            .output()
+            .unwrap()
+    }
+
     fn session(session_id: &str, ts_ms: u64, restored: bool) -> SessionInfo {
         SessionInfo {
             session_id: session_id.to_string(),
@@ -1524,6 +1833,141 @@ mod tests {
         state.merge_sessions(BTreeMap::from([(7, session("ended", 40, false))]));
         assert_eq!(state.sessions.get(&7).unwrap().last_ts_ms, 40);
         assert!(state.session_end_tombstones.is_empty());
+    }
+
+    #[test]
+    fn settings_save_payload_does_not_copy_effective_custom_states() {
+        let layout = custom_layouts::CustomLayout {
+            id: "claude6".to_string(),
+            width: 1,
+            height: 1,
+            commands: vec!["claude".to_string()],
+        };
+        let mut state = State::default();
+        state.custom_layouts.insert(layout.id.clone(), layout);
+
+        let document: serde_json::Value =
+            serde_json::from_str(&state.serialized_settings()).unwrap();
+
+        assert!(document.get("custom_states").is_none());
+        assert!(document.get("notifications").is_some());
+    }
+
+    #[test]
+    fn settings_save_merges_large_file_owned_states_atomically() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!(
+            "zellaude-save-config-{}-{unique}",
+            std::process::id()
+        ));
+        let config_path = test_dir.join("nested/zellaude.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+
+        let file_layout = custom_layouts::CustomLayout {
+            id: "large-file-state".to_string(),
+            width: 3,
+            height: 1,
+            commands: vec!["x".repeat(50_000); 3],
+        };
+        std::fs::write(&config_path, serde_json::to_vec(&file_layout).unwrap()).unwrap();
+        let state = State::default();
+        let settings_json = state.serialized_settings();
+        let output = run_save_config_script(&config_path, &settings_json);
+        assert!(
+            output.status.success(),
+            "save failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(saved["custom_states"][0]["id"], "large-file-state");
+        assert_eq!(
+            saved["custom_states"][0]["commands"][2]
+                .as_str()
+                .unwrap()
+                .len(),
+            50_000
+        );
+        assert!(saved.get("notifications").is_some());
+
+        let wrapped = serde_json::json!({
+            "unrelated": {"preserve": true},
+            "custom_states": [file_layout],
+        });
+        std::fs::write(&config_path, serde_json::to_vec(&wrapped).unwrap()).unwrap();
+        assert!(run_save_config_script(&config_path, &settings_json)
+            .status
+            .success());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(saved["unrelated"]["preserve"], true);
+        assert_eq!(saved["custom_states"][0]["id"], "large-file-state");
+
+        let array_document = serde_json::json!([{
+            "id": "array-state",
+            "width": 1,
+            "height": 1,
+            "commands": ["true"]
+        }]);
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&array_document).unwrap(),
+        )
+        .unwrap();
+        assert!(run_save_config_script(&config_path, &settings_json)
+            .status
+            .success());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(saved["custom_states"][0]["id"], "array-state");
+
+        std::fs::remove_file(&config_path).unwrap();
+        assert!(run_save_config_script(&config_path, &settings_json)
+            .status
+            .success());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        assert!(saved.get("notifications").is_some());
+
+        #[cfg(unix)]
+        {
+            let real_path = test_dir.join("real/zellaude.json");
+            let link_path = test_dir.join("linked/zellaude.json");
+            std::fs::create_dir_all(real_path.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+            std::fs::write(&real_path, serde_json::to_vec(&wrapped).unwrap()).unwrap();
+            std::os::unix::fs::symlink("../real/zellaude.json", &link_path).unwrap();
+
+            assert!(run_save_config_script(&link_path, &settings_json)
+                .status
+                .success());
+            assert!(std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&real_path).unwrap()).unwrap();
+            assert_eq!(saved["unrelated"]["preserve"], true);
+            assert!(saved.get("notifications").is_some());
+        }
+
+        for invalid in [
+            b"{ this is not json".as_slice(),
+            b" \n\t".as_slice(),
+            b"{}\n{}".as_slice(),
+        ] {
+            std::fs::write(&config_path, invalid).unwrap();
+            assert!(!run_save_config_script(&config_path, &settings_json)
+                .status
+                .success());
+            assert_eq!(std::fs::read(&config_path).unwrap(), invalid);
+        }
+
+        std::fs::remove_dir_all(test_dir).unwrap();
     }
 
     #[test]

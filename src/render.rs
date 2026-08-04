@@ -1,3 +1,4 @@
+use crate::custom_layouts::Prompt as CustomLayoutPrompt;
 use crate::rainbow;
 use crate::session_selection::{session_to_display, session_to_focus};
 use crate::tool_symbol::tool_symbol;
@@ -8,6 +9,7 @@ use crate::state::{
 use crate::theme::{self, BarTheme, SegmentStyle};
 use std::fmt::Write;
 use std::io::Write as IoWrite;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zellij_tile::prelude::{InputMode, PaletteColor, TabInfo};
 
 #[derive(Clone, Copy)]
@@ -80,7 +82,40 @@ fn bg(color: PaletteColor) -> String {
 }
 
 fn display_width(s: &str) -> usize {
-    s.chars().count()
+    UnicodeWidthStr::width(s)
+}
+
+fn take_display_width(value: &str, max_width: usize) -> String {
+    let mut width = 0;
+    value
+        .chars()
+        .take_while(|character| {
+            let character_width = character.width().unwrap_or(0);
+            if width + character_width > max_width {
+                return false;
+            }
+            width += character_width;
+            true
+        })
+        .collect()
+}
+
+fn take_display_width_from_end(value: &str, max_width: usize) -> String {
+    let mut width = 0;
+    let mut characters: Vec<char> = value
+        .chars()
+        .rev()
+        .take_while(|character| {
+            let character_width = character.width().unwrap_or(0);
+            if width + character_width > max_width {
+                return false;
+            }
+            width += character_width;
+            true
+        })
+        .collect();
+    characters.reverse();
+    characters.into_iter().collect()
 }
 
 fn sanitize_tab_name(name: &str) -> String {
@@ -130,9 +165,8 @@ pub(crate) fn elapsed_suffix(session: &SessionInfo, now_s: u64) -> Option<String
 /// which Zellij gates behind the very permission that was just denied, so the
 /// plugin cannot know a remapped binding in this state.
 ///
-/// ASCII only. `display_width` counts chars, so an East-Asian-Ambiguous glyph
-/// like `↑` would be measured one column narrower than it renders and overrun a
-/// bar that has auto-wrap disabled.
+/// ASCII only so the permission notice renders consistently across terminals,
+/// including terminals that choose different widths for ambiguous glyphs.
 /// Every variant keeps the word "permission" — naming what is missing is the
 /// part that turns a strange-looking bar into something the user can act on.
 const PERMISSION_NOTICES: [&str; 4] = [
@@ -214,6 +248,7 @@ pub fn render_status_bar(state: &mut State, rows: usize, cols: usize) {
 pub(crate) fn build_status_bar(state: &mut State, _rows: usize, cols: usize) -> String {
     state.click_regions.clear();
     state.menu_click_regions.clear();
+    state.prefix_click_region = None;
 
     let theme = state
         .zellij_styling
@@ -227,6 +262,11 @@ pub(crate) fn build_status_bar(state: &mut State, _rows: usize, cols: usize) -> 
     //  \x1b[?25l  — hide cursor
     buf.push_str("\x1b[H\x1b[?7l\x1b[?25l");
     let bar_bg_str = bg(theme.surface.background);
+
+    if let Some(prompt) = state.custom_layout_prompt.as_ref() {
+        render_custom_layout_prompt(&mut buf, prompt, cols, theme);
+        return buf;
+    }
 
     // Bail early if terminal is too narrow
     if cols < 5 {
@@ -289,7 +329,7 @@ pub(crate) fn build_status_bar(state: &mut State, _rows: usize, cols: usize) -> 
     } else {
         // Even name doesn't fit — just show what we can
         let avail = cols.saturating_sub(2); // leave room for fill
-        let short: String = prefix_text.chars().take(avail).collect();
+        let short = take_display_width(&prefix_text, avail);
         let _ = write!(
             buf,
             "{}{}{BOLD}{short}{RESET}",
@@ -344,6 +384,97 @@ pub(crate) fn build_status_bar(state: &mut State, _rows: usize, cols: usize) -> 
     let _ = write!(buf, "{RESET}");
 
     buf
+}
+
+fn render_custom_layout_prompt(
+    buf: &mut String,
+    prompt: &CustomLayoutPrompt,
+    cols: usize,
+    theme: BarTheme,
+) {
+    let full_label = " Custom state ";
+    let label = if cols >= display_width(full_label) + 2 {
+        full_label
+    } else {
+        ""
+    };
+    let mut col = display_width(label);
+    let _ = write!(
+        buf,
+        "{}{}{BOLD}{label}{RESET}",
+        bg(theme.settings_prefix.background),
+        fg(theme.settings_prefix.base),
+    );
+
+    if col > 0 && col < cols {
+        arrow(
+            buf,
+            &mut col,
+            theme.settings_prefix.background,
+            theme.surface.background,
+        );
+    }
+
+    let available = cols.saturating_sub(col);
+    if available > 0 {
+        let hint = prompt
+            .error
+            .as_deref()
+            .unwrap_or("Enter: open | Esc: cancel");
+        let hint_budget = if available >= 30 { available / 2 } else { 0 };
+        let input_budget = available.saturating_sub(hint_budget);
+        let cursor = prompt.cursor.min(prompt.input.chars().count());
+        let cursor_byte = prompt
+            .input
+            .char_indices()
+            .nth(cursor)
+            .map(|(byte, _)| byte)
+            .unwrap_or(prompt.input.len());
+        let (before_cursor, after_cursor) = prompt.input.split_at(cursor_byte);
+        let padded = input_budget >= 3;
+        let around_cursor = input_budget.saturating_sub(if padded { 3 } else { 1 });
+        let before_budget = around_cursor * 2 / 3;
+        let after_budget = around_cursor.saturating_sub(before_budget);
+        let before = take_display_width_from_end(before_cursor, before_budget);
+        let after = take_display_width(after_cursor, after_budget);
+        let input = if padded {
+            format!(" {before}▌{after} ")
+        } else {
+            format!("{before}▌{after}")
+        };
+        let input = take_display_width(&input, input_budget);
+        let _ = write!(
+            buf,
+            "{}{}{}",
+            bg(theme.surface.background),
+            fg(theme.active_tab.base),
+            input,
+        );
+        col += display_width(&input);
+
+        if hint_budget > 0 && col < cols {
+            let hint = format!(" {hint}");
+            let hint = take_display_width(&hint, cols - col);
+            let hint_color = if prompt.error.is_some() {
+                theme.error.base
+            } else {
+                theme.surface.base
+            };
+            let _ = write!(buf, "{}{hint}", fg(hint_color));
+            col += display_width(&hint);
+        }
+    }
+
+    if col < cols {
+        let _ = write!(
+            buf,
+            "{}{:width$}",
+            bg(theme.surface.background),
+            "",
+            width = cols - col
+        );
+    }
+    let _ = write!(buf, "{RESET}");
 }
 
 fn render_tabs(
@@ -434,17 +565,14 @@ fn render_tabs(
         let tab_name = sanitize_tab_name(&tab.name);
 
         // Truncate name
-        let char_count = tab_name.chars().count();
+        let name_width = display_width(&tab_name);
         let truncated = if max_name_len == 0 {
             String::new()
-        } else if char_count > max_name_len {
-            let s: String = tab_name
-                .chars()
-                .take(max_name_len.saturating_sub(1))
-                .collect();
+        } else if name_width > max_name_len {
+            let s = take_display_width(&tab_name, max_name_len.saturating_sub(1));
             format!("{s}…")
         } else {
-            tab_name.to_string()
+            tab_name
         };
 
         // Check flash for any session in this tab
