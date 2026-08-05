@@ -119,9 +119,30 @@ default_tab_template {
 }
 ```
 
-On first load, the plugin automatically installs the hook script and registers it with Claude Code and Codex. No cloning, no install scripts.
+Once you grant its permissions (see below), the plugin installs the hook script and registers it with Claude Code and Codex on its own. No cloning, no install scripts.
 
 [Codex requires a one-time review](https://developers.openai.com/codex/hooks) before running newly installed user hooks. Start Codex, open `/hooks`, inspect the Zellaude handlers, and trust them.
+
+### Granting permissions
+
+Zellaude needs seven Zellij permissions, and everything it does is gated behind
+them — the hook install, the runtime keybindings, and the bar itself. Until they
+are granted the bar renders empty.
+
+Zellij asks by drawing its prompt *inside the plugin's pane*. As a one-row
+borderless status bar there is nothing to draw into, and normal focus navigation
+skips the pane, so the prompt cannot be answered where it appears. Grant them
+once in a full-size pane instead:
+
+```bash
+zellij action new-pane --plugin file:~/.config/zellij/plugins/zellaude.wasm
+```
+
+Press `y` in that pane, then close it (`Ctrl+p`, `x`). The grant is cached, so
+every bar instance — including new tabs and later sessions — picks it up. If the
+bar is already on screen and blank, clicking it also re-raises the prompt.
+
+Installing from source does this for you; see below.
 
 ### Build from source
 
@@ -133,7 +154,15 @@ cd zellaude
 ./install.sh
 ```
 
-This builds the WASM plugin and copies it to `~/.config/zellij/plugins/`. Hook registration happens automatically when the plugin loads.
+This builds the WASM plugin and copies it to `~/.config/zellij/plugins/`, then
+pre-grants the permissions above so the first run is not an empty bar. Hook
+registration happens automatically when the plugin loads.
+
+Pass `--no-permissions` to skip the pre-grant and approve interactively instead:
+
+```bash
+./install.sh --no-permissions
+```
 
 Then add the plugin to your Zellij layout (replaces the default tab bar):
 
