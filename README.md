@@ -104,7 +104,7 @@ Click the **Zellaude** prefix on the left side of the bar to open the settings m
 ### Prerequisites
 
 - [Zellij 0.44 or newer](https://zellij.dev)
-- [jq](https://jqlang.github.io/jq/) — used by hooks and settings persistence at runtime
+- [jq](https://jqlang.github.io/jq/) — required by the hook bridge, by settings persistence, and by the install scripts
 
 ### Quick install
 
@@ -142,6 +142,14 @@ Press `y` in that pane, then close it (`Ctrl+p`, `x`). The grant is cached, so
 every bar instance — including new tabs and later sessions — picks it up. If the
 bar is already on screen and blank, clicking it also re-raises the prompt.
 
+The seven are `ReadApplicationState`, `ChangeApplicationState`, `RunCommands`,
+`ReadCliPipes`, `MessageAndLaunchOtherPlugins`, `Reconfigure` and
+`RunActionsAsUser`. `RunCommands` is what lets the plugin shell out to install
+the hook script and read its settings file; `Reconfigure` and `RunActionsAsUser`
+back the session-only keybindings described above. The grant is recorded in
+Zellij's own cache — `zellij setup --check` prints the directory, typically
+`~/.cache/zellij/permissions.kdl`.
+
 Installing from source does this for you; see below.
 
 ### Build from source
@@ -154,9 +162,13 @@ cd zellaude
 ./install.sh
 ```
 
-This builds the WASM plugin and copies it to `~/.config/zellij/plugins/`, then
-pre-grants the permissions above so the first run is not an empty bar. Hook
-registration happens automatically when the plugin loads.
+The script needs `jq`, `cargo` and `rustup` on `PATH` (it adds `~/.cargo/bin`
+itself if `cargo` is missing from the environment) and installs the
+`wasm32-wasip1` target if it is not already present. It then builds the plugin
+and copies it to `~/.config/zellij/plugins/`, pre-grants the permissions above
+so the first run is not an empty bar, and registers the hooks. Registration also
+happens automatically when the plugin loads, so the script's copy of it is
+belt-and-braces for a first run that has no working bar yet.
 
 Pass `--no-permissions` to skip the pre-grant and approve interactively instead:
 
@@ -164,7 +176,30 @@ Pass `--no-permissions` to skip the pre-grant and approve interactively instead:
 ./install.sh --no-permissions
 ```
 
-Then add the plugin to your Zellij layout (replaces the default tab bar):
+That leaves `permissions.kdl` untouched, so the bar stays inert until you grant
+the seven by hand in a full-size pane — see [Granting permissions](#granting-permissions).
+Everything else the script does is unchanged.
+
+#### What it touches
+
+| Path | Change |
+|------|--------|
+| `~/.config/zellij/plugins/zellaude.wasm` | created |
+| `~/.config/zellij/plugins/zellaude-hook.sh` | created, version-tagged, `+x` |
+| `~/.cache/zellij/permissions.kdl` | zellaude's block replaced; other plugins' grants preserved |
+| `~/.claude/settings.json` | zellaude hook entries replaced under 11 events; previous file copied to `.bak` |
+| `${CODEX_HOME:-~/.codex}/hooks.json` | same under 9 events; previous file copied to `.bak` |
+
+Both JSON files are created as `{}` if absent, symlinks are resolved before
+writing so `mv` cannot replace them with regular files, and the jq filters only
+add or remove entries whose command contains `zellaude-hook.sh` — re-running the
+script is idempotent and leaves unrelated hooks alone. Your Zellij layout is
+never modified; that step is below.
+
+### Wiring it into a layout
+
+The plugin replaces the native tab bar, so it goes where `zellij:tab-bar` would.
+For a fresh setup, add it to your layout:
 
 ```kdl
 default_tab_template {
@@ -175,27 +210,81 @@ default_tab_template {
 }
 ```
 
-Or try the included layout directly:
+If you already have a layout in `layout_dir`, swap the location string in every
+template that draws a tab bar — a stock `default.kdl` has **two**,
+`default_tab_template` and `new_tab_template`, and missing the second leaves new
+tabs on the native bar:
+
+```diff
+ default_tab_template {
+     pane size=1 borderless=true {
+-        plugin location="zellij:tab-bar"
++        plugin location="file:~/.config/zellij/plugins/zellaude.wasm"
+     }
+     children
+     pane size=2 borderless=true {
+         plugin location="zellij:status-bar"
+     }
+ }
+```
+
+Leave the `zellij:status-bar` pane alone — Zellaude replaces the *tab* bar only.
+Keep `size=1 borderless=true`: the bar renders one row, and a bordered pane
+clips it.
+
+Layouts are read at session start, so restart Zellij (or start a new session)
+to pick the change up; running sessions keep the bar they launched with.
+
+Or try the included layout directly, without touching your own:
 
 ```bash
 zellij --layout layout.kdl
 ```
 
-### Optional: click-to-focus notifications
+### Optional: desktop notifications
 
-For desktop notifications that focus the right pane when clicked, install [terminal-notifier](https://github.com/julienXX/terminal-notifier):
+The bar itself needs nothing extra. Desktop notifications on permission requests
+are delegated to whatever notifier the platform has, so they are silently
+skipped when none is installed.
+
+**macOS** — notifications work out of the box via `osascript`. For ones that
+focus the requesting pane when clicked, install
+[terminal-notifier](https://github.com/julienXX/terminal-notifier):
 
 ```bash
 brew install terminal-notifier
 ```
 
-Without it, notifications still appear via osascript but clicking them won't focus the pane.
+Without it notifications still appear, but clicking them won't focus the pane.
+
+**Linux** — install `notify-send`, or nothing is delivered at all:
+
+```bash
+sudo apt install libnotify-bin   # or: dnf install libnotify / pacman -S libnotify
+```
+
+There is no click-to-focus on Linux; `terminal-notifier` is macOS-only.
+
+The **Unfocused** notification setting also needs a way to ask which window is
+frontmost. macOS uses `osascript`. X11 needs [`xdotool`](https://github.com/jordansissel/xdotool);
+without it — and on Wayland, which exposes no standard way to check — the
+terminal never counts as focused, so Unfocused behaves like Always.
 
 ## Uninstall
+
+Run from the clone — the script removes what it installed relative to its own
+location, so keep the checkout around if you want this:
 
 ```bash
 ./install.sh --uninstall
 ```
+
+That deletes `zellaude.wasm` and `zellaude-hook.sh`, drops zellaude's block from
+`permissions.kdl`, and strips the hook entries from `~/.claude/settings.json`
+and `~/.codex/hooks.json` (backing both up again first). Two things it does not
+touch: your Zellij layout — put `zellij:tab-bar` back by hand — and
+`~/.config/zellij/plugins/zellaude.json`, which holds your settings and any
+custom states. Restart Zellij afterwards.
 
 ## How it works
 
