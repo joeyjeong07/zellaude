@@ -4,8 +4,10 @@ version = "0.5.9"
 edition = "2021"
 
 [dependencies]
-zellij-tile = "0.44.3"
-zellij-utils = "0.44.3"
+# Non-caret so a future Zellij minor resolves without a manifest bump;
+# Cargo.lock still pins the tested version until `cargo update`.
+zellij-tile = ">=0.44.3"
+zellij-utils = ">=0.44.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-width = "0.1.8"
