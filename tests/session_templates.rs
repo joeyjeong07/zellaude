@@ -104,7 +104,7 @@ fn the_config_document_accepts_the_key_and_rejects_duplicates() {
 
 use session_templates::{built_in, effective, marker, BUILT_IN_NAME};
 use std::collections::BTreeMap;
-use zellij_utils::input::layout::Layout;
+use zellij_utils::input::layout::{Layout, Run, RunPluginOrAlias, TiledPaneLayout};
 
 const PLUGIN: &str = "file:~/.config/zellij/plugins/zellaude.wasm";
 
@@ -118,6 +118,45 @@ fn compile(t: &SessionTemplate) -> String {
 fn parse(kdl: &str) -> Layout {
     Layout::from_kdl(kdl, Some("generated.kdl".to_string()), None, None)
         .unwrap_or_else(|error| panic!("generated KDL did not parse: {error}\n{kdl}"))
+}
+
+/// Depth-first search for the first plugin pane in a parsed tab's tree. Used
+/// to prove `default_tab_template` inheritance: a tab that never mentions the
+/// plugin in its own body still carries a bar once Zellij merges the template.
+fn find_plugin(node: &TiledPaneLayout) -> Option<&RunPluginOrAlias> {
+    if let Some(Run::Plugin(plugin)) = &node.run {
+        return Some(plugin);
+    }
+    node.children.iter().find_map(find_plugin)
+}
+
+/// Depth-first search for the first node whose own children are split
+/// vertically (ie. a column layout), mirroring `tests/custom_layouts.rs`'s use
+/// of `children_split_direction` to prove pane geometry post-parse.
+fn find_vertical_split(node: &TiledPaneLayout) -> Option<&TiledPaneLayout> {
+    use zellij_utils::input::layout::SplitDirection;
+    if node.children_split_direction == SplitDirection::Vertical {
+        return Some(node);
+    }
+    node.children.iter().find_map(find_vertical_split)
+}
+
+/// Depth-first search for the command pane running `command`'s resolved cwd,
+/// as Zellij will actually run it, rather than the pre-parse KDL text.
+fn command_cwd(node: &TiledPaneLayout, command: &str) -> Option<Option<std::path::PathBuf>> {
+    if let Some(Run::Command(run_command)) = &node.run {
+        if run_command.args.get(1).map(String::as_str) == Some(command) {
+            return Some(run_command.cwd.clone());
+        }
+    }
+    node.children.iter().find_map(|child| command_cwd(child, command))
+}
+
+fn maybe_shell_command(run: &Option<Run>) -> Option<String> {
+    let Some(Run::Command(command)) = run else {
+        return None;
+    };
+    command.args.get(1).cloned()
 }
 
 #[test]
@@ -140,9 +179,27 @@ fn a_generated_layout_parses_and_carries_a_bar_in_every_tab() {
 
     // The template is a session layout, so later tabs the user opens by hand
     // must also get a bar. That comes from default_tab_template, not from a
-    // bar pane repeated inside each tab.
+    // bar pane repeated inside each tab: the plugin is declared once in the
+    // source text, and Zellij's own parser is trusted to fan it out below.
     assert!(kdl.contains("default_tab_template"), "{kdl}");
     assert_eq!(kdl.matches("plugin location=").count(), 1, "{kdl}");
+
+    // Prove the fan-out actually happened by walking each *parsed* tab's own
+    // tree, not the source text: every tab must independently carry the bar.
+    // Zellij expands `~` in plugin locations itself (unlike `cwd`, see
+    // `expand_home`), so compare on the stable suffix rather than the exact
+    // string.
+    for (name, tiled, _) in &layout.tabs {
+        let plugin = find_plugin(tiled)
+            .unwrap_or_else(|| panic!("tab {name:?} has no bar in its parsed tree"));
+        assert!(
+            plugin
+                .location_string()
+                .ends_with(".config/zellij/plugins/zellaude.wasm"),
+            "tab {name:?} bar has unexpected plugin location: {}",
+            plugin.location_string()
+        );
+    }
 }
 
 #[test]
@@ -157,15 +214,25 @@ fn commands_become_panes_in_reading_order_with_a_default_single_row() {
         }],
     };
     let kdl = compile(&template);
-    parse(&kdl);
+    let layout = parse(&kdl);
+    let (_, tiled, _) = &layout.tabs[0];
 
-    let order: Vec<_> = ["one", "two", "three"]
+    // `extract_run_instructions` returns panes in the flattened, geometric
+    // reading order Zellij itself uses (see zellij_utils' own doc comment on
+    // it) — a stronger claim than "these three substrings appear in this
+    // relative order in the source text".
+    let order: Vec<String> = tiled
+        .extract_run_instructions()
         .iter()
-        .map(|c| kdl.find(&format!("\"{c}\"")).unwrap())
+        .filter_map(maybe_shell_command)
         .collect();
-    assert!(order[0] < order[1] && order[1] < order[2], "{kdl}");
-    assert_eq!(kdl.matches("command=\"sh\"").count(), 3, "{kdl}");
-    assert!(kdl.contains("split_direction=\"vertical\""), "{kdl}");
+    assert_eq!(order, vec!["one", "two", "three"], "{kdl}");
+
+    // A default single row is three columns of one command each: the grid
+    // node's own children are split vertically (columns), and there are
+    // exactly as many columns as commands.
+    let grid = find_vertical_split(tiled).unwrap_or_else(|| panic!("no vertical split: {kdl}"));
+    assert_eq!(grid.children.len(), 3, "{kdl}");
 }
 
 #[test]
@@ -178,6 +245,18 @@ fn a_tab_without_commands_is_a_plain_shell_tab() {
     let kdl = compile(&template);
     parse(&kdl);
     assert!(!kdl.contains("command=\"sh\""), "{kdl}");
+}
+
+/// Look up the tab named `tab_name` in a parsed layout and find the resolved
+/// `cwd` Zellij will actually launch `command` with.
+fn cwd_of(layout: &Layout, tab_name: &str, command: &str) -> Option<std::path::PathBuf> {
+    let (_, tiled, _) = layout
+        .tabs
+        .iter()
+        .find(|(name, _, _)| name.as_deref() == Some(tab_name))
+        .unwrap_or_else(|| panic!("no tab named {tab_name:?}"));
+    command_cwd(tiled, command)
+        .unwrap_or_else(|| panic!("command {command:?} not found in tab {tab_name:?}"))
 }
 
 #[test]
@@ -197,11 +276,21 @@ fn cwd_is_omitted_relative_or_home_expanded() {
         tabs: vec![absent, relative, home],
     };
     let kdl = compile(&template);
-    parse(&kdl);
+    let layout = parse(&kdl);
 
-    assert!(kdl.contains("tab name=\"absent\" {"), "{kdl}");
-    assert!(kdl.contains("tab name=\"relative\" cwd=\"src\""), "{kdl}");
-    assert!(kdl.contains("tab name=\"home\" cwd=\"/home/tester/other\""), "{kdl}");
+    // Verified against the resolved `RunCommand.cwd` Zellij will actually use,
+    // not the pre-parse text.
+    assert_eq!(cwd_of(&layout, "absent", "a"), None, "{kdl}");
+    assert_eq!(
+        cwd_of(&layout, "relative", "b"),
+        Some(std::path::PathBuf::from("src")),
+        "{kdl}"
+    );
+    assert_eq!(
+        cwd_of(&layout, "home", "c"),
+        Some(std::path::PathBuf::from("/home/tester/other")),
+        "{kdl}"
+    );
     assert!(!kdl.contains("\"~/"), "tilde must be expanded: {kdl}");
 }
 
@@ -219,10 +308,18 @@ fn a_tab_cwd_overrides_the_template_cwd() {
         tabs: vec![inherits, overrides],
     };
     let kdl = compile(&template);
-    parse(&kdl);
+    let layout = parse(&kdl);
 
-    assert!(kdl.contains("tab name=\"inherits\" cwd=\"/home/tester/base\""), "{kdl}");
-    assert!(kdl.contains("tab name=\"overrides\" cwd=\"/elsewhere\""), "{kdl}");
+    assert_eq!(
+        cwd_of(&layout, "inherits", "a"),
+        Some(std::path::PathBuf::from("/home/tester/base")),
+        "{kdl}"
+    );
+    assert_eq!(
+        cwd_of(&layout, "overrides", "b"),
+        Some(std::path::PathBuf::from("/elsewhere")),
+        "{kdl}"
+    );
 }
 
 #[test]
@@ -233,15 +330,58 @@ fn focus_marks_exactly_one_tab_and_defaults_to_none() {
         tabs: vec![tab(&["a"]), { let mut t = tab(&["b"]); t.focus = true; t }],
     };
     let kdl = compile(&template);
-    parse(&kdl);
-    assert_eq!(kdl.matches("focus=true").count(), 1, "{kdl}");
+    let layout = parse(&kdl);
+    // The parsed layout's own notion of which tab is focused, rather than
+    // counting `focus=true` occurrences in the source text.
+    assert_eq!(layout.focused_tab_index, Some(1), "{kdl}");
 
     let unfocused = SessionTemplate {
         name: "unfocused".to_string(),
         cwd: None,
         tabs: vec![tab(&["a"]), tab(&["b"])],
     };
-    assert!(!compile(&unfocused).contains("focus=true"));
+    let unfocused_kdl = compile(&unfocused);
+    let unfocused_layout = parse(&unfocused_kdl);
+    assert_eq!(unfocused_layout.focused_tab_index, None, "{unfocused_kdl}");
+}
+
+#[test]
+fn a_grid_with_spare_cells_gets_a_plain_shell_pane_at_the_reading_order_tail() {
+    // 2 columns x 2 rows with only 3 commands: the fourth, spare cell must
+    // still render (a rectangular grid), but as a plain shell pane, and it
+    // must land bottom-right — the last position in reading order.
+    let mut t = tab(&["one", "two", "three"]);
+    t.name = Some("grid".to_string());
+    t.width = Some(2);
+    t.height = Some(2);
+    let template = SessionTemplate {
+        name: "spare".to_string(),
+        cwd: None,
+        tabs: vec![t],
+    };
+    let kdl = compile(&template);
+    let layout = parse(&kdl);
+    let (_, tiled, _) = &layout.tabs[0];
+
+    let order: Vec<String> = tiled
+        .extract_run_instructions()
+        .iter()
+        .filter_map(maybe_shell_command)
+        .collect();
+    assert_eq!(order, vec!["one", "two", "three"], "{kdl}");
+
+    let grid = find_vertical_split(tiled).unwrap_or_else(|| panic!("no vertical split: {kdl}"));
+    assert_eq!(grid.children.len(), 2, "expected two columns: {kdl}");
+    let bottom_right = grid
+        .children
+        .last()
+        .and_then(|column| column.children.last())
+        .unwrap_or_else(|| panic!("no bottom-right cell: {kdl}"));
+    assert!(
+        bottom_right.run.is_none(),
+        "bottom-right cell must be a plain shell pane, not a fourth command: {kdl}"
+    );
+    assert_eq!(tiled.pane_count(), 5, "bar + 3 commands + 1 spare pane: {kdl}");
 }
 
 #[test]
@@ -265,6 +405,23 @@ fn compilation_refuses_an_empty_plugin_location_and_invalid_templates() {
 
 fn compile_err(t: &SessionTemplate) -> String {
     t.to_kdl(PLUGIN, &BTreeMap::new(), "/home/tester").unwrap_err()
+}
+
+#[test]
+fn validation_rejects_more_than_one_focused_tab() {
+    let mut first = tab(&["a"]);
+    first.focus = true;
+    let mut second = tab(&["b"]);
+    second.focus = true;
+    let doubly_focused = template("dupe-focus", vec![first, second]);
+
+    let error = doubly_focused.validate().unwrap_err();
+    assert!(error.contains("dupe-focus"), "{error}");
+    assert!(error.contains("focus"), "{error}");
+
+    // A silently-dropped setting is worse than a config error, so this must
+    // also fail at compile time, not just quietly keep the first focus.
+    assert!(compile_err(&doubly_focused).contains("focus"));
 }
 
 #[test]
@@ -293,3 +450,4 @@ fn the_built_in_is_always_present_and_yields_to_a_user_template_of_the_same_name
 fn the_built_in_default_is_itself_valid() {
     built_in().validate().unwrap();
 }
+

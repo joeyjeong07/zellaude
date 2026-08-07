@@ -135,6 +135,13 @@ impl SessionTemplate {
                 self.name
             ));
         }
+        let focused_tabs = self.tabs.iter().filter(|tab| tab.focus).count();
+        if focused_tabs > 1 {
+            return Err(format!(
+                "session template {:?} marks {focused_tabs} tabs as focus; at most one is allowed",
+                self.name
+            ));
+        }
         let mut bytes = 0usize;
         for (index, tab) in self.tabs.iter().enumerate() {
             bytes = bytes.saturating_add(tab.validate(&self.name, index)?);
