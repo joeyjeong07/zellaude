@@ -14,6 +14,7 @@ A Zellij status bar plugin that replaces the default tab bar with Claude Code an
 - **Ultra-mode rainbow** — tab names shimmer through rainbow colors for Codex `ultra` sessions and Claude Code `ultracode` sessions
 - **Split Three** — upgraded Pane-mode versions of Split Right and Split Down create three equal panes at once
 - **Custom states** — open a named command grid in a new tab with `Ctrl+t`, `Shift+n`
+- **Session templates** — describe a multi-tab session once and start it with `zellij -s work -n <name>`
 - **Clickable tabs** — click any tab to switch to it
 - **Smart pane focus** — clicking an agent-aware tab focuses its most recently active Claude Code or Codex pane, revealing it inside a stack; waiting (⚠) sessions retain priority
 - **Permission flash** — sessions pulse with the theme's error color for 2 seconds when a permission request arrives
@@ -88,6 +89,69 @@ plugin location="file:~/.config/zellij/plugins/zellaude.wasm" {
 ```
 
 Zellaude installs `Shift+n` in Tab mode for the running client without changing `config.kdl`. If that key already has a user binding, the user binding wins and the custom-state shortcut remains unavailable.
+
+### Session templates
+
+A session template describes a whole session — its tabs, their commands and
+their directories — and Zellaude compiles it into a layout Zellij starts
+natively:
+
+```bash
+zellij -s work -n zellaude
+```
+
+`zellaude` is the built-in template, available without any configuration:
+
+| Tab | Panes |
+|-----|-------|
+| `git` | `lazygit` beside `btop` |
+| `claude` | `claude` |
+| `editor` | `nvim` |
+| `shell` | plain shell |
+
+Define your own in `~/.config/zellij/plugins/zellaude.json`:
+
+```json
+{
+  "session_templates": [
+    {
+      "name": "work",
+      "tabs": [
+        { "name": "git", "commands": ["lazygit", "btop"] },
+        { "name": "claude", "commands": ["claude"] },
+        { "name": "editor", "cwd": "src", "commands": ["nvim"] },
+        { "name": "shell" }
+      ]
+    }
+  ]
+}
+```
+
+Reload the plugin after editing, then `zellij -s work -n work`. A template named
+`zellaude` replaces the built-in.
+
+A tab's `commands` become one pane each, arranged in a single row by default;
+`width` and `height` lay them out as a grid, reading order left-to-right and
+top-to-bottom, with any spare cells opening as plain shell panes. Setting
+`width` or `height` without `commands` is a config error. A tab without
+`commands` is a plain shell tab. `focus` starts the session on that tab — at
+most one tab may set it, and setting it on more than one is a config error.
+Commands run through `sh -lc`, so template configuration is trusted local
+shell code, exactly as for custom states.
+
+Omitting `cwd` opens panes in the directory `zellij` was run from, which is
+usually what you want. A relative `cwd` resolves against that same directory,
+so `"src"` means `<where you ran zellij>/src`; absolute paths are used as
+given, and `~` is expanded at compile time. A tab's `cwd` overrides the
+template's.
+
+Templates are compiled to `~/.config/zellij/layouts/<name>.kdl`, so template
+names are held to filesystem- and flag-safe rules: 1 to 64 characters, only
+letters, digits, `.`, `_` and `-`, never `.` or `..`, and never starting with
+`-`. Every generated file begins with a `// zellaude-generated` marker, and
+Zellaude only ever writes or removes files carrying it — a layout you wrote
+yourself is never overwritten, even if a template shares its name. Problems
+are reported to the plugin log; run Zellij with `--debug` to see them.
 
 ### Settings
 
