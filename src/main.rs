@@ -6,6 +6,7 @@ mod placeholder;
 mod rainbow;
 mod render;
 mod session_selection;
+mod session_templates;
 mod split_three;
 mod state;
 mod tab_pane_map;
