@@ -101,3 +101,195 @@ fn the_config_document_accepts_the_key_and_rejects_duplicates() {
     assert!(parse_config_document(r#"{"session_templates": 3}"#).is_err());
     assert!(parse_config_document("not json").is_err());
 }
+
+use session_templates::{built_in, effective, marker, BUILT_IN_NAME};
+use std::collections::BTreeMap;
+use zellij_utils::input::layout::Layout;
+
+const PLUGIN: &str = "file:~/.config/zellij/plugins/zellaude.wasm";
+
+fn compile(t: &SessionTemplate) -> String {
+    t.to_kdl(PLUGIN, &BTreeMap::new(), "/home/tester").unwrap()
+}
+
+/// Parse the generated document the way Zellij will. `tabs` is a field, not a
+/// method, and each entry is `(Option<String>, tiled, floating)` — see
+/// `tests/custom_layouts.rs:224`.
+fn parse(kdl: &str) -> Layout {
+    Layout::from_kdl(kdl, Some("generated.kdl".to_string()), None, None)
+        .unwrap_or_else(|error| panic!("generated KDL did not parse: {error}\n{kdl}"))
+}
+
+#[test]
+fn a_generated_layout_parses_and_carries_a_bar_in_every_tab() {
+    let kdl = compile(&built_in());
+    assert!(
+        kdl.starts_with(&marker(BUILT_IN_NAME)),
+        "first line must be the ownership marker, got: {}",
+        kdl.lines().next().unwrap_or("")
+    );
+
+    let layout = parse(&kdl);
+    assert_eq!(layout.tabs.len(), 4);
+    let names: Vec<_> = layout
+        .tabs
+        .iter()
+        .map(|(name, _, _)| name.as_deref().unwrap_or(""))
+        .collect();
+    assert_eq!(names, vec!["git", "claude", "editor", "shell"]);
+
+    // The template is a session layout, so later tabs the user opens by hand
+    // must also get a bar. That comes from default_tab_template, not from a
+    // bar pane repeated inside each tab.
+    assert!(kdl.contains("default_tab_template"), "{kdl}");
+    assert_eq!(kdl.matches("plugin location=").count(), 1, "{kdl}");
+}
+
+#[test]
+fn commands_become_panes_in_reading_order_with_a_default_single_row() {
+    let template = SessionTemplate {
+        name: "grid".to_string(),
+        cwd: None,
+        tabs: vec![{
+            let mut t = tab(&["one", "two", "three"]);
+            t.name = Some("row".to_string());
+            t
+        }],
+    };
+    let kdl = compile(&template);
+    parse(&kdl);
+
+    let order: Vec<_> = ["one", "two", "three"]
+        .iter()
+        .map(|c| kdl.find(&format!("\"{c}\"")).unwrap())
+        .collect();
+    assert!(order[0] < order[1] && order[1] < order[2], "{kdl}");
+    assert_eq!(kdl.matches("command=\"sh\"").count(), 3, "{kdl}");
+    assert!(kdl.contains("split_direction=\"vertical\""), "{kdl}");
+}
+
+#[test]
+fn a_tab_without_commands_is_a_plain_shell_tab() {
+    let template = SessionTemplate {
+        name: "bare".to_string(),
+        cwd: None,
+        tabs: vec![tab(&[])],
+    };
+    let kdl = compile(&template);
+    parse(&kdl);
+    assert!(!kdl.contains("command=\"sh\""), "{kdl}");
+}
+
+#[test]
+fn cwd_is_omitted_relative_or_home_expanded() {
+    let mut absent = tab(&["a"]);
+    absent.name = Some("absent".to_string());
+    let mut relative = tab(&["b"]);
+    relative.name = Some("relative".to_string());
+    relative.cwd = Some("src".to_string());
+    let mut home = tab(&["c"]);
+    home.name = Some("home".to_string());
+    home.cwd = Some("~/other".to_string());
+
+    let template = SessionTemplate {
+        name: "dirs".to_string(),
+        cwd: None,
+        tabs: vec![absent, relative, home],
+    };
+    let kdl = compile(&template);
+    parse(&kdl);
+
+    assert!(kdl.contains("tab name=\"absent\" {"), "{kdl}");
+    assert!(kdl.contains("tab name=\"relative\" cwd=\"src\""), "{kdl}");
+    assert!(kdl.contains("tab name=\"home\" cwd=\"/home/tester/other\""), "{kdl}");
+    assert!(!kdl.contains("\"~/"), "tilde must be expanded: {kdl}");
+}
+
+#[test]
+fn a_tab_cwd_overrides_the_template_cwd() {
+    let mut inherits = tab(&["a"]);
+    inherits.name = Some("inherits".to_string());
+    let mut overrides = tab(&["b"]);
+    overrides.name = Some("overrides".to_string());
+    overrides.cwd = Some("/elsewhere".to_string());
+
+    let template = SessionTemplate {
+        name: "dirs".to_string(),
+        cwd: Some("~/base".to_string()),
+        tabs: vec![inherits, overrides],
+    };
+    let kdl = compile(&template);
+    parse(&kdl);
+
+    assert!(kdl.contains("tab name=\"inherits\" cwd=\"/home/tester/base\""), "{kdl}");
+    assert!(kdl.contains("tab name=\"overrides\" cwd=\"/elsewhere\""), "{kdl}");
+}
+
+#[test]
+fn focus_marks_exactly_one_tab_and_defaults_to_none() {
+    let template = SessionTemplate {
+        name: "focused".to_string(),
+        cwd: None,
+        tabs: vec![tab(&["a"]), { let mut t = tab(&["b"]); t.focus = true; t }],
+    };
+    let kdl = compile(&template);
+    parse(&kdl);
+    assert_eq!(kdl.matches("focus=true").count(), 1, "{kdl}");
+
+    let unfocused = SessionTemplate {
+        name: "unfocused".to_string(),
+        cwd: None,
+        tabs: vec![tab(&["a"]), tab(&["b"])],
+    };
+    assert!(!compile(&unfocused).contains("focus=true"));
+}
+
+#[test]
+fn plugin_configuration_is_carried_into_the_generated_bar() {
+    let mut configuration = BTreeMap::new();
+    configuration.insert("custom_states".to_string(), r#"[{"id":"x"}]"#.to_string());
+    let kdl = built_in()
+        .to_kdl(PLUGIN, &configuration, "/home/tester")
+        .unwrap();
+    parse(&kdl);
+    assert!(kdl.contains("\"custom_states\""), "{kdl}");
+}
+
+#[test]
+fn compilation_refuses_an_empty_plugin_location_and_invalid_templates() {
+    assert!(built_in().to_kdl("", &BTreeMap::new(), "/home/tester").is_err());
+
+    let invalid = SessionTemplate { name: "..".to_string(), cwd: None, tabs: vec![tab(&[])] };
+    assert!(compile_err(&invalid).contains("reserved"));
+}
+
+fn compile_err(t: &SessionTemplate) -> String {
+    t.to_kdl(PLUGIN, &BTreeMap::new(), "/home/tester").unwrap_err()
+}
+
+#[test]
+fn the_built_in_is_always_present_and_yields_to_a_user_template_of_the_same_name() {
+    let none = effective(None);
+    assert_eq!(none.len(), 1);
+    assert_eq!(none[0].name, BUILT_IN_NAME);
+    assert_eq!(none[0].tabs.len(), 4);
+    assert_eq!(none[0].tabs[0].commands, vec!["lazygit", "btop"]);
+    assert_eq!(none[0].tabs[1].commands, vec!["claude"]);
+    assert_eq!(none[0].tabs[2].commands, vec!["nvim"]);
+    assert!(none[0].tabs[3].commands.is_empty());
+
+    let alongside = effective(Some(vec![template("work", vec![tab(&["a"])])]));
+    let names: Vec<_> = alongside.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, vec![BUILT_IN_NAME, "work"]);
+
+    let overridden = effective(Some(vec![template(BUILT_IN_NAME, vec![tab(&["mine"])])]));
+    assert_eq!(overridden.len(), 1);
+    assert_eq!(overridden[0].tabs[0].commands, vec!["mine"]);
+
+    assert!(effective(Some(vec![])).iter().any(|t| t.name == BUILT_IN_NAME));
+}
+
+#[test]
+fn the_built_in_default_is_itself_valid() {
+    built_in().validate().unwrap();
+}
