@@ -6,7 +6,7 @@
 
 **Architecture:** A new module `src/session_templates.rs` parses `session_templates` from the settings file, validates it, and compiles each template to a Zellij layout KDL document. The status bar writes those documents to `~/.config/zellij/layouts/<name>.kdl` by shelling out, once per plugin instance, after `load_config` succeeds and the plugin's own URL is known. Zellij then reads them natively — no new binary, no shell wrapper.
 
-**Tech Stack:** Rust 2021 targeting `wasm32-wasip1`, `zellij-tile` 0.44.3, `serde`/`serde_json`, POSIX `sh` for host-side file writes. Tests are plain `cargo test` on the host target and parse generated KDL back through `zellij_utils::input::layout::Layout`.
+**Tech Stack:** Rust 2021 targeting `wasm32-wasip1`, `zellij-tile` 0.44.3, `serde`/`serde_json`, POSIX `sh` for host-side file writes. Tests are plain `cargo test --target x86_64-unknown-linux-gnu` on the host target and parse generated KDL back through `zellij_utils::input::layout::Layout`.
 
 ## Global Constraints
 
@@ -21,7 +21,7 @@
 - Writes are atomic: `mktemp` in the destination directory then `mv`
 - Failures are reported with `eprintln!`, not on the bar
 - Every commit message uses the repo's existing style (`feat:`, `fix:`, `docs:`, `test:`); no Claude attribution trailer
-- Run `cargo test` (host target) for tests; `cargo build --release` targets wasm via `.cargo/config.toml`
+- Run `cargo test --target x86_64-unknown-linux-gnu` (host target) for tests; `cargo build --release` targets wasm via `.cargo/config.toml`
 
 ## File Structure
 
@@ -166,7 +166,7 @@ fn the_config_document_accepts_the_key_and_rejects_duplicates() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --test session_templates`
+Run: `cargo test --target x86_64-unknown-linux-gnu --test session_templates`
 Expected: FAIL — `couldn't read src/session_templates.rs` (the file does not exist yet)
 
 - [ ] **Step 3: Write minimal implementation**
@@ -356,7 +356,7 @@ mod session_templates;
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --test session_templates`
+Run: `cargo test --target x86_64-unknown-linux-gnu --test session_templates`
 Expected: PASS, 4 tests
 
 Run: `cargo build --release`
@@ -588,7 +588,7 @@ fn the_built_in_default_is_itself_valid() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --test session_templates`
+Run: `cargo test --target x86_64-unknown-linux-gnu --test session_templates`
 Expected: FAIL — `cannot find function built_in`, `no method named to_kdl`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -757,10 +757,10 @@ use crate::custom_layouts::{kdl_string, MAX_COMMAND_BYTES, MAX_PANES, MAX_TOTAL_
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --test session_templates`
+Run: `cargo test --target x86_64-unknown-linux-gnu --test session_templates`
 Expected: PASS, 14 tests
 
-Run: `cargo test`
+Run: `cargo test --target x86_64-unknown-linux-gnu`
 Expected: PASS — the whole suite, confirming the `kdl_string` visibility change broke nothing
 
 - [ ] **Step 5: Commit**
@@ -930,7 +930,7 @@ fn writing_follows_a_symlink_instead_of_replacing_it() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --test session_templates`
+Run: `cargo test --target x86_64-unknown-linux-gnu --test session_templates`
 Expected: FAIL — `cannot find value WRITE_LAYOUT_SCRIPT`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1067,7 +1067,7 @@ fn a_settings_document_compiles_to_the_files_a_session_start_will_read() {
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test --test session_templates`
+Run: `cargo test --target x86_64-unknown-linux-gnu --test session_templates`
 Expected: PASS, 21 tests
 
 - [ ] **Step 6: Commit**
@@ -1271,7 +1271,7 @@ beside `Some("save_config")`:
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test`
+Run: `cargo test --target x86_64-unknown-linux-gnu`
 Expected: PASS — the whole suite, 21 tests in `session_templates`
 
 Run: `cargo build --release`
@@ -1413,7 +1413,7 @@ git commit -m "docs: document session templates"
 After the final task:
 
 ```bash
-cargo test
+cargo test --target x86_64-unknown-linux-gnu
 cargo build --release
 ```
 
