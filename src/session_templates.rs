@@ -437,13 +437,13 @@ else
 fi
 [ -d "$layouts_dir" ] || exit 0
 
-for path in "$layouts_dir"/*.kdl; do
-    [ -f "$path" ] || continue
-    basename=${path##*/}
-    is_zellaude_layout "$path" "$basename" || continue
+for layout_path in "$layouts_dir"/*.kdl; do
+    [ -f "$layout_path" ] || continue
+    basename=${layout_path##*/}
+    is_zellaude_layout "$layout_path" "$basename" || continue
     if printf '%s\n' "$1" | grep -qxF "$basename"; then
         continue
     fi
-    rm -f "$path"
+    rm -f "$layout_path"
 done
 "#;
