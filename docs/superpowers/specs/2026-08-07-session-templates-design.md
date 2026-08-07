@@ -181,7 +181,7 @@ arbitrary Unicode; they never become filenames, so the rules differ.
 |---------------|--------|
 | none | create |
 | has the marker | overwrite |
-| **no marker** | **leave untouched**, report the conflict on the bar |
+| **no marker** | **leave untouched**, log the conflict |
 | marker, but no longer in the config | delete |
 
 The third row is what keeps a hand-written `default.kdl` — or any other layout
@@ -194,8 +194,18 @@ already matches is not rewritten.
 
 ## Errors
 
-Invalid configuration is reported through the existing
-`custom_layout_config_error` path, which already renders on the bar. A malformed
+Compilation runs in the background with no prompt open, so there is no
+interactive surface to report into. `custom_layout_config_error` is not one — it
+is only read when the custom-state prompt opens (`main.rs:570`), and a one-row
+status bar has nowhere to put a message besides the tab list.
+
+Failures therefore go to the plugin log via `eprintln!`, the way `save_config`
+failures already do (`main.rs:307`). That covers a malformed template, a name
+that fails validation, and a layout file that exists without the ownership
+marker. The user sees the consequence directly — `zellij -n <name>` reports an
+unknown layout — and `zellij --debug` has the reason.
+
+A malformed
 `session_templates` value rejects the whole key rather than skipping the bad
 entry, matching how `parse_config_document` treats custom states. Rejecting the
 key leaves any previously generated files in place; they are not deleted on a
