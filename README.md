@@ -362,11 +362,13 @@ Three things it does not touch:
   zellaude compiled is still there, and each one still points at the
   now-deleted `zellaude.wasm`, so `zellij -n zellaude` after an uninstall opens
   a session with a broken plugin pane in every tab. They are the files whose
-  first line starts with `// zellaude-generated`; list them, then delete the
-  ones you no longer want:
+  first line is exactly `// zellaude-generated <version> <name>` with
+  `<name>` matching the filename (minus `.kdl`) — the same test the plugin
+  itself uses, so this lists exactly the files it owns; list them, then
+  delete the ones you no longer want:
 
   ```bash
-  grep -l '^// zellaude-generated ' ~/.config/zellij/layouts/*.kdl
+  awk 'FNR==1 && NF==4 && $0 ~ /^\/\/ zellaude-generated / {n=FILENAME; sub(/^.*\//,"",n); sub(/\.kdl$/,"",n); if ($4==n) print FILENAME}' ~/.config/zellij/layouts/*.kdl
   ```
 
 ## How it works
