@@ -451,7 +451,9 @@ fn the_built_in_default_is_itself_valid() {
     built_in().validate().unwrap();
 }
 
-use session_templates::{PRUNE_LAYOUTS_SCRIPT, WRITE_LAYOUT_SCRIPT};
+use session_templates::{
+    keep_list, layout_basename, MARKER_PREFIX, PRUNE_LAYOUTS_SCRIPT, WRITE_LAYOUT_SCRIPT,
+};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -483,6 +485,134 @@ fn prune_layouts(dir: &Path, keep: &str) -> Output {
 
 fn owned(name: &str, body: &str) -> String {
     format!("{}\n{body}\n", marker(name))
+}
+
+/// Neither script may write to or delete any of these files. Both are checked,
+/// because the two carry separate copies of the ownership test.
+fn assert_survives_write_and_prune(dir: &Path, filenames: &[&str]) {
+    let before: Vec<Vec<u8>> = filenames
+        .iter()
+        .map(|name| std::fs::read(dir.join(name)).expect("fixture must exist"))
+        .collect();
+
+    for (filename, original) in filenames.iter().zip(&before) {
+        let content = owned(filename.trim_end_matches(".kdl"), "layout {}");
+        let written = write_layout(dir, filename, &content);
+        assert!(
+            !written.status.success(),
+            "write must refuse {filename}: {written:?}"
+        );
+        assert_eq!(
+            &std::fs::read(dir.join(filename)).unwrap(),
+            original,
+            "write changed {filename} byte-for-byte"
+        );
+    }
+
+    let pruned = prune_layouts(dir, "nothing-here.kdl\n");
+    assert!(pruned.status.success(), "{pruned:?}");
+    for (filename, original) in filenames.iter().zip(&before) {
+        let path = dir.join(filename);
+        assert!(path.exists(), "prune deleted {filename}");
+        assert_eq!(
+            &std::fs::read(&path).unwrap(),
+            original,
+            "prune changed {filename} byte-for-byte"
+        );
+    }
+}
+
+#[test]
+fn the_marker_separator_is_the_literal_both_scripts_match() {
+    assert!(MARKER_PREFIX.ends_with(' '), "{MARKER_PREFIX:?}");
+    assert!(marker("work").starts_with(MARKER_PREFIX));
+    let literal = format!("'{MARKER_PREFIX}'*");
+    assert!(WRITE_LAYOUT_SCRIPT.contains(&literal), "write script drifted");
+    assert!(PRUNE_LAYOUTS_SCRIPT.contains(&literal), "prune script drifted");
+}
+
+#[test]
+fn a_file_whose_first_word_merely_starts_with_the_marker_is_not_ours() {
+    let dir = temp_dir("separator");
+    // No space after the tag: "zellaude-generated-notes" is one word, and a
+    // prefix match without the separator reads this user file as generated.
+    std::fs::write(
+        dir.join("notes.kdl"),
+        "// zellaude-generated-notes: MY OWN FILE\nlayout { /* mine */ }\n",
+    )
+    .unwrap();
+
+    // Same trap, but the last field happens to equal the filename, so the name
+    // check cannot save this one and only the separator rejects it.
+    std::fs::write(
+        dir.join("plan.kdl"),
+        "// zellaude-generated-copy plan\nlayout { /* mine */ }\n",
+    )
+    .unwrap();
+
+    assert_survives_write_and_prune(&dir, &["notes.kdl", "plan.kdl"]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_users_renamed_copy_of_a_generated_layout_survives() {
+    let dir = temp_dir("renamed");
+    // The workflow the feature invites: copy zellaude.kdl, edit it, start it
+    // with `zellij -n mine`. The marker is genuine, separator and all, but it
+    // names "zellaude" while the file is called mine.kdl, so it is not ours.
+    std::fs::write(dir.join("mine.kdl"), owned("zellaude", "layout { /* edited */ }")).unwrap();
+
+    assert_survives_write_and_prune(&dir, &["mine.kdl"]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_keep_list_holds_every_template_including_ones_that_cannot_compile() {
+    let good = template("work", vec![tab(&["a"])]);
+    let mut sized_without_commands = tab(&[]);
+    sized_without_commands.width = Some(2);
+    let broken = template("broken", vec![sized_without_commands]);
+    assert!(
+        broken.to_kdl(PLUGIN, &BTreeMap::new(), "/home/tester").is_err(),
+        "fixture must actually fail to compile"
+    );
+
+    assert_eq!(keep_list(&[good, broken.clone()]), "work.kdl\nbroken.kdl\n");
+    // The all-fail case: an outcome-derived list would be empty here, and an
+    // empty keep list prunes every generated layout in one pass.
+    assert_eq!(keep_list(&[broken]), "broken.kdl\n");
+    assert_eq!(layout_basename("work"), "work.kdl");
+}
+
+#[test]
+fn a_template_that_fails_to_compile_keeps_its_previously_generated_file() {
+    let dir = temp_dir("failkeep");
+    // Both compiled cleanly on an earlier load.
+    for name in ["zellaude", "broken"] {
+        std::fs::write(dir.join(format!("{name}.kdl")), owned(name, "layout {}")).unwrap();
+    }
+
+    // Now "broken" no longer compiles. The keep list still covers it, because
+    // it is built from the templates rather than from what compiled.
+    let mut sized_without_commands = tab(&[]);
+    sized_without_commands.width = Some(2);
+    let templates = vec![
+        template("zellaude", vec![tab(&["a"])]),
+        template("broken", vec![sized_without_commands]),
+    ];
+    assert!(templates[1].to_kdl(PLUGIN, &BTreeMap::new(), "/home/tester").is_err());
+
+    let pruned = prune_layouts(&dir, &keep_list(&templates));
+    assert!(pruned.status.success(), "{pruned:?}");
+    assert!(dir.join("zellaude.kdl").exists());
+    assert!(
+        dir.join("broken.kdl").exists(),
+        "a compile failure must not delete the file it failed to regenerate"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

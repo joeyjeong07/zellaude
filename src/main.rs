@@ -1563,8 +1563,12 @@ impl State {
             eprintln!("Zellaude could not read session templates: {error}");
         }
 
-        let mut keep = String::new();
+        // Built from the templates, not from the compile results below, so a
+        // template that fails to compile keeps whatever it generated last time.
+        let keep = session_templates::keep_list(&templates);
+
         for template in &templates {
+            let basename = session_templates::layout_basename(&template.name);
             let kdl = match template.to_kdl(&plugin_location, &self.plugin_configuration, &home) {
                 Ok(kdl) => kdl,
                 Err(error) => {
@@ -1575,7 +1579,6 @@ impl State {
                     continue;
                 }
             };
-            let basename = format!("{}.kdl", template.name);
             let mut ctx = BTreeMap::new();
             ctx.insert("type".into(), "write_layout".into());
             ctx.insert("layout".into(), basename.clone());
@@ -1590,8 +1593,6 @@ impl State {
                 ],
                 ctx,
             );
-            keep.push_str(&basename);
-            keep.push('\n');
         }
 
         let mut ctx = BTreeMap::new();
