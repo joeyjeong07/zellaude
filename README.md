@@ -350,10 +350,24 @@ location, so keep the checkout around if you want this:
 
 That deletes `zellaude.wasm` and `zellaude-hook.sh`, drops zellaude's block from
 `permissions.kdl`, and strips the hook entries from `~/.claude/settings.json`
-and `~/.codex/hooks.json` (backing both up again first). Two things it does not
-touch: your Zellij layout — put `zellij:tab-bar` back by hand — and
-`~/.config/zellij/plugins/zellaude.json`, which holds your settings and any
-custom states. Restart Zellij afterwards.
+and `~/.codex/hooks.json` (backing both up again first). Restart Zellij
+afterwards.
+
+Three things it does not touch:
+
+- **Your Zellij layout** — put `zellij:tab-bar` back by hand.
+- **`~/.config/zellij/plugins/zellaude.json`** — your settings, custom states
+  and session templates.
+- **Generated session layouts** in `~/.config/zellij/layouts/`. Every layout
+  zellaude compiled is still there, and each one still points at the
+  now-deleted `zellaude.wasm`, so `zellij -n zellaude` after an uninstall opens
+  a session with a broken plugin pane in every tab. They are the files whose
+  first line starts with `// zellaude-generated`; list them, then delete the
+  ones you no longer want:
+
+  ```bash
+  grep -l '^// zellaude-generated ' ~/.config/zellij/layouts/*.kdl
+  ```
 
 ## How it works
 
