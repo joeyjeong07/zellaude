@@ -132,12 +132,15 @@ Reload the plugin after editing, then `zellij -s work -n work`. A template named
 
 A tab's `commands` become one pane each, arranged in a single row by default;
 `width` and `height` lay them out as a grid, reading order left-to-right and
-top-to-bottom, with any spare cells opening as plain shell panes. Setting
+top-to-bottom. A tab may contain at most 64 panes, and its command count may
+not exceed `width × height`; when there are fewer commands than cells, the
+spare cells open as plain shell panes at the reading-order tail. Setting
 `width` or `height` without `commands` is a config error. A tab without
-`commands` is a plain shell tab. `focus` starts the session on that tab — at
-most one tab may set it, and setting it on more than one is a config error.
-Commands run through `sh -lc`, so template configuration is trusted local
-shell code, exactly as for custom states.
+`commands` is a plain shell tab, and a template needs at least one tab.
+`focus` starts the session on that tab — at most one tab may set it, and
+setting it on more than one is a config error. Commands run through `sh -lc`,
+so template configuration is trusted local shell code, exactly as for custom
+states.
 
 Omitting `cwd` opens panes in the directory `zellij` was run from, which is
 usually what you want. A relative `cwd` resolves against that same directory,
@@ -151,7 +154,9 @@ letters, digits, `.`, `_` and `-`, never `.` or `..`, and never starting with
 `-`. Every generated file begins with a `// zellaude-generated` marker, and
 Zellaude only ever writes or removes files carrying it — a layout you wrote
 yourself is never overwritten, even if a template shares its name. Problems
-are reported to the plugin log; run Zellij with `--debug` to see them.
+are reported to Zellij's own log rather than the bar — by default
+`/tmp/zellij-<uid>/zellij-log/zellij.log`, written on every run regardless of
+`--debug`; that flag only raises its verbosity.
 
 ### Settings
 
