@@ -6,6 +6,7 @@ mod placeholder;
 mod rainbow;
 mod render;
 mod session_selection;
+mod session_templates;
 mod split_three;
 mod state;
 mod tab_pane_map;
@@ -162,6 +163,7 @@ impl ZellijPlugin for State {
                 self.maybe_finish_split_three_validation();
                 self.maybe_install_runtime_bindings();
                 self.maybe_start_attach_scan();
+                self.maybe_compile_session_templates();
                 true
             }
             Event::ModeUpdate(mode_info) => {
@@ -293,8 +295,28 @@ impl ZellijPlugin for State {
                             }
                             Err(_) => {}
                         }
+                        match session_templates::parse_config_document(raw.trim()) {
+                            Ok(configured) => {
+                                self.session_templates =
+                                    Some(session_templates::effective(configured));
+                                self.session_template_config_error = None;
+                            }
+                            Err(error) => {
+                                // Keep whatever is already on disk: a typo in
+                                // one key must not strand a session template
+                                // the user relies on mid-day. `load_config` only
+                                // ever runs once per instance, so `session_templates`
+                                // never becomes `Some` in the same instance this
+                                // error is recorded in — report it here, since the
+                                // check inside `maybe_compile_session_templates`
+                                // would otherwise never see it.
+                                eprintln!("Zellaude could not read session templates: {error}");
+                                self.session_template_config_error = Some(error);
+                            }
+                        }
                         self.config_loaded = true;
                         self.on_command_permissions_granted();
+                        self.maybe_compile_session_templates();
                         true
                     }
                     Some("install_hooks") if exit_code == Some(0) => {
@@ -306,6 +328,25 @@ impl ZellijPlugin for State {
                         if exit_code != Some(0) {
                             eprintln!(
                                 "Zellaude could not save settings: {}",
+                                String::from_utf8_lossy(&stderr).trim()
+                            );
+                        }
+                        false
+                    }
+                    Some("write_layout") => {
+                        if exit_code != Some(0) {
+                            eprintln!(
+                                "Zellaude could not write layout {}: {}",
+                                context.get("layout").map(String::as_str).unwrap_or("?"),
+                                String::from_utf8_lossy(&stderr).trim()
+                            );
+                        }
+                        false
+                    }
+                    Some("prune_layouts") => {
+                        if exit_code != Some(0) {
+                            eprintln!(
+                                "Zellaude could not prune generated layouts: {}",
                                 String::from_utf8_lossy(&stderr).trim()
                             );
                         }
@@ -1488,6 +1529,84 @@ impl State {
         if attach::run(session_name, &self.pane_to_tab, supports_introspection) {
             self.attach_scan_requested = true;
         }
+    }
+
+    /// Compile every template to `~/.config/zellij/layouts/`. Runs once per
+    /// plugin instance, as soon as both the settings file and this plugin's own
+    /// URL are known — the URL only becomes available once a pane manifest
+    /// describing this pane arrives.
+    fn maybe_compile_session_templates(&mut self) {
+        if self.session_templates_compiled || !self.command_permissions_granted {
+            return;
+        }
+        let Some(templates) = self.session_templates.clone() else {
+            return;
+        };
+        let plugin_id = *self
+            .plugin_id
+            .get_or_insert_with(|| get_plugin_ids().plugin_id);
+        let plugin_location = self
+            .pane_manifest
+            .as_ref()
+            .into_iter()
+            .flat_map(|manifest| manifest.panes.values())
+            .flatten()
+            .find(|pane| pane.is_plugin && pane.id == plugin_id)
+            .and_then(|pane| pane.plugin_url.clone());
+        let Some(plugin_location) = plugin_location else {
+            return;
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+
+        self.session_templates_compiled = true;
+        if let Some(error) = self.session_template_config_error.as_deref() {
+            eprintln!("Zellaude could not read session templates: {error}");
+        }
+
+        // Built from the templates, not from the compile results below, so a
+        // template that fails to compile keeps whatever it generated last time.
+        let keep = session_templates::keep_list(&templates);
+
+        for template in &templates {
+            let basename = session_templates::layout_basename(&template.name);
+            let kdl = match template.to_kdl(&plugin_location, &self.plugin_configuration, &home) {
+                Ok(kdl) => kdl,
+                Err(error) => {
+                    eprintln!(
+                        "Zellaude could not compile session template {:?}: {error}",
+                        template.name
+                    );
+                    continue;
+                }
+            };
+            let mut ctx = BTreeMap::new();
+            ctx.insert("type".into(), "write_layout".into());
+            ctx.insert("layout".into(), basename.clone());
+            run_command(
+                &[
+                    "sh",
+                    "-c",
+                    session_templates::WRITE_LAYOUT_SCRIPT,
+                    "zellaude-write-layout",
+                    &basename,
+                    &kdl,
+                ],
+                ctx,
+            );
+        }
+
+        let mut ctx = BTreeMap::new();
+        ctx.insert("type".into(), "prune_layouts".into());
+        run_command(
+            &[
+                "sh",
+                "-c",
+                session_templates::PRUNE_LAYOUTS_SCRIPT,
+                "zellaude-prune-layouts",
+                &keep,
+            ],
+            ctx,
+        );
     }
 
     /// Only the instance whose tab is visible should spend host calls on

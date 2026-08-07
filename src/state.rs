@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zellij_tile::prelude::*;
 
-use crate::{custom_layouts, split_three};
+use crate::{custom_layouts, session_templates, split_three};
 
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -220,6 +220,11 @@ pub struct State {
     pub custom_layouts_from_plugin_configuration: bool,
     pub custom_layout_config_error: Option<String>,
     pub custom_layout_prompt: Option<custom_layouts::Prompt>,
+    /// `None` until the settings file has been read; `Some` afterwards, even
+    /// when the key is absent, so the built-in still compiles.
+    pub session_templates: Option<Vec<session_templates::SessionTemplate>>,
+    pub session_templates_compiled: bool,
+    pub session_template_config_error: Option<String>,
     pub hooks_installed: bool,
     pub attach_scan_requested: bool,
     pub last_agent_poll_ms: u64,

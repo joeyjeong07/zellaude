@@ -202,7 +202,7 @@ impl CustomLayout {
     }
 }
 
-fn kdl_string(value: &str) -> String {
+pub fn kdl_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
     escaped.push('"');
     for character in value.chars() {
