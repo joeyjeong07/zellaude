@@ -11,11 +11,12 @@
 # Seeding Zellij's permission cache at install time removes the prompt for the
 # plugin the user just chose to install. Other plugins' entries are preserved.
 #
-# Usage: ./scripts/install-permissions.sh [--uninstall]
+# Usage: ./scripts/install-permissions.sh [--check|--uninstall]
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PLUGIN_PATH="$HOME/.config/zellij/plugins/zellaude.wasm"
+INSTALL_HOME="${ZELLAUDE_INSTALL_HOME:-$HOME}"
+PLUGIN_PATH="$INSTALL_HOME/.config/zellij/plugins/zellaude.wasm"
 
 dim() { printf '\033[2m%s\033[0m\n' "$*"; }
 
@@ -49,18 +50,94 @@ fi
 
 resolve_cache_dir() {
   local dir=""
+  if [ -n "${ZELLAUDE_CACHE_DIR:-}" ]; then
+    printf '%s\n' "$ZELLAUDE_CACHE_DIR"
+    return
+  fi
   if command -v zellij >/dev/null 2>&1; then
     dir=$(zellij setup --check 2>/dev/null |
-      awk -F': ' '/^\[CACHE DIR\]:/ { gsub(/^"|"$/, "", $2); print $2; exit }')
+      awk -F': ' '/^\[CACHE DIR\]:/ { gsub(/^"|"$/, "", $2); print $2; exit }' || true)
   fi
   if [ -z "$dir" ]; then
-    dir="${XDG_CACHE_HOME:-$HOME/.cache}/zellij"
+    dir="${XDG_CACHE_HOME:-$INSTALL_HOME/.cache}/zellij"
   fi
   printf '%s\n' "$dir"
 }
 
 CACHE_DIR=$(resolve_cache_dir)
 PERMISSIONS_FILE="$CACHE_DIR/permissions.kdl"
+
+resolve_file_symlink() {
+  local path=$1 dir target hops=0
+  while [ -L "$path" ]; do
+    hops=$((hops + 1))
+    if [ "$hops" -gt 40 ]; then
+      echo "Error: Too many symbolic links while resolving $1" >&2
+      return 1
+    fi
+    dir=$(cd "$(dirname "$path")" && pwd -P)
+    target=$(readlink "$path")
+    case "$target" in
+      /*) path=$target ;;
+      *) path=$dir/$target ;;
+    esac
+  done
+  dir=$(cd "$(dirname "$path")" && pwd -P)
+  printf '%s/%s\n' "$dir" "$(basename "$path")"
+}
+
+if [ -L "$PERMISSIONS_FILE" ]; then
+  PERMISSIONS_FILE=$(resolve_file_symlink "$PERMISSIONS_FILE")
+  CACHE_DIR=$(dirname "$PERMISSIONS_FILE")
+fi
+
+LOCK_DIR="$CACHE_DIR/.zellaude-permissions.lock"
+LOCK_HELD=false
+
+release_lock() {
+  if [ "$LOCK_HELD" = true ]; then
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=false
+  fi
+}
+
+acquire_lock() {
+  local attempts=0 owner=""
+  mkdir -p "$CACHE_DIR"
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    owner=""
+    if [ -r "$LOCK_DIR/pid" ]; then
+      owner=$(sed -n '1p' "$LOCK_DIR/pid" 2>/dev/null || true)
+    fi
+    local stale=false current_owner=""
+    case "$owner" in
+      ""|*[!0-9]*)
+        [ "$attempts" -ge 20 ] && stale=true
+        ;;
+      *)
+        kill -0 "$owner" 2>/dev/null || stale=true
+        ;;
+    esac
+    if [ "$stale" = true ]; then
+      current_owner=$(sed -n '1p' "$LOCK_DIR/pid" 2>/dev/null || true)
+      if [ "$current_owner" = "$owner" ]; then
+        [ ! -e "$LOCK_DIR/pid" ] || rm -f "$LOCK_DIR/pid"
+        if rmdir "$LOCK_DIR" 2>/dev/null; then
+          continue
+        fi
+      fi
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 200 ]; then
+      echo "Error: Timed out waiting for Zellaude's permission-cache lock: $LOCK_DIR" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+  LOCK_HELD=true
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+}
 
 # Drop any existing block for one key, preserving every other plugin's grants.
 strip_entry() {
@@ -100,6 +177,55 @@ write_permissions() {
 }
 
 case "${1:-}" in
+  ""|--check|--uninstall) ;;
+  *)
+    echo "Usage: $0 [--check|--uninstall]" >&2
+    exit 1
+    ;;
+esac
+
+validate_permissions_file() {
+  [ ! -e "$PERMISSIONS_FILE" ] && return 0
+  if [ ! -f "$PERMISSIONS_FILE" ] || ! awk '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    {
+      line = trim($0)
+      if (line == "" || line ~ /^\/\// || line ~ /^#/) next
+      if (line ~ /^".*"[[:space:]]*\{$/) {
+        if (depth != 0) invalid = 1
+        depth = 1
+        next
+      }
+      if (line == "}") {
+        if (depth != 1) invalid = 1
+        depth = 0
+        next
+      }
+      if (depth != 1 || line !~ /^[A-Za-z][A-Za-z0-9]*$/) invalid = 1
+    }
+    END { exit(invalid || depth != 0) }
+  ' "$PERMISSIONS_FILE"; then
+    echo "Error: $PERMISSIONS_FILE contains malformed permission-cache KDL" >&2
+    return 1
+  fi
+}
+
+validate_permissions_file
+
+if [ "${1:-}" = "--check" ]; then
+  echo "Permission cache is valid"
+  exit 0
+fi
+
+trap release_lock EXIT
+acquire_lock
+validate_permissions_file
+
+case "${1:-}" in
   --uninstall)
     if [ -f "$PERMISSIONS_FILE" ]; then
       write_permissions
@@ -108,7 +234,7 @@ case "${1:-}" in
       echo "No zellaude permissions found"
     fi
     ;;
-  *)
+  "")
     write_permissions --with-entry
     echo "Pre-granted Zellaude permissions in $PERMISSIONS_FILE"
     dim "  $(printf '%s' "$PERMISSIONS" | tr '\n' ' ')"
