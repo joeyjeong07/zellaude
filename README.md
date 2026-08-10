@@ -182,7 +182,7 @@ Add the plugin to your Zellij layout — that's it:
 ```kdl
 default_tab_template {
     pane size=1 borderless=true {
-        plugin location="https://github.com/ishefi/zellaude/releases/latest/download/zellaude.wasm"
+        plugin location="https://github.com/joeyjeong07/zellaude/releases/latest/download/zellaude.wasm"
     }
     children
 }
@@ -201,10 +201,19 @@ are granted the bar renders empty.
 Zellij asks by drawing its prompt *inside the plugin's pane*. As a one-row
 borderless status bar there is nothing to draw into, and normal focus navigation
 skips the pane, so the prompt cannot be answered where it appears. Grant them
-once in a full-size pane instead:
+once in a full-size pane instead. Zellij keys the grant to the plugin location,
+so use the command matching how you installed it.
+
+For the remote plugin in [Quick install](#quick-install):
 
 ```bash
-zellij action new-pane --plugin file:~/.config/zellij/plugins/zellaude.wasm
+zellij action new-pane --plugin https://github.com/joeyjeong07/zellaude/releases/latest/download/zellaude.wasm
+```
+
+For a plugin built and installed locally:
+
+```bash
+zellij action new-pane --plugin "file:$HOME/.config/zellij/plugins/zellaude.wasm"
 ```
 
 Press `y` in that pane, then close it (`Ctrl+p`, `x`). The grant is cached, so
@@ -226,18 +235,29 @@ Installing from source does this for you; see below.
 Prerequisites: [Rust](https://rustup.rs) (in addition to the above)
 
 ```bash
-git clone https://github.com/ishefi/zellaude.git
+git clone https://github.com/joeyjeong07/zellaude.git
 cd zellaude
 ./install.sh
 ```
 
-The script needs `jq`, `cargo` and `rustup` on `PATH` (it adds `~/.cargo/bin`
-itself if `cargo` is missing from the environment) and installs the
-`wasm32-wasip1` target if it is not already present. It then builds the plugin
-and copies it to `~/.config/zellij/plugins/`, pre-grants the permissions above
-so the first run is not an empty bar, and registers the hooks. Registration also
-happens automatically when the plugin loads, so the script's copy of it is
-belt-and-braces for a first run that has no working bar yet.
+The script first checks for `jq`, `cargo`, `rustup`, and Zellij 0.44 or newer
+before writing anything. It adds `~/.cargo/bin` to its `PATH` when needed and
+installs the `wasm32-wasip1` target if it is not already present. It then runs a
+locked release build with an explicit target and target directory, verifies the
+resulting WASM is nonempty, and atomically installs it to
+`~/.config/zellij/plugins/`. Finally, it pre-grants the permissions above so the
+first run is not an empty bar and registers the hooks. You can invoke the script
+from any directory; all project paths are resolved relative to `install.sh`.
+
+Set `ZELLAUDE_INSTALL_HOME` when staging an installation for a different home
+or running an isolated test. The helpers use that directory for the plugin,
+Claude/Codex settings, and Zellij cache instead of inheriting the invoking
+account's `CODEX_HOME` or `XDG_CACHE_HOME`. Hook registrations intentionally
+remain portable as `${HOME}/.config/zellij/plugins/zellaude-hook.sh`, so the
+staged directory must be that user's `HOME` when the clients later run. Set
+`ZELLAUDE_BUILD_DIR` to choose the Cargo target directory; relative values are
+resolved from the project directory. Run `./install.sh --help` for the complete
+option summary.
 
 Pass `--no-permissions` to skip the pre-grant and approve interactively instead:
 
@@ -261,9 +281,10 @@ Everything else the script does is unchanged.
 
 Both JSON files are created as `{}` if absent, symlinks are resolved before
 writing so `mv` cannot replace them with regular files, and the jq filters only
-add or remove entries whose command contains `zellaude-hook.sh` — re-running the
-script is idempotent and leaves unrelated hooks alone. Your Zellij layout is
-never modified; that step is below.
+replace the exact hook commands Zellaude owns. Re-running the script is
+idempotent, while unrelated hooks—even commands that mention
+`zellaude-hook.sh`—are left alone. Your Zellij layout is never modified; that
+step is below.
 
 ### Wiring it into a layout
 

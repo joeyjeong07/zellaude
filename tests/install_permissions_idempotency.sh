@@ -11,7 +11,9 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 mkdir -p "$(dirname "$PERMISSIONS_FILE")"
 
 run_install() {
-  HOME="$TEST_HOME" "$PROJECT_DIR/scripts/install-permissions.sh" "$@" >/dev/null
+  ZELLAUDE_INSTALL_HOME="$TEST_HOME" \
+    ZELLAUDE_CACHE_DIR="$TEST_HOME/.cache/zellij" \
+    "$PROJECT_DIR/scripts/install-permissions.sh" "$@" >/dev/null
 }
 
 seed_permissions() {
@@ -91,7 +93,36 @@ for pid in "${pids[@]}"; do
 done
 assert_installed
 
+# Replacing the cache contents must not replace a user-managed symlink with a
+# regular file. The atomic rewrite happens beside the resolved target instead.
+EXTERNAL_PERMISSIONS="$TEST_DIR/external-cache/permissions.kdl"
+mkdir -p "$(dirname "$EXTERNAL_PERMISSIONS")"
+rm -f "$PERMISSIONS_FILE"
+printf '%s\n' '"/home/someone/.config/zellij/plugins/other.wasm" {' \
+  '    ReadApplicationState' '}' > "$EXTERNAL_PERMISSIONS"
+ln -s "$EXTERNAL_PERMISSIONS" "$PERMISSIONS_FILE"
+run_install
+[ -L "$PERMISSIONS_FILE" ]
+assert_installed
+assert_unrelated_preserved
+
+# A truncated block could swallow the appended grant. Both check and install
+# must reject malformed cache KDL byte-for-byte instead of reporting success.
+rm -f "$PERMISSIONS_FILE"
+printf '%s\n' '"/tmp/truncated.wasm" {' '    RunCommands' > "$PERMISSIONS_FILE"
+cp "$PERMISSIONS_FILE" "$TEST_DIR/permissions-malformed.before"
+if run_install --check 2>/dev/null; then
+  echo "expected malformed permission cache check to fail" >&2
+  exit 1
+fi
+if run_install 2>/dev/null; then
+  echo "expected malformed permission cache install to fail" >&2
+  exit 1
+fi
+cmp -s "$PERMISSIONS_FILE" "$TEST_DIR/permissions-malformed.before"
+
 # Uninstall removes only Zellaude's entry.
+rm -f "$PERMISSIONS_FILE"
 seed_permissions
 run_install
 run_install --uninstall
