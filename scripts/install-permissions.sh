@@ -11,7 +11,7 @@
 # Seeding Zellij's permission cache at install time removes the prompt for the
 # plugin the user just chose to install. Other plugins' entries are preserved.
 #
-# Usage: ./scripts/install-permissions.sh [--check|--uninstall]
+# Usage: ./scripts/install-permissions.sh [--check|--granted|--uninstall]
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -176,10 +176,39 @@ write_permissions() {
   mv "$tmp" "$PERMISSIONS_FILE"
 }
 
+# ── Grant status ───────────────────────────────────────────
+#
+# Zellij grants silently only when every requested permission is cached; a
+# partial block still prompts. When several blocks share the key, Zellij's
+# parser keeps the last one, so read the way it reads.
+
+granted_permissions() {
+  [ -f "$PERMISSIONS_FILE" ] || return 0
+  awk -v key="\"$PLUGIN_PATH\" {" '
+    $0 == key { inside = 1; block = ""; next }
+    inside && /^}/ { inside = 0; next }
+    inside {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      if ($0 != "") block = block $0 "\n"
+    }
+    END { printf "%s", block }
+  ' "$PERMISSIONS_FILE"
+}
+
+all_permissions_granted() {
+  local granted permission
+  granted=$(granted_permissions)
+  [ -n "$granted" ] || return 1
+  while IFS= read -r permission; do
+    [ -n "$permission" ] || continue
+    printf '%s\n' "$granted" | grep -qx "$permission" || return 1
+  done <<< "$PERMISSIONS"
+}
+
 case "${1:-}" in
-  ""|--check|--uninstall) ;;
+  ""|--check|--granted|--uninstall) ;;
   *)
-    echo "Usage: $0 [--check|--uninstall]" >&2
+    echo "Usage: $0 [--check|--granted|--uninstall]" >&2
     exit 1
     ;;
 esac
@@ -221,6 +250,12 @@ if [ "${1:-}" = "--check" ]; then
   exit 0
 fi
 
+# Exit 0 iff the full grant is cached. Read-only, so no lock is taken.
+if [ "${1:-}" = "--granted" ]; then
+  all_permissions_granted
+  exit 0
+fi
+
 trap release_lock EXIT
 acquire_lock
 validate_permissions_file
@@ -235,9 +270,16 @@ case "${1:-}" in
     fi
     ;;
   "")
-    write_permissions --with-entry
-    echo "Pre-granted Zellaude permissions in $PERMISSIONS_FILE"
-    dim "  $(printf '%s' "$PERMISSIONS" | tr '\n' ' ')"
-    dim "  Skip this step with: ./install.sh --no-permissions"
+    # A complete grant is left untouched: a live Zellij server also writes
+    # this file from its in-memory grants, so routine re-runs (setup scripts
+    # converging a wiped cache) must not rewrite it without need.
+    if all_permissions_granted; then
+      echo "Zellaude permissions already granted in $PERMISSIONS_FILE"
+    else
+      write_permissions --with-entry
+      echo "Pre-granted Zellaude permissions in $PERMISSIONS_FILE"
+      dim "  $(printf '%s' "$PERMISSIONS" | tr '\n' ' ')"
+      dim "  Skip this step with: ./install.sh --no-permissions"
+    fi
     ;;
 esac
