@@ -642,6 +642,76 @@ fn custom_state_prompt_surfaces_lookup_errors() {
 }
 
 #[test]
+fn fair_name_width_cap_shrinks_only_names_above_the_cap() {
+    // Everything fits: no cap.
+    assert_eq!(render::fair_name_width_cap(&[3, 5], 100), usize::MAX);
+    // The short name keeps its 3 columns; the long one gets the rest.
+    assert_eq!(render::fair_name_width_cap(&[3, 40], 32), 29);
+    // Equally long names split the space evenly.
+    assert_eq!(render::fair_name_width_cap(&[10, 10, 10], 15), 5);
+    // No room at all.
+    assert_eq!(render::fair_name_width_cap(&[10, 10], 0), 0);
+}
+
+#[test]
+fn tab_names_render_in_full_when_the_bar_has_room() {
+    let mut state = State {
+        zellij_styling: Some(gruvbox_dark()),
+        tabs: vec![
+            tab(0, "asterorank_trainer-benchmark-query-source", true),
+            tab(1, "short", false),
+        ],
+        ..State::default()
+    };
+
+    let visible = strip_ansi(&render::build_status_bar(&mut state, 1, 200));
+
+    assert!(
+        visible.contains("asterorank_trainer-benchmark-query-source"),
+        "{visible}"
+    );
+    assert!(!visible.contains('…'), "{visible}");
+}
+
+#[test]
+fn only_the_longest_names_shrink_when_the_bar_overflows() {
+    let mut state = State {
+        tabs: vec![
+            tab(0, "log", true),
+            tab(1, "a-name-too-wide-for-the-remaining-space", false),
+        ],
+        ..State::default()
+    };
+
+    let visible = strip_ansi(&render::build_status_bar(&mut state, 1, 60));
+
+    assert!(visible.contains(" log "), "{visible}");
+    assert!(visible.contains('…'), "{visible}");
+    // The long name gets the width the short one left unused, not a bare
+    // equal split of the remaining columns.
+    assert!(visible.contains("a-name-too-wide-for-the-"), "{visible}");
+}
+
+#[test]
+fn tab_row_never_overruns_the_terminal_width() {
+    for cols in 1..120 {
+        let mut state = State {
+            tabs: vec![
+                tab(0, "a-name-too-wide-for-the-remaining-space", true),
+                tab(1, "another-name-that-is-also-rather-long", false),
+                tab(2, "log", false),
+            ],
+            ..State::default()
+        };
+        let visible = strip_ansi(&render::build_status_bar(&mut state, 1, cols));
+        assert!(
+            unicode_width::UnicodeWidthStr::width(visible.as_str()) <= cols,
+            "cols={cols} overran the bar: {visible:?}"
+        );
+    }
+}
+
+#[test]
 fn custom_state_prompt_clips_wide_unicode_to_the_terminal_width() {
     let mut state = State {
         custom_layout_prompt: Some(custom_layouts::Prompt {

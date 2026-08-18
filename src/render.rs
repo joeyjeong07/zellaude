@@ -118,6 +118,23 @@ fn take_display_width_from_end(value: &str, max_width: usize) -> String {
     characters.into_iter().collect()
 }
 
+/// Largest width cap such that every name, clipped to the cap, fits in
+/// `available` columns. Names at or under the cap keep their full width, so
+/// only the longest names shrink; `usize::MAX` when everything fits untrimmed.
+pub(crate) fn fair_name_width_cap(name_widths: &[usize], available: usize) -> usize {
+    let mut ascending = name_widths.to_vec();
+    ascending.sort_unstable();
+    let mut remaining = available;
+    for (settled, &width) in ascending.iter().enumerate() {
+        let equal_share = remaining / (ascending.len() - settled);
+        if width > equal_share {
+            return equal_share;
+        }
+        remaining -= width;
+    }
+    usize::MAX
+}
+
 fn sanitize_tab_name(name: &str) -> String {
     name.chars()
         .filter(|character| !character.is_control())
@@ -545,8 +562,12 @@ fn render_tabs(
         .map(|s: &Option<&SessionInfo>| if s.is_some() { 4 } else { 2 })
         .sum();
     let overhead = prefix_width + 2 * count + per_tab_overhead + total_elapsed_width;
+    let name_widths: Vec<usize> = tabs
+        .iter()
+        .map(|tab| display_width(&sanitize_tab_name(&tab.name)))
+        .collect();
     let max_name_len = if overhead < cols {
-        ((cols - overhead) / count).min(20)
+        fair_name_width_cap(&name_widths, cols - overhead)
     } else {
         0
     };

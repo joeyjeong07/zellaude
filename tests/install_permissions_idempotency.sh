@@ -133,4 +133,25 @@ assert_unrelated_preserved
 run_install --uninstall
 [ "$(zellaude_block_count)" -eq 0 ]
 
+# --granted reports the grant without writing anything.
+rm -f "$PERMISSIONS_FILE"
+if run_install --granted; then exit 1; fi
+run_install
+run_install --granted
+
+# A partial grant — Zellij's per-permission check would still prompt — is not
+# "granted", and a reinstall completes it.
+printf '"%s" {\n    ReadApplicationState\n}\n' "$PLUGIN_KEY" > "$PERMISSIONS_FILE"
+if run_install --granted; then exit 1; fi
+run_install
+run_install --granted
+assert_installed
+
+# A complete grant is left untouched: reinstalls on top of it must not rewrite
+# the file (the atomic rename would swap the inode), so routine re-runs cannot
+# race a live Zellij server that also writes this file.
+inode_before=$(ls -i "$PERMISSIONS_FILE" | awk '{print $1}')
+run_install
+[ "$(ls -i "$PERMISSIONS_FILE" | awk '{print $1}')" = "$inode_before" ]
+
 printf 'permission installation idempotency tests passed\n'

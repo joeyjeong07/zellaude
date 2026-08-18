@@ -106,18 +106,10 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
             return;
         }
         let ts_ms = payload.ts_ms.unwrap_or_else(crate::state::unix_now_ms);
-        // Recorded even when the payload omits an id, so the introspection
-        // poll can still hold off on resurrecting the pane it just left.
-        state
-            .pane_session_ended_ms
-            .entry(payload.pane_id)
-            .and_modify(|ended_at| *ended_at = (*ended_at).max(ts_ms))
-            .or_insert(ts_ms);
         // Keyed by the id as sent, empty included. An end that carries no id
         // still has to block the events that raced it: gating the tombstone on
         // a non-empty id left that path recording nothing, so a pre-end tool
-        // event recreated the pane as a real session — and the introspection
-        // poll only retires placeholders, so it never left again.
+        // event recreated the pane as a real session.
         state
             .session_end_tombstones
             .entry((
@@ -130,8 +122,8 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
             .sessions
             .get(&payload.pane_id)
             .map(|session| {
-                // A placeholder tracks a process that introspection still sees
-                // running, so only the poll may retire it.
+                // A placeholder (created only by older plugin builds) is not
+                // owned by any hook session, so an end event may not retire it.
                 !session.placeholder
                     && (payload.session_id.as_deref().unwrap_or_default().is_empty()
                         || session.session_id.is_empty()
@@ -148,8 +140,8 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     // session's activity but must never create pane ownership. This also lets
     // a freshly loaded plugin accept synchronized root state without a
     // child-created placeholder winning on an equal timestamp.
-    // A poll-derived placeholder is not a root session, so it cannot confer
-    // the ownership this guard withholds.
+    // A placeholder is not a root session, so it cannot confer the ownership
+    // this guard withholds.
     if payload.is_subagent
         && state
             .sessions

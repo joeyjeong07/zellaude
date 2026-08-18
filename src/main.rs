@@ -21,9 +21,6 @@ use zellij_tile::prelude::*;
 const DONE_TIMEOUT: u64 = 30;
 const TIMER_INTERVAL: f64 = 1.0;
 const FLASH_TICK: f64 = 0.25;
-/// Foreground-command polling for pre-prompt agent TUIs; keeps host queries
-/// bounded when the timer runs at flash/rainbow cadence.
-const AGENT_POLL_INTERVAL_MS: u64 = 2000;
 const SPLIT_THREE_ACTION_TIMEOUT_MS: u64 = 5000;
 const SAVE_CONFIG_SCRIPT: &str = r#"
 set -eu
@@ -143,9 +140,6 @@ impl ZellijPlugin for State {
                     if let Some(idx) = new_active {
                         self.clear_flashes_on_tab(idx);
                     }
-                    // This instance stopped polling while its tab was hidden,
-                    // so its placeholders may be stale. Poll on the next tick.
-                    self.last_agent_poll_ms = 0;
                 }
                 self.active_tab_index = new_active;
                 self.tabs = tabs;
@@ -468,7 +462,6 @@ impl ZellijPlugin for State {
                 self.recover_stalled_split_three();
                 let stale_changed = self.cleanup_stale_sessions();
                 let flash_changed = self.cleanup_expired_flashes();
-                let placeholder_changed = self.poll_agent_panes();
                 let has_flashes = self.has_active_flashes();
                 let has_rainbows = self.has_rainbow_sessions();
                 if has_rainbows {
@@ -482,7 +475,6 @@ impl ZellijPlugin for State {
                     || has_flashes
                     || stale_changed
                     || flash_changed
-                    || placeholder_changed
                     || custom_layout_prompt_changed
                     || self.has_elapsed_display()
             }
@@ -1610,7 +1602,7 @@ impl State {
     }
 
     /// Only the instance whose tab is visible should spend host calls on
-    /// discovery or polling.
+    /// discovery.
     fn is_on_active_tab(&mut self) -> bool {
         let plugin_id = *self
             .plugin_id
@@ -1627,82 +1619,6 @@ impl State {
         *self
             .pane_introspection_supported
             .get_or_insert_with(|| attach::supports_pane_introspection(&get_zellij_version()))
-    }
-
-    /// Bounds how often the pane-introspection poll runs. Runs after the cheap
-    /// gates so an instance that cannot poll does not consume its own window,
-    /// and treats a backward clock step as due so polling cannot latch off.
-    fn agent_poll_due(&mut self, now_ms: u64) -> bool {
-        if now_ms >= self.last_agent_poll_ms
-            && now_ms - self.last_agent_poll_ms < AGENT_POLL_INTERVAL_MS
-        {
-            return false;
-        }
-        self.last_agent_poll_ms = now_ms;
-        true
-    }
-
-    /// Recognize agent TUIs that have not produced a hook event yet (Codex
-    /// starts its session lazily on the first prompt) by classifying each
-    /// unclaimed pane's current foreground command. Only the instance on the
-    /// active tab polls: inactive instances are not visible and re-derive
-    /// placeholders when their tab regains focus.
-    fn poll_agent_panes(&mut self) -> bool {
-        if !self.command_permissions_granted || !self.hooks_installed {
-            return false;
-        }
-        if !self.is_on_active_tab() || !self.introspection_supported() {
-            return false;
-        }
-        let now = unix_now_ms();
-        if !self.agent_poll_due(now) {
-            return false;
-        }
-
-        let candidates: Vec<u32> = self
-            .pane_to_tab
-            .keys()
-            .copied()
-            .filter(|pane_id| {
-                self.sessions
-                    .get(pane_id)
-                    .is_none_or(placeholder::is_placeholder)
-            })
-            .collect();
-        let (to_poll, next_cursor) = placeholder::panes_to_poll(
-            candidates,
-            self.agent_poll_cursor,
-            placeholder::AGENT_POLL_BUDGET,
-        );
-        self.agent_poll_cursor = next_cursor;
-
-        let observed: Vec<(u32, placeholder::PaneAgent)> = to_poll
-            .into_iter()
-            .map(|pane_id| {
-                let observation = if placeholder::ended_recently(
-                    &self.pane_session_ended_ms,
-                    pane_id,
-                    now,
-                ) {
-                    placeholder::PaneAgent::Unknown
-                } else {
-                    match get_pane_running_command(PaneId::Terminal(pane_id)) {
-                        Ok(command) if attach::client_for_command(&command).is_some() => {
-                            placeholder::PaneAgent::Running
-                        }
-                        Ok(_) => placeholder::PaneAgent::Absent,
-                        // A failed query says nothing about the pane.
-                        Err(_) => placeholder::PaneAgent::Unknown,
-                    }
-                };
-                (pane_id, observation)
-            })
-            .collect();
-        let changed = placeholder::reconcile_agent_panes(&mut self.sessions, observed);
-        if changed {
-            self.refresh_session_tab_names();
-        }
-        changed
     }
 
     fn rebuild_pane_map(&mut self) {
@@ -2151,25 +2067,6 @@ mod tests {
         assert_eq!(session.session_id, "real");
         assert_eq!(session.activity, Activity::Thinking);
         assert!(!placeholder::is_placeholder(session));
-    }
-
-    #[test]
-    fn the_agent_poll_throttle_consumes_a_window_it_has_stamped() {
-        let mut state = State::default();
-
-        assert!(state.agent_poll_due(10_000));
-        assert!(!state.agent_poll_due(10_001));
-        assert!(state.agent_poll_due(10_000 + AGENT_POLL_INTERVAL_MS));
-    }
-
-    #[test]
-    fn a_backward_clock_step_cannot_latch_the_agent_poll_off() {
-        let mut state = State::default();
-        assert!(state.agent_poll_due(100_000));
-
-        // The clock steps back; the stale future stamp must not block polling.
-        assert!(state.agent_poll_due(40_000));
-        assert!(!state.agent_poll_due(40_001));
     }
 
     #[test]
