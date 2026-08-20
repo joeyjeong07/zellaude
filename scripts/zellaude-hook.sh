@@ -1001,5 +1001,14 @@ fi
 
 # Forwarding is best-effort: a missing Zellij session/plugin should never fail
 # the agent's own hook. Redirect output so Codex sees only the JSON it expects.
-zellij pipe --name "zellaude" -- "$PAYLOAD" >/dev/null 2>&1 || true
+# A dying session accepts the pipe but never answers it (SessionEnd races the
+# server shutdown), so a watchdog bounds the wait — unbounded, these hooks pile
+# up forever. Hand-rolled instead of timeout(1), which stock macOS lacks.
+zellij pipe --name "zellaude" -- "$PAYLOAD" >/dev/null 2>&1 &
+PIPE_PID=$!
+( sleep 10; kill "$PIPE_PID" 2>/dev/null ) &
+WATCHDOG_PID=$!
+wait "$PIPE_PID" 2>/dev/null || true
+kill "$WATCHDOG_PID" 2>/dev/null || true
+wait "$WATCHDOG_PID" 2>/dev/null || true
 finish 0
