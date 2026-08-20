@@ -268,6 +268,26 @@ finish() {
 # that race through parallel hook subprocesses.
 TS_MS=$(jq -nc 'now * 1000 | floor')
 
+# The agent process that fired this hook: the nearest claude/codex ancestor
+# (hooks run as descendants of the client). Recorded so tools reading the
+# state cache (zellmv) get exact kill/inspect targets instead of inferring
+# them from argv, which process-title rewrites make unreliable. The host
+# matters on shared homes, where every pod sees this cache.
+find_agent_pid() {
+  local pid comm
+  pid=$PPID
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    case "$comm" in
+      claude*|codex*) printf '%s\n' "$pid"; return 0 ;;
+    esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+  done
+  return 1
+}
+AGENT_PID=$(find_agent_pid) || AGENT_PID=""
+AGENT_HOST=$(hostname 2>/dev/null) || AGENT_HOST=""
+
 # Extract fields with jq (required dependency)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
@@ -739,12 +759,16 @@ PAYLOAD=$(jq -nc \
   --arg term_program "${TERM_PROGRAM:-}" \
   --arg client "$CLIENT" \
   --arg ts_ms "$TS_MS" \
+  --arg agent_pid "$AGENT_PID" \
+  --arg host "$AGENT_HOST" \
   --argjson rainbow_name "$RAINBOW_NAME" \
   --arg rainbow_mode_marker "$RAINBOW_MODE_MARKER" \
   --argjson is_subagent "$IS_SUBAGENT" \
   '{
     pane_id: ($pane_id | tonumber),
     session_id: $session_id,
+    agent_pid: (if $agent_pid == "" then null else ($agent_pid | tonumber) end),
+    host: (if $host == "" then null else $host end),
     hook_event: $hook_event,
     tool_name: (if $tool_name == "" then null else $tool_name end),
     cwd: (if $cwd == "" then null else $cwd end),
