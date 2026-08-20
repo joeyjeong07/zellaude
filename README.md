@@ -187,6 +187,7 @@ Click the **Zellaude** prefix on the left side of the bar to open the settings m
 | Notifications | Always / Unfocused / Off | Always | Desktop notifications on permission requests. "Unfocused" only notifies when the requesting pane is on a different tab. |
 | Flash | Persist / Brief / Off | Brief | Theme-colored flash on permission requests. "Persist" keeps flashing until resolved, "Brief" flashes for 2 seconds. |
 | Elapsed time | On / Off | On | Show time since last activity (appears after 30s). |
+| Smart focus | On / Off | On | Clicking an agent-aware tab focuses its most recently active agent pane (waiting ⚠ sessions first). Off makes tab clicks plain tab switches. |
 
 ## Install
 

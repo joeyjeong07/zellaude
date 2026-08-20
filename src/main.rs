@@ -225,7 +225,10 @@ impl ZellijPlugin for State {
                     ViewMode::Normal => {
                         for region in &self.click_regions {
                             if col >= region.start_col && col < region.end_col {
-                                if let Some(pane_id) = region.focus_pane_id {
+                                let focus_pane_id = region
+                                    .focus_pane_id
+                                    .filter(|_| self.settings.smart_focus);
+                                if let Some(pane_id) = focus_pane_id {
                                     focus_terminal_pane(pane_id, false, false);
                                 } else {
                                     switch_tab_to(region.tab_index as u32 + 1);
@@ -256,6 +259,10 @@ impl ZellijPlugin for State {
                                             state::SettingKey::ModeIndicator => {
                                                 self.settings.mode_indicator =
                                                     !self.settings.mode_indicator;
+                                            }
+                                            state::SettingKey::SmartFocus => {
+                                                self.settings.smart_focus =
+                                                    !self.settings.smart_focus;
                                             }
                                         }
                                         self.save_config();

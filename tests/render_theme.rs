@@ -127,6 +127,7 @@ mod state {
         pub flash: FlashMode,
         pub elapsed_time: bool,
         pub mode_indicator: bool,
+        pub smart_focus: bool,
     }
 
     #[derive(Default, PartialEq)]
@@ -142,6 +143,7 @@ mod state {
         Flash,
         ElapsedTime,
         ModeIndicator,
+        SmartFocus,
     }
 
     pub enum MenuAction {
@@ -211,6 +213,7 @@ mod state {
                     flash: FlashMode::Once,
                     elapsed_time: true,
                     mode_indicator: true,
+                    smart_focus: true,
                 },
                 view_mode: ViewMode::Normal,
                 prefix_click_region: None,

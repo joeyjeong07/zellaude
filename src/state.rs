@@ -144,6 +144,7 @@ pub struct Settings {
     pub flash: FlashMode,
     pub elapsed_time: bool,
     pub mode_indicator: bool,
+    pub smart_focus: bool,
 }
 
 impl Default for Settings {
@@ -153,6 +154,7 @@ impl Default for Settings {
             flash: FlashMode::Once,
             elapsed_time: true,
             mode_indicator: true,
+            smart_focus: true,
         }
     }
 }
@@ -170,6 +172,7 @@ pub enum SettingKey {
     Flash,
     ElapsedTime,
     ModeIndicator,
+    SmartFocus,
 }
 
 pub enum MenuAction {
