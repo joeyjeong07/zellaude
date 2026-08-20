@@ -129,10 +129,12 @@ impl CustomLayout {
         Ok(())
     }
 
-    /// Build a complete tab with a one-row Zellaude bar and the configured
+    /// Build a complete tab with the source tab's bars and the configured
     /// command grid. Explicit plugin-created layouts do not inherit the
-    /// session's default tab template, so the caller's plugin URL and complete
-    /// configuration are included in the tab.
+    /// session's default tab template, so every bar the new tab should keep --
+    /// Zellaude's own and Zellij's status bar below the grid -- has to be
+    /// written into the layout, along with the caller's plugin URL and
+    /// complete configuration.
     ///
     /// The command array is mapped left-to-right, top-to-bottom. Columns are
     /// the first-level grid children and each column owns its rows, producing
@@ -143,10 +145,18 @@ impl CustomLayout {
         plugin_location: &str,
         plugin_configuration: &BTreeMap<String, String>,
         cwd: Option<&str>,
+        chrome: &TabChrome,
     ) -> Result<String, String> {
         self.validate()?;
         if plugin_location.is_empty() {
             return Err("Zellaude plugin location is unavailable".to_string());
+        }
+
+        // The pane manifest may not describe this instance yet, and a tab
+        // without the Zellaude bar is not worth generating.
+        let mut top = chrome.top.clone();
+        if !top.iter().any(|location| location == plugin_location) {
+            top.insert(0, plugin_location.to_string());
         }
 
         let mut kdl = String::from("layout {\n");
@@ -155,21 +165,9 @@ impl CustomLayout {
             let _ = write!(kdl, " cwd={}", kdl_string(cwd));
         }
         kdl.push_str(" {\n");
-        kdl.push_str("        pane size=1 borderless=true {\n");
-        let _ = writeln!(
-            kdl,
-            "            plugin location={} {{",
-            kdl_string(plugin_location)
-        );
-        for (key, value) in plugin_configuration {
-            let _ = writeln!(
-                kdl,
-                "                {} {}",
-                kdl_string(key),
-                kdl_string(value)
-            );
+        for location in &top {
+            write_bar(&mut kdl, location, plugin_location, plugin_configuration);
         }
-        kdl.push_str("            }\n        }\n");
         kdl.push_str("        pane split_direction=\"vertical\" {\n");
 
         for column in 0..self.width {
@@ -197,9 +195,88 @@ impl CustomLayout {
             }
             kdl.push_str("            }\n");
         }
-        kdl.push_str("        }\n    }\n}\n");
+        kdl.push_str("        }\n");
+        for location in &chrome.bottom {
+            write_bar(&mut kdl, location, plugin_location, plugin_configuration);
+        }
+        kdl.push_str("    }\n}\n");
         Ok(kdl)
     }
+}
+
+/// The one-row plugin panes that frame a tab: Zellaude's bar above the
+/// content, Zellij's status bar below it, and anything else the session's tab
+/// template puts there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabChrome {
+    pub top: Vec<String>,
+    pub bottom: Vec<String>,
+}
+
+/// Read the bars of the tab a custom state is opened from, so the generated
+/// tab can repeat them.
+///
+/// A bar is a plugin pane one row tall that spans the tab. Width is what makes
+/// the test reliable: a collapsed member of a stack is also one row tall, so
+/// height alone would pull a plugin pane sitting inside the grid into the
+/// chrome. Which side a bar belongs to follows from the content it frames.
+pub fn tab_chrome(panes: &[PaneInfo]) -> TabChrome {
+    let tiled = || {
+        panes
+            .iter()
+            .filter(|pane| !pane.is_floating && !pane.is_suppressed)
+    };
+    let width = tiled().map(|pane| pane.pane_columns).max().unwrap_or(0);
+    let is_bar = |pane: &PaneInfo| {
+        width > 0 && pane.is_plugin && pane.pane_rows == 1 && pane.pane_columns == width
+    };
+    // A tab that is nothing but bars has no content to place them around, so
+    // every bar keeps its position above the grid.
+    let content_top = tiled()
+        .filter(|pane| !is_bar(pane))
+        .map(|pane| pane.pane_y)
+        .min();
+
+    let mut bars: Vec<&PaneInfo> = tiled().filter(|pane| is_bar(pane)).collect();
+    bars.sort_by_key(|pane| pane.pane_y);
+    let mut chrome = TabChrome::default();
+    for bar in bars {
+        let Some(location) = bar.plugin_url.clone().filter(|url| !url.is_empty()) else {
+            continue;
+        };
+        match content_top {
+            Some(content_top) if bar.pane_y > content_top => chrome.bottom.push(location),
+            _ => chrome.top.push(location),
+        }
+    }
+    chrome
+}
+
+/// Write one borderless one-row bar pane. Only Zellaude's own bar carries the
+/// plugin configuration; the other bars are identified by location alone.
+fn write_bar(
+    kdl: &mut String,
+    location: &str,
+    plugin_location: &str,
+    plugin_configuration: &BTreeMap<String, String>,
+) {
+    kdl.push_str("        pane size=1 borderless=true {\n");
+    let _ = writeln!(
+        kdl,
+        "            plugin location={} {{",
+        kdl_string(location)
+    );
+    if location == plugin_location {
+        for (key, value) in plugin_configuration {
+            let _ = writeln!(
+                kdl,
+                "                {} {}",
+                kdl_string(key),
+                kdl_string(value)
+            );
+        }
+    }
+    kdl.push_str("            }\n        }\n");
 }
 
 pub fn kdl_string(value: &str) -> String {

@@ -3,7 +3,7 @@
 #[path = "../src/custom_layouts.rs"]
 mod custom_layouts;
 
-use custom_layouts::{CustomLayout, Prompt, PromptKey};
+use custom_layouts::{CustomLayout, Prompt, PromptKey, TabChrome};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use zellij_tile::prelude::actions::Action;
@@ -13,6 +13,7 @@ use zellij_utils::input::layout::{Layout, Run, SplitDirection, SplitSize};
 use zellij_utils::pane_size::PaneGeom;
 
 const TEST_PLUGIN_ID: u32 = 42;
+const ZELLAUDE_URL: &str = "file:/tmp/zellaude.wasm";
 const EXAMPLE: &str = r#"{
     "id": "claude6",
     "width": "3",
@@ -219,6 +220,7 @@ fn generated_three_by_two_layout_has_reading_order_geometry_and_startup_order() 
             "file:/tmp/zellaude.wasm",
             &plugin_configuration,
             Some("/work/tree"),
+            &TabChrome::default(),
         )
         .unwrap();
     let parsed = Layout::from_kdl(&kdl, Some("generated.kdl".to_string()), None, None).unwrap();
@@ -324,7 +326,12 @@ fn one_dimensional_and_maximum_sized_grids_generate_valid_layouts() {
             commands: commands.clone(),
         };
         let kdl = layout
-            .to_kdl("file:/tmp/zellaude.wasm", &BTreeMap::new(), None)
+            .to_kdl(
+                "file:/tmp/zellaude.wasm",
+                &BTreeMap::new(),
+                None,
+                &TabChrome::default(),
+            )
             .unwrap();
         let parsed = Layout::from_kdl(&kdl, Some("boundary.kdl".to_string()), None, None)
             .unwrap_or_else(|error| panic!("{width}x{height} did not parse: {error}"));
@@ -354,6 +361,97 @@ fn one_dimensional_and_maximum_sized_grids_generate_valid_layouts() {
 }
 
 #[test]
+fn a_generated_tab_repeats_the_bars_of_the_tab_it_was_opened_from() {
+    // A real tab: Zellaude above the content, Zellij's status bar below it, a
+    // stack whose collapsed members are also one row tall, and a floating
+    // helper plugin. Only the two full-width bars are chrome.
+    let panes = vec![
+        bar_pane(6, 0, 284, ZELLAUDE_URL),
+        terminal_pane(1, 1, 74, 142),
+        terminal_pane(3, 75, 1, 142),
+        bar_pane(4, 76, 142, ZELLAUDE_URL),
+        bar_pane(5, 77, 284, "zellij:status-bar"),
+        PaneInfo {
+            is_floating: true,
+            ..bar_pane(0, 13, 284, "zellij:link")
+        },
+    ];
+    let chrome = custom_layouts::tab_chrome(&panes);
+    assert_eq!(chrome.top, vec![ZELLAUDE_URL.to_string()]);
+    assert_eq!(chrome.bottom, vec!["zellij:status-bar".to_string()]);
+
+    let plugin_configuration = plugin_configuration();
+    let kdl = example_layout()
+        .to_kdl(ZELLAUDE_URL, &plugin_configuration, None, &chrome)
+        .unwrap();
+    let parsed = Layout::from_kdl(&kdl, Some("chrome.kdl".to_string()), None, None).unwrap();
+    let tiled = &parsed.tabs[0].1;
+    assert_eq!(tiled.children.len(), 3);
+
+    for (child, location) in [
+        (&tiled.children[0], ZELLAUDE_URL),
+        (&tiled.children[2], "zellij:status-bar"),
+    ] {
+        assert_eq!(child.split_size, Some(SplitSize::Fixed(1)));
+        assert_eq!(child.borderless, Some(true));
+        let Some(Run::Plugin(plugin)) = &child.run else {
+            panic!("{location} must be a plugin pane");
+        };
+        assert_eq!(plugin.location_string(), location);
+    }
+
+    // Only Zellaude's own bar is configured; the status bar is Zellij's.
+    let Some(Run::Plugin(zellaude)) = &tiled.children[0].run else {
+        unreachable!();
+    };
+    let Some(Run::Plugin(status_bar)) = &tiled.children[2].run else {
+        unreachable!();
+    };
+    assert_eq!(
+        zellaude.get_configuration().unwrap().inner(),
+        &plugin_configuration
+    );
+    assert!(status_bar
+        .get_configuration()
+        .map(|configuration| configuration.inner().is_empty())
+        .unwrap_or(true));
+
+    let mut space = PaneGeom::default();
+    space.cols.set_inner(90);
+    space.rows.set_inner(60);
+    let positioned = tiled
+        .position_panes_in_space(&space, None, false, false)
+        .unwrap();
+    let status_bar = positioned
+        .iter()
+        .find(|(pane, _)| match &pane.run {
+            Some(Run::Plugin(plugin)) => plugin.location_string() == "zellij:status-bar",
+            _ => false,
+        })
+        .expect("the status bar must survive positioning");
+    assert_eq!(status_bar.1.y, 59);
+    assert_eq!(status_bar.1.rows.as_usize(), 1);
+    assert_eq!(status_bar.1.cols.as_usize(), 90);
+}
+
+#[test]
+fn a_tab_without_a_zellaude_bar_in_the_manifest_still_generates_one() {
+    let chrome = custom_layouts::tab_chrome(&[terminal_pane(1, 0, 60, 90)]);
+    assert_eq!(chrome, TabChrome::default());
+
+    let kdl = example_layout()
+        .to_kdl(ZELLAUDE_URL, &BTreeMap::new(), None, &chrome)
+        .unwrap();
+    let parsed = Layout::from_kdl(&kdl, Some("bare.kdl".to_string()), None, None).unwrap();
+    let tiled = &parsed.tabs[0].1;
+    assert_eq!(tiled.children.len(), 2);
+    let Some(Run::Plugin(plugin)) = &tiled.children[0].run else {
+        panic!("the first row must run the Zellaude plugin");
+    };
+    assert_eq!(plugin.location_string(), ZELLAUDE_URL);
+}
+
+#[test]
 fn a_partially_filled_grid_keeps_blank_cells_at_the_visual_bottom_right() {
     let commands: Vec<String> = (1..=7).map(|index| format!("A{index}")).collect();
     let layout = CustomLayout {
@@ -363,7 +461,12 @@ fn a_partially_filled_grid_keeps_blank_cells_at_the_visual_bottom_right() {
         commands: commands.clone(),
     };
     let kdl = layout
-        .to_kdl("file:/tmp/zellaude.wasm", &BTreeMap::new(), None)
+        .to_kdl(
+            "file:/tmp/zellaude.wasm",
+            &BTreeMap::new(),
+            None,
+            &TabChrome::default(),
+        )
         .unwrap();
     let parsed = Layout::from_kdl(&kdl, Some("partial.kdl".to_string()), None, None).unwrap();
     let tiled = &parsed.tabs[0].1;
@@ -412,7 +515,12 @@ fn generated_kdl_round_trips_quotes_newlines_backslashes_and_unicode_controls() 
         ("quoted\"key".to_string(), "slash\\line\nnext".to_string()),
     ]);
     let kdl = layout
-        .to_kdl("file:/tmp/zellaude.wasm", &plugin_configuration, None)
+        .to_kdl(
+            "file:/tmp/zellaude.wasm",
+            &plugin_configuration,
+            None,
+            &TabChrome::default(),
+        )
         .unwrap();
     assert!(kdl.contains(r#"\u{1}"#));
     assert!(!kdl.contains(r#"\u0001"#));
@@ -435,7 +543,9 @@ fn generated_kdl_round_trips_quotes_newlines_backslashes_and_unicode_controls() 
         vec![original.to_string()]
     );
 
-    assert!(layout.to_kdl("", &plugin_configuration, None).is_err());
+    assert!(layout
+        .to_kdl("", &plugin_configuration, None, &TabChrome::default())
+        .is_err());
 }
 
 #[test]
@@ -661,6 +771,28 @@ fn prompt_closes_when_the_host_never_honors_its_focus_request() {
         false,
         requested_ms + custom_layouts::FOCUS_ACQUISITION_TIMEOUT_MS
     ));
+}
+
+fn bar_pane(id: u32, pane_y: usize, pane_columns: usize, plugin_url: &str) -> PaneInfo {
+    PaneInfo {
+        id,
+        is_plugin: true,
+        pane_y,
+        pane_rows: 1,
+        pane_columns,
+        plugin_url: Some(plugin_url.to_string()),
+        ..Default::default()
+    }
+}
+
+fn terminal_pane(id: u32, pane_y: usize, pane_rows: usize, pane_columns: usize) -> PaneInfo {
+    PaneInfo {
+        id,
+        pane_y,
+        pane_rows,
+        pane_columns,
+        ..Default::default()
+    }
 }
 
 fn example_layout() -> CustomLayout {

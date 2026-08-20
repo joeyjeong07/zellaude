@@ -682,25 +682,36 @@ impl State {
         let plugin_id = *self
             .plugin_id
             .get_or_insert_with(|| get_plugin_ids().plugin_id);
-        let plugin_location = self
-            .pane_manifest
-            .as_ref()
-            .into_iter()
-            .flat_map(|manifest| manifest.panes.values())
-            .flatten()
-            .find(|pane| pane.is_plugin && pane.id == plugin_id)
-            .and_then(|pane| pane.plugin_url.clone());
+        let tab_panes = self.pane_manifest.as_ref().and_then(|manifest| {
+            manifest.panes.values().find(|panes| {
+                panes
+                    .iter()
+                    .any(|pane| pane.is_plugin && pane.id == plugin_id)
+            })
+        });
+        let plugin_location = tab_panes.and_then(|panes| {
+            panes
+                .iter()
+                .find(|pane| pane.is_plugin && pane.id == plugin_id)
+                .and_then(|pane| pane.plugin_url.clone())
+        });
         let Some(plugin_location) = plugin_location else {
             if let Some(prompt) = self.custom_layout_prompt.as_mut() {
                 prompt.error = Some("Zellaude plugin location is unavailable".to_string());
             }
             return true;
         };
+        // The new tab has to carry this tab's bars itself: Zellij parses the
+        // generated KDL on its own, so the session's tab template -- and with
+        // it the status bar under the grid -- never reaches the new tab.
+        let chrome = tab_panes
+            .map(|panes| custom_layouts::tab_chrome(panes))
+            .unwrap_or_default();
         let cwd = self
             .custom_layout_prompt
             .as_ref()
             .and_then(|prompt| prompt.cwd.as_deref());
-        let kdl = match layout.to_kdl(&plugin_location, &self.plugin_configuration, cwd) {
+        let kdl = match layout.to_kdl(&plugin_location, &self.plugin_configuration, cwd, &chrome) {
             Ok(kdl) => kdl,
             Err(error) => {
                 if let Some(prompt) = self.custom_layout_prompt.as_mut() {
