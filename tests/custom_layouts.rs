@@ -3,7 +3,7 @@
 #[path = "../src/custom_layouts.rs"]
 mod custom_layouts;
 
-use custom_layouts::{CustomLayout, Prompt, PromptKey, TabChrome};
+use custom_layouts::{CommandGrid, CustomLayout, Prompt, PromptKey, TabChrome};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use zellij_tile::prelude::actions::Action;
@@ -59,101 +59,137 @@ fn validation_rejects_invalid_ids_dimensions_and_command_counts() {
         (
             CustomLayout {
                 id: String::new(),
-                width: 1,
-                height: 1,
-                commands: vec!["A1".to_string()],
+                width: Some(1),
+                height: Some(1),
+                commands: CommandGrid::Flat(vec!["A1".to_string()]),
             },
             "must not be empty",
         ),
         (
             CustomLayout {
                 id: " padded".to_string(),
-                width: 1,
-                height: 1,
-                commands: vec!["A1".to_string()],
+                width: Some(1),
+                height: Some(1),
+                commands: CommandGrid::Flat(vec!["A1".to_string()]),
             },
             "must not start or end with whitespace",
         ),
         (
             CustomLayout {
                 id: "bad\nid".to_string(),
-                width: 1,
-                height: 1,
-                commands: vec!["A1".to_string()],
+                width: Some(1),
+                height: Some(1),
+                commands: CommandGrid::Flat(vec!["A1".to_string()]),
             },
             "must not contain control characters",
         ),
         (
             CustomLayout {
                 id: "zero".to_string(),
-                width: 0,
-                height: 1,
-                commands: vec![],
+                width: Some(0),
+                height: Some(1),
+                commands: CommandGrid::Flat(vec![]),
             },
             "non-zero width and height",
         ),
         (
             CustomLayout {
                 id: "overflow".to_string(),
-                width: usize::MAX,
-                height: 2,
-                commands: vec![],
+                width: Some(usize::MAX),
+                height: Some(2),
+                commands: CommandGrid::Flat(vec![]),
             },
             "dimensions that are too large",
         ),
         (
             CustomLayout {
                 id: "too-many".to_string(),
-                width: 9,
-                height: 8,
-                commands: vec!["x".to_string(); 72],
+                width: Some(9),
+                height: Some(8),
+                commands: CommandGrid::Flat(vec!["x".to_string(); 72]),
             },
             "the maximum is 64",
         ),
         (
             CustomLayout {
                 id: "empty".to_string(),
-                width: 3,
-                height: 2,
-                commands: vec![],
+                width: Some(3),
+                height: Some(2),
+                commands: CommandGrid::Flat(vec![]),
             },
             "must contain at least one command",
         ),
         (
             CustomLayout {
                 id: "too-many-commands".to_string(),
-                width: 3,
-                height: 2,
-                commands: vec!["x".to_string(); 7],
+                width: Some(3),
+                height: Some(2),
+                commands: CommandGrid::Flat(vec!["x".to_string(); 7]),
             },
             "has room for 6 commands, but has 7",
         ),
         (
             CustomLayout {
                 id: "command-too-large".to_string(),
-                width: 1,
-                height: 1,
-                commands: vec!["x".repeat(custom_layouts::MAX_COMMAND_BYTES + 1)],
+                width: Some(1),
+                height: Some(1),
+                commands: CommandGrid::Flat(vec!["x".repeat(custom_layouts::MAX_COMMAND_BYTES + 1)]),
             },
             "exceeds 65536 bytes",
         ),
         (
             CustomLayout {
                 id: "nul-command".to_string(),
-                width: 1,
-                height: 1,
-                commands: vec!["before\0after".to_string()],
+                width: Some(1),
+                height: Some(1),
+                commands: CommandGrid::Flat(vec!["before\0after".to_string()]),
             },
             "contains a NUL byte",
         ),
         (
             CustomLayout {
                 id: "commands-too-large".to_string(),
-                width: 17,
-                height: 1,
-                commands: vec!["x".repeat(custom_layouts::MAX_COMMAND_BYTES); 17],
+                width: Some(17),
+                height: Some(1),
+                commands: CommandGrid::Flat(vec!["x".repeat(custom_layouts::MAX_COMMAND_BYTES); 17]),
             },
             "exceed 1048576 bytes in total",
+        ),
+        (
+            CustomLayout {
+                id: "rows-with-dimensions".to_string(),
+                width: Some(2),
+                height: None,
+                commands: CommandGrid::Rows(vec![vec!["A1".to_string()]]),
+            },
+            "must not set width or height with nested commands",
+        ),
+        (
+            CustomLayout {
+                id: "empty-row".to_string(),
+                width: None,
+                height: None,
+                commands: CommandGrid::Rows(vec![vec!["A1".to_string()], vec![]]),
+            },
+            "row 2",
+        ),
+        (
+            CustomLayout {
+                id: "too-many-row-panes".to_string(),
+                width: None,
+                height: None,
+                commands: CommandGrid::Rows(vec![vec!["x".to_string(); 13]; 5]),
+            },
+            "the maximum is 64",
+        ),
+        (
+            CustomLayout {
+                id: "flat-without-dimensions".to_string(),
+                width: None,
+                height: None,
+                commands: CommandGrid::Flat(vec!["A1".to_string()]),
+            },
+            "must set width and height",
         ),
     ];
 
@@ -167,9 +203,9 @@ fn validation_rejects_invalid_ids_dimensions_and_command_counts() {
 
     let long_id = CustomLayout {
         id: "x".repeat(custom_layouts::MAX_ID_CHARACTERS + 1),
-        width: 1,
-        height: 1,
-        commands: vec!["A1".to_string()],
+        width: Some(1),
+        height: Some(1),
+        commands: CommandGrid::Flat(vec!["A1".to_string()]),
     };
     assert!(long_id.validate().unwrap_err().contains("exceeds 128"));
 }
@@ -321,9 +357,9 @@ fn one_dimensional_and_maximum_sized_grids_generate_valid_layouts() {
             .collect();
         let layout = CustomLayout {
             id: format!("grid-{width}x{height}"),
-            width,
-            height,
-            commands: commands.clone(),
+            width: Some(width),
+            height: Some(height),
+            commands: CommandGrid::Flat(commands.clone()),
         };
         let kdl = layout
             .to_kdl(
@@ -456,9 +492,9 @@ fn a_partially_filled_grid_keeps_blank_cells_at_the_visual_bottom_right() {
     let commands: Vec<String> = (1..=7).map(|index| format!("A{index}")).collect();
     let layout = CustomLayout {
         id: "claude7".to_string(),
-        width: 4,
-        height: 2,
-        commands: commands.clone(),
+        width: Some(4),
+        height: Some(2),
+        commands: CommandGrid::Flat(commands.clone()),
     };
     let kdl = layout
         .to_kdl(
@@ -498,13 +534,63 @@ fn a_partially_filled_grid_keeps_blank_cells_at_the_visual_bottom_right() {
 }
 
 #[test]
+fn a_ragged_state_positions_rows_of_unequal_width_without_filler() {
+    let layout = custom_layouts::parse_config_document(
+        r#"{"id":"claude5","commands":[["A1","A2"],["A3","A4","A5"]]}"#,
+    )
+    .unwrap()
+    .unwrap()
+    .remove(0);
+    let kdl = layout
+        .to_kdl(ZELLAUDE_URL, &BTreeMap::new(), None, &TabChrome::default())
+        .unwrap();
+    let parsed = Layout::from_kdl(&kdl, Some("ragged.kdl".to_string()), None, None).unwrap();
+    let tiled = &parsed.tabs[0].1;
+
+    // the Zellaude bar plus five commands; ragged rows leave no blank cells
+    assert_eq!(tiled.pane_count(), 6);
+    assert_eq!(tiled.children[1].children_split_direction, SplitDirection::Horizontal);
+
+    let mut space = PaneGeom::default();
+    space.cols.set_inner(90);
+    space.rows.set_inner(61);
+    let mut positioned: Vec<(String, usize, usize, usize, usize)> = tiled
+        .position_panes_in_space(&space, None, false, false)
+        .unwrap()
+        .iter()
+        .filter_map(|(pane, geometry)| {
+            maybe_shell_command(&pane.run).map(|command| {
+                (
+                    command,
+                    geometry.x,
+                    geometry.y,
+                    geometry.cols.as_usize(),
+                    geometry.rows.as_usize(),
+                )
+            })
+        })
+        .collect();
+    positioned.sort_by_key(|(_, x, y, _, _)| (*y, *x));
+    assert_eq!(
+        positioned,
+        vec![
+            ("A1".to_string(), 0, 1, 45, 30),
+            ("A2".to_string(), 45, 1, 45, 30),
+            ("A3".to_string(), 0, 31, 30, 30),
+            ("A4".to_string(), 30, 31, 30, 30),
+            ("A5".to_string(), 60, 31, 30, 30),
+        ]
+    );
+}
+
+#[test]
 fn generated_kdl_round_trips_quotes_newlines_backslashes_and_unicode_controls() {
     let original = "quote \" slash \\ newline\nnext \u{1} end";
     let layout = CustomLayout {
         id: "escaped".to_string(),
-        width: 1,
-        height: 1,
-        commands: vec![original.to_string()],
+        width: Some(1),
+        height: Some(1),
+        commands: CommandGrid::Flat(vec![original.to_string()]),
     };
 
     let plugin_configuration = BTreeMap::from([
@@ -798,9 +884,9 @@ fn terminal_pane(id: u32, pane_y: usize, pane_rows: usize, pane_columns: usize) 
 fn example_layout() -> CustomLayout {
     CustomLayout {
         id: "claude6".to_string(),
-        width: 3,
-        height: 2,
-        commands: command_names(),
+        width: Some(3),
+        height: Some(2),
+        commands: CommandGrid::Flat(command_names()),
     }
 }
 

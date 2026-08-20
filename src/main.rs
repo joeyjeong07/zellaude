@@ -1885,9 +1885,9 @@ mod tests {
     fn settings_save_payload_does_not_copy_effective_custom_states() {
         let layout = custom_layouts::CustomLayout {
             id: "claude6".to_string(),
-            width: 1,
-            height: 1,
-            commands: vec!["claude".to_string()],
+            width: Some(1),
+            height: Some(1),
+            commands: custom_layouts::CommandGrid::Flat(vec!["claude".to_string()]),
         };
         let mut state = State::default();
         state.custom_layouts.insert(layout.id.clone(), layout);
@@ -1914,9 +1914,9 @@ mod tests {
 
         let file_layout = custom_layouts::CustomLayout {
             id: "large-file-state".to_string(),
-            width: 3,
-            height: 1,
-            commands: vec!["x".repeat(50_000); 3],
+            width: Some(3),
+            height: Some(1),
+            commands: custom_layouts::CommandGrid::Flat(vec!["x".repeat(50_000); 3]),
         };
         std::fs::write(&config_path, serde_json::to_vec(&file_layout).unwrap()).unwrap();
         let state = State::default();
