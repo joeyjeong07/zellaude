@@ -78,7 +78,27 @@ Add one or more named states to `~/.config/zellij/plugins/zellaude.json`:
 
 Reload the plugin (or restart the Zellij session) after editing the file. Then press `Ctrl+t`, `Shift+n`, type the state ID, and press `Enter`. Zellaude opens a new tab with the configured grid, mapping the command array to panes from left to right, top to bottom. Press `Esc` or `Ctrl+c` to cancel the prompt.
 
-`width` and `height` may be JSON numbers or numeric strings. A state needs at least one command, the command count may not exceed `width × height`, and a state may contain at most 64 panes; the resulting grid must also fit the current terminal. When there are fewer commands than cells, the unused bottom-right cells open as normal shell panes. Commands run through `sh -lc` in the directory of the pane where the prompt was opened when Zellij can resolve it, falling back to Zellij's default working directory otherwise. Custom-state configuration should therefore be treated as trusted local shell code.
+The new tab repeats the bars of the tab it was opened from — Zellaude above the grid, Zellij's status bar below it. Zellij parses a plugin-created layout on its own, so a generated tab never inherits `default_tab_template`; anything the layout leaves out is simply missing from that tab.
+
+`width` and `height` may be JSON numbers or numeric strings. A state needs at least one command, the command count may not exceed `width × height`, and a state may contain at most 64 panes; the resulting grid must also fit the current terminal. When there are fewer commands than cells, the unused bottom-right cells open as normal shell panes.
+
+For counts that don't fill a rectangle, `commands` may instead be an array of arrays. Each inner array is one row, and the row shapes are the layout — rows may hold different pane counts, each row splits its full width equally among its panes, and no filler cells appear:
+
+```json
+{
+  "custom_states": [
+    {
+      "id": "claude5",
+      "commands": [
+        ["claude -n A1", "claude -n A2"],
+        ["claude -n A3", "claude -n A4", "claude -n A5"]
+      ]
+    }
+  ]
+}
+```
+
+A nested state takes no `width` or `height` (setting either is an error), every row needs at least one command, and the 64-pane cap still applies. Commands run through `sh -lc` in the directory of the pane where the prompt was opened when Zellij can resolve it, falling back to Zellij's default working directory otherwise. Custom-state configuration should therefore be treated as trusted local shell code.
 
 The settings file may also contain a single state object or an array of states, although the `custom_states` wrapper is recommended because it coexists with Zellaude's UI settings. As an alternative, states can be supplied directly in the plugin block; this takes precedence over the settings file:
 
@@ -167,6 +187,7 @@ Click the **Zellaude** prefix on the left side of the bar to open the settings m
 | Notifications | Always / Unfocused / Off | Always | Desktop notifications on permission requests. "Unfocused" only notifies when the requesting pane is on a different tab. |
 | Flash | Persist / Brief / Off | Brief | Theme-colored flash on permission requests. "Persist" keeps flashing until resolved, "Brief" flashes for 2 seconds. |
 | Elapsed time | On / Off | On | Show time since last activity (appears after 30s). |
+| Smart focus | On / Off | On | Clicking an agent-aware tab focuses its most recently active agent pane (waiting ⚠ sessions first). Off makes tab clicks plain tab switches. |
 
 ## Install
 

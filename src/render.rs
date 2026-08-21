@@ -937,6 +937,37 @@ fn render_settings_menu(state: &mut State, buf: &mut String, col: &mut usize, th
         );
     }
 
+    // --- Smart focus (bool) ---
+    {
+        let _ = write!(buf, "  ");
+        *col += 2;
+        let enabled = state.settings.smart_focus;
+        let appearance = if enabled {
+            SettingLabel {
+                symbol: "●",
+                label: "Smart focus: on",
+                symbol_color: theme.surface.emphasis(1),
+                label_color: theme.surface.base,
+                dimmed: false,
+            }
+        } else {
+            SettingLabel {
+                symbol: "○",
+                label: "Smart focus: off",
+                symbol_color: theme.surface.base,
+                label_color: theme.surface.base,
+                dimmed: true,
+            }
+        };
+        render_tristate(
+            buf,
+            col,
+            &mut state.menu_click_regions,
+            SettingKey::SmartFocus,
+            appearance,
+        );
+    }
+
     // Close button
     let _ = write!(buf, "  ");
     *col += 2;

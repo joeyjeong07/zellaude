@@ -225,7 +225,10 @@ impl ZellijPlugin for State {
                     ViewMode::Normal => {
                         for region in &self.click_regions {
                             if col >= region.start_col && col < region.end_col {
-                                if let Some(pane_id) = region.focus_pane_id {
+                                let focus_pane_id = region
+                                    .focus_pane_id
+                                    .filter(|_| self.settings.smart_focus);
+                                if let Some(pane_id) = focus_pane_id {
                                     focus_terminal_pane(pane_id, false, false);
                                 } else {
                                     switch_tab_to(region.tab_index as u32 + 1);
@@ -256,6 +259,10 @@ impl ZellijPlugin for State {
                                             state::SettingKey::ModeIndicator => {
                                                 self.settings.mode_indicator =
                                                     !self.settings.mode_indicator;
+                                            }
+                                            state::SettingKey::SmartFocus => {
+                                                self.settings.smart_focus =
+                                                    !self.settings.smart_focus;
                                             }
                                         }
                                         self.save_config();
@@ -682,25 +689,36 @@ impl State {
         let plugin_id = *self
             .plugin_id
             .get_or_insert_with(|| get_plugin_ids().plugin_id);
-        let plugin_location = self
-            .pane_manifest
-            .as_ref()
-            .into_iter()
-            .flat_map(|manifest| manifest.panes.values())
-            .flatten()
-            .find(|pane| pane.is_plugin && pane.id == plugin_id)
-            .and_then(|pane| pane.plugin_url.clone());
+        let tab_panes = self.pane_manifest.as_ref().and_then(|manifest| {
+            manifest.panes.values().find(|panes| {
+                panes
+                    .iter()
+                    .any(|pane| pane.is_plugin && pane.id == plugin_id)
+            })
+        });
+        let plugin_location = tab_panes.and_then(|panes| {
+            panes
+                .iter()
+                .find(|pane| pane.is_plugin && pane.id == plugin_id)
+                .and_then(|pane| pane.plugin_url.clone())
+        });
         let Some(plugin_location) = plugin_location else {
             if let Some(prompt) = self.custom_layout_prompt.as_mut() {
                 prompt.error = Some("Zellaude plugin location is unavailable".to_string());
             }
             return true;
         };
+        // The new tab has to carry this tab's bars itself: Zellij parses the
+        // generated KDL on its own, so the session's tab template -- and with
+        // it the status bar under the grid -- never reaches the new tab.
+        let chrome = tab_panes
+            .map(|panes| custom_layouts::tab_chrome(panes))
+            .unwrap_or_default();
         let cwd = self
             .custom_layout_prompt
             .as_ref()
             .and_then(|prompt| prompt.cwd.as_deref());
-        let kdl = match layout.to_kdl(&plugin_location, &self.plugin_configuration, cwd) {
+        let kdl = match layout.to_kdl(&plugin_location, &self.plugin_configuration, cwd, &chrome) {
             Ok(kdl) => kdl,
             Err(error) => {
                 if let Some(prompt) = self.custom_layout_prompt.as_mut() {
@@ -1874,9 +1892,9 @@ mod tests {
     fn settings_save_payload_does_not_copy_effective_custom_states() {
         let layout = custom_layouts::CustomLayout {
             id: "claude6".to_string(),
-            width: 1,
-            height: 1,
-            commands: vec!["claude".to_string()],
+            width: Some(1),
+            height: Some(1),
+            commands: custom_layouts::CommandGrid::Flat(vec!["claude".to_string()]),
         };
         let mut state = State::default();
         state.custom_layouts.insert(layout.id.clone(), layout);
@@ -1903,9 +1921,9 @@ mod tests {
 
         let file_layout = custom_layouts::CustomLayout {
             id: "large-file-state".to_string(),
-            width: 3,
-            height: 1,
-            commands: vec!["x".repeat(50_000); 3],
+            width: Some(3),
+            height: Some(1),
+            commands: custom_layouts::CommandGrid::Flat(vec!["x".repeat(50_000); 3]),
         };
         std::fs::write(&config_path, serde_json::to_vec(&file_layout).unwrap()).unwrap();
         let state = State::default();

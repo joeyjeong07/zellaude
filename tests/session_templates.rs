@@ -696,6 +696,8 @@ fn pruning_an_empty_or_missing_directory_is_not_an_error() {
     assert!(prune_layouts(&missing, "keep.kdl\n").status.success());
 }
 
+// std::os::unix does not exist on the wasm32-wasip1 default target.
+#[cfg(unix)]
 #[test]
 fn writing_follows_a_symlink_instead_of_replacing_it() {
     let dir = temp_dir("symlink");

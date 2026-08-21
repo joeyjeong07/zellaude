@@ -19,11 +19,38 @@ pub type TabBinding = (InputMode, KeyWithModifier, Vec<Action>);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomLayout {
     pub id: String,
-    #[serde(deserialize_with = "deserialize_dimension")]
-    pub width: usize,
-    #[serde(deserialize_with = "deserialize_dimension")]
-    pub height: usize,
-    pub commands: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_dimension",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub width: Option<usize>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_dimension",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub height: Option<usize>,
+    pub commands: CommandGrid,
+}
+
+/// The commands of a custom state and their arrangement: a flat list placed
+/// into an explicit `width` x `height` grid, or nested rows whose shape is
+/// itself the layout (each inner array is one row of equal-width panes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CommandGrid {
+    Flat(Vec<String>),
+    Rows(Vec<Vec<String>>),
+}
+
+impl CommandGrid {
+    fn all_commands(&self) -> Box<dyn Iterator<Item = &String> + '_> {
+        match self {
+            Self::Flat(commands) => Box::new(commands.iter()),
+            Self::Rows(rows) => Box::new(rows.iter().flatten()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,14 +60,16 @@ enum Dimension {
     String(String),
 }
 
-fn deserialize_dimension<'de, D>(deserializer: D) -> Result<usize, D::Error>
+fn deserialize_optional_dimension<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    match Dimension::deserialize(deserializer)? {
-        Dimension::Number(value) => Ok(value),
-        Dimension::String(value) => value
+    match Option::<Dimension>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Dimension::Number(value)) => Ok(Some(value)),
+        Some(Dimension::String(value)) => value
             .parse::<usize>()
+            .map(Some)
             .map_err(|_| de::Error::custom("dimension must be a positive integer")),
     }
 }
@@ -68,42 +97,80 @@ impl CustomLayout {
                 self.id
             ));
         }
-        if self.width == 0 || self.height == 0 {
-            return Err(format!(
-                "custom state {:?} must have non-zero width and height",
-                self.id
-            ));
-        }
-        let expected_commands = self.width.checked_mul(self.height).ok_or_else(|| {
-            format!(
-                "custom state {:?} has dimensions that are too large",
-                self.id
-            )
-        })?;
-        if expected_commands > MAX_PANES {
-            return Err(format!(
-                "custom state {:?} requests {} panes; the maximum is {MAX_PANES}",
-                self.id, expected_commands
-            ));
-        }
-        if self.commands.is_empty() {
-            return Err(format!(
-                "custom state {:?} must contain at least one command",
-                self.id
-            ));
-        }
-        if self.commands.len() > expected_commands {
-            return Err(format!(
-                "custom state {:?} is {}x{} and has room for {} commands, but has {}",
-                self.id,
-                self.width,
-                self.height,
-                expected_commands,
-                self.commands.len()
-            ));
+        match &self.commands {
+            CommandGrid::Flat(commands) => {
+                let (Some(width), Some(height)) = (self.width, self.height) else {
+                    return Err(format!(
+                        "custom state {:?} must set width and height for a flat command list",
+                        self.id
+                    ));
+                };
+                if width == 0 || height == 0 {
+                    return Err(format!(
+                        "custom state {:?} must have non-zero width and height",
+                        self.id
+                    ));
+                }
+                let expected_commands = width.checked_mul(height).ok_or_else(|| {
+                    format!(
+                        "custom state {:?} has dimensions that are too large",
+                        self.id
+                    )
+                })?;
+                if expected_commands > MAX_PANES {
+                    return Err(format!(
+                        "custom state {:?} requests {} panes; the maximum is {MAX_PANES}",
+                        self.id, expected_commands
+                    ));
+                }
+                if commands.is_empty() {
+                    return Err(format!(
+                        "custom state {:?} must contain at least one command",
+                        self.id
+                    ));
+                }
+                if commands.len() > expected_commands {
+                    return Err(format!(
+                        "custom state {:?} is {}x{} and has room for {} commands, but has {}",
+                        self.id,
+                        width,
+                        height,
+                        expected_commands,
+                        commands.len()
+                    ));
+                }
+            }
+            CommandGrid::Rows(rows) => {
+                if self.width.is_some() || self.height.is_some() {
+                    return Err(format!(
+                        "custom state {:?} must not set width or height with nested commands; the row shapes are the layout",
+                        self.id
+                    ));
+                }
+                if rows.is_empty() {
+                    return Err(format!(
+                        "custom state {:?} must contain at least one command",
+                        self.id
+                    ));
+                }
+                if let Some(index) = rows.iter().position(|row| row.is_empty()) {
+                    return Err(format!(
+                        "row {} in custom state {:?} must contain at least one command",
+                        index + 1,
+                        self.id
+                    ));
+                }
+                let pane_count: usize = rows.iter().map(Vec::len).sum();
+                if pane_count > MAX_PANES {
+                    return Err(format!(
+                        "custom state {:?} requests {pane_count} panes; the maximum is {MAX_PANES}",
+                        self.id
+                    ));
+                }
+            }
         }
         let mut total_command_bytes = 0usize;
-        for (index, command) in self.commands.iter().enumerate() {
+        for (index, command) in self.commands.all_commands().enumerate() {
             if command.contains('\0') {
                 return Err(format!(
                     "command {} in custom state {:?} contains a NUL byte",
@@ -129,24 +196,37 @@ impl CustomLayout {
         Ok(())
     }
 
-    /// Build a complete tab with a one-row Zellaude bar and the configured
+    /// Build a complete tab with the source tab's bars and the configured
     /// command grid. Explicit plugin-created layouts do not inherit the
-    /// session's default tab template, so the caller's plugin URL and complete
-    /// configuration are included in the tab.
+    /// session's default tab template, so every bar the new tab should keep --
+    /// Zellaude's own and Zellij's status bar below the grid -- has to be
+    /// written into the layout, along with the caller's plugin URL and
+    /// complete configuration.
     ///
-    /// The command array is mapped left-to-right, top-to-bottom. Columns are
-    /// the first-level grid children and each column owns its rows, producing
-    /// equal column widths while `row * width + column` assigns each command
-    /// to its visual reading-order position.
+    /// A flat command array is mapped left-to-right, top-to-bottom. Columns
+    /// are the first-level grid children and each column owns its rows,
+    /// producing equal column widths while `row * width + column` assigns
+    /// each command to its visual reading-order position. Nested command rows
+    /// are emitted rows-first instead: each inner array becomes one row of
+    /// equal-width panes, so rows may hold different pane counts and no
+    /// filler cells exist.
     pub fn to_kdl(
         &self,
         plugin_location: &str,
         plugin_configuration: &BTreeMap<String, String>,
         cwd: Option<&str>,
+        chrome: &TabChrome,
     ) -> Result<String, String> {
         self.validate()?;
         if plugin_location.is_empty() {
             return Err("Zellaude plugin location is unavailable".to_string());
+        }
+
+        // The pane manifest may not describe this instance yet, and a tab
+        // without the Zellaude bar is not worth generating.
+        let mut top = chrome.top.clone();
+        if !top.iter().any(|location| location == plugin_location) {
+            top.insert(0, plugin_location.to_string());
         }
 
         let mut kdl = String::from("layout {\n");
@@ -155,12 +235,128 @@ impl CustomLayout {
             let _ = write!(kdl, " cwd={}", kdl_string(cwd));
         }
         kdl.push_str(" {\n");
-        kdl.push_str("        pane size=1 borderless=true {\n");
-        let _ = writeln!(
-            kdl,
-            "            plugin location={} {{",
-            kdl_string(plugin_location)
-        );
+        for location in &top {
+            write_bar(&mut kdl, location, plugin_location, plugin_configuration);
+        }
+        match &self.commands {
+            CommandGrid::Flat(commands) => {
+                let (Some(width), Some(height)) = (self.width, self.height) else {
+                    return Err(format!(
+                        "custom state {:?} must set width and height for a flat command list",
+                        self.id
+                    ));
+                };
+                kdl.push_str("        pane split_direction=\"vertical\" {\n");
+                for column in 0..width {
+                    kdl.push_str("            pane split_direction=\"horizontal\" {\n");
+                    for row in 0..height {
+                        let command_index = row * width + column;
+                        if let Some(command) = commands.get(command_index) {
+                            write_command_pane(&mut kdl, command, command_index == 0);
+                        } else {
+                            // Keep a rectangular grid for balanced non-factor counts
+                            // (eg. seven commands in a 4x2 grid). Unfilled cells are
+                            // ordinary shell panes and naturally land at bottom-right
+                            // because command indices use visual reading order.
+                            kdl.push_str("                pane\n");
+                        }
+                    }
+                    kdl.push_str("            }\n");
+                }
+                kdl.push_str("        }\n");
+            }
+            CommandGrid::Rows(rows) => {
+                kdl.push_str("        pane split_direction=\"horizontal\" {\n");
+                for (row_index, row) in rows.iter().enumerate() {
+                    kdl.push_str("            pane split_direction=\"vertical\" {\n");
+                    for (column_index, command) in row.iter().enumerate() {
+                        write_command_pane(&mut kdl, command, row_index == 0 && column_index == 0);
+                    }
+                    kdl.push_str("            }\n");
+                }
+                kdl.push_str("        }\n");
+            }
+        }
+        for location in &chrome.bottom {
+            write_bar(&mut kdl, location, plugin_location, plugin_configuration);
+        }
+        kdl.push_str("    }\n}\n");
+        Ok(kdl)
+    }
+}
+
+/// The one-row plugin panes that frame a tab: Zellaude's bar above the
+/// content, Zellij's status bar below it, and anything else the session's tab
+/// template puts there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabChrome {
+    pub top: Vec<String>,
+    pub bottom: Vec<String>,
+}
+
+/// Read the bars of the tab a custom state is opened from, so the generated
+/// tab can repeat them.
+///
+/// A bar is a plugin pane one row tall that spans the tab. Width is what makes
+/// the test reliable: a collapsed member of a stack is also one row tall, so
+/// height alone would pull a plugin pane sitting inside the grid into the
+/// chrome. Which side a bar belongs to follows from the content it frames.
+pub fn tab_chrome(panes: &[PaneInfo]) -> TabChrome {
+    let tiled = || {
+        panes
+            .iter()
+            .filter(|pane| !pane.is_floating && !pane.is_suppressed)
+    };
+    let width = tiled().map(|pane| pane.pane_columns).max().unwrap_or(0);
+    let is_bar = |pane: &PaneInfo| {
+        width > 0 && pane.is_plugin && pane.pane_rows == 1 && pane.pane_columns == width
+    };
+    // A tab that is nothing but bars has no content to place them around, so
+    // every bar keeps its position above the grid.
+    let content_top = tiled()
+        .filter(|pane| !is_bar(pane))
+        .map(|pane| pane.pane_y)
+        .min();
+
+    let mut bars: Vec<&PaneInfo> = tiled().filter(|pane| is_bar(pane)).collect();
+    bars.sort_by_key(|pane| pane.pane_y);
+    let mut chrome = TabChrome::default();
+    for bar in bars {
+        let Some(location) = bar.plugin_url.clone().filter(|url| !url.is_empty()) else {
+            continue;
+        };
+        match content_top {
+            Some(content_top) if bar.pane_y > content_top => chrome.bottom.push(location),
+            _ => chrome.top.push(location),
+        }
+    }
+    chrome
+}
+
+fn write_command_pane(kdl: &mut String, command: &str, focus: bool) {
+    let focus = if focus { " focus=true" } else { "" };
+    let _ = writeln!(
+        kdl,
+        "                pane command=\"sh\"{focus} {{\n                    args \"-lc\" {}\n                }}",
+        kdl_string(command)
+    );
+}
+
+/// Write one borderless one-row bar pane. Only Zellaude's own bar carries the
+/// plugin configuration; the other bars are identified by location alone.
+fn write_bar(
+    kdl: &mut String,
+    location: &str,
+    plugin_location: &str,
+    plugin_configuration: &BTreeMap<String, String>,
+) {
+    kdl.push_str("        pane size=1 borderless=true {\n");
+    let _ = writeln!(
+        kdl,
+        "            plugin location={} {{",
+        kdl_string(location)
+    );
+    if location == plugin_location {
         for (key, value) in plugin_configuration {
             let _ = writeln!(
                 kdl,
@@ -169,37 +365,8 @@ impl CustomLayout {
                 kdl_string(value)
             );
         }
-        kdl.push_str("            }\n        }\n");
-        kdl.push_str("        pane split_direction=\"vertical\" {\n");
-
-        for column in 0..self.width {
-            kdl.push_str("            pane split_direction=\"horizontal\" {\n");
-            for row in 0..self.height {
-                let command_index = row * self.width + column;
-                if let Some(command) = self.commands.get(command_index) {
-                    let focus = if command_index == 0 {
-                        " focus=true"
-                    } else {
-                        ""
-                    };
-                    let _ = writeln!(
-                        kdl,
-                        "                pane command=\"sh\"{focus} {{\n                    args \"-lc\" {}\n                }}",
-                        kdl_string(command)
-                    );
-                } else {
-                    // Keep a rectangular grid for balanced non-factor counts
-                    // (eg. seven commands in a 4x2 grid). Unfilled cells are
-                    // ordinary shell panes and naturally land at bottom-right
-                    // because command indices use visual reading order.
-                    kdl.push_str("                pane\n");
-                }
-            }
-            kdl.push_str("            }\n");
-        }
-        kdl.push_str("        }\n    }\n}\n");
-        Ok(kdl)
     }
+    kdl.push_str("            }\n        }\n");
 }
 
 pub fn kdl_string(value: &str) -> String {
