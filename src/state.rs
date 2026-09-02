@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zellij_tile::prelude::*;
 
-use crate::{custom_layouts, session_templates, split_three};
+use crate::{custom_layouts, manifest, session_templates, split_three};
 
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -199,6 +199,19 @@ pub struct State {
     /// pane_id -> flash deadline in ms (for waiting animation)
     pub flash_deadlines: HashMap<u32, u64>,
     pub zellij_session_name: Option<String>,
+    /// Session name as Zellij itself reports it (SessionUpdate, ModeUpdate).
+    /// Hook payloads also feed `zellij_session_name`, but theirs is the
+    /// launch-time environment value, which goes stale after `rename-session`
+    /// — the manifest must not use it while this is available.
+    pub reported_session_name: Option<String>,
+    /// Body of the last dispatched manifest write. Skips identical rewrites
+    /// and names the key to delete after a session rename.
+    pub manifest_last_body: Option<manifest::ManifestBody>,
+    pub manifest_last_write_ms: u64,
+    /// A change that arrived inside the debounce window, held for the timer.
+    /// The body itself is held — not a dirty flag — because the holder may be
+    /// a hidden instance whose own tabs/panes are stale by flush time.
+    pub manifest_pending_body: Option<manifest::ManifestBody>,
     pub term_program: Option<String>,
     pub input_mode: InputMode,
     pub settings: Settings,

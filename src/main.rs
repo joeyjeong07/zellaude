@@ -2,6 +2,7 @@ mod attach;
 mod custom_layouts;
 mod event_handler;
 mod installer;
+mod manifest;
 mod placeholder;
 mod rainbow;
 mod render;
@@ -20,6 +21,7 @@ use zellij_tile::prelude::*;
 
 const DONE_TIMEOUT: u64 = 30;
 const TIMER_INTERVAL: f64 = 1.0;
+const MANIFEST_DEBOUNCE_MS: u64 = 1000;
 const FLASH_TICK: f64 = 0.25;
 const SPLIT_THREE_ACTION_TIMEOUT_MS: u64 = 5000;
 const SAVE_CONFIG_SCRIPT: &str = r#"
@@ -114,6 +116,7 @@ impl ZellijPlugin for State {
             EventType::TabUpdate,
             EventType::PaneUpdate,
             EventType::ModeUpdate,
+            EventType::SessionUpdate,
             EventType::Timer,
             EventType::Mouse,
             EventType::Key,
@@ -147,6 +150,7 @@ impl ZellijPlugin for State {
                 self.maybe_cancel_custom_layout_prompt_on_focus_loss();
                 self.maybe_install_runtime_bindings();
                 self.maybe_start_attach_scan();
+                self.maybe_write_manifest();
                 true
             }
             Event::PaneUpdate(manifest) => {
@@ -158,6 +162,7 @@ impl ZellijPlugin for State {
                 self.maybe_install_runtime_bindings();
                 self.maybe_start_attach_scan();
                 self.maybe_compile_session_templates();
+                self.maybe_write_manifest();
                 true
             }
             Event::ModeUpdate(mode_info) => {
@@ -165,11 +170,34 @@ impl ZellijPlugin for State {
                 self.input_mode = mode_info.mode;
                 self.zellij_styling = Some(mode_info.style.colors);
                 if let Some(name) = mode_info.session_name {
-                    self.zellij_session_name = Some(name);
+                    self.zellij_session_name = Some(name.clone());
+                    self.reported_session_name = Some(name);
                 }
                 self.maybe_capture_legacy_keybinds(legacy_keybinds);
                 self.maybe_start_attach_scan();
+                self.maybe_write_manifest();
                 true
+            }
+            // The only client-independent source of the session's current
+            // name: ModeUpdate needs an attached client, and hook payloads
+            // carry the stale launch-time name after a rename. Without this a
+            // detached session never learns its name (or a rename), and the
+            // manifest cannot follow.
+            Event::SessionUpdate(sessions, _) => {
+                if let Some(current) = sessions.iter().find(|session| session.is_current_session) {
+                    if self.reported_session_name.as_deref() != Some(current.name.as_str()) {
+                        self.reported_session_name = Some(current.name.clone());
+                        // Written from the update's own topology snapshot:
+                        // this event reaches hidden instances too, whose own
+                        // tabs/panes stop updating while another tab is
+                        // visible and would republish a stale layout here.
+                        if !current.tabs.is_empty() {
+                            let body = manifest::body(&current.name, &current.tabs, &current.panes);
+                            self.dispatch_manifest(body);
+                        }
+                    }
+                }
+                false
             }
             Event::Key(key) if self.custom_layout_prompt.is_some() => {
                 self.handle_custom_layout_prompt_key(key)
@@ -344,6 +372,18 @@ impl ZellijPlugin for State {
                         }
                         false
                     }
+                    Some("write_manifest") => {
+                        if exit_code != Some(0) {
+                            eprintln!(
+                                "Zellaude could not write the session manifest: {}",
+                                String::from_utf8_lossy(&stderr).trim()
+                            );
+                            // Requeue the failed body so the timer retries it,
+                            // instead of skipping it as "already written".
+                            self.manifest_pending_body = self.manifest_last_body.take();
+                        }
+                        false
+                    }
                     Some("prune_layouts") => {
                         if exit_code != Some(0) {
                             eprintln!(
@@ -462,6 +502,9 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_) => {
+                if let Some(pending_body) = self.manifest_pending_body.take() {
+                    self.dispatch_manifest(pending_body);
+                }
                 let custom_layout_prompt_changed =
                     self.maybe_cancel_custom_layout_prompt_on_focus_loss();
                 self.maybe_recover_pending_split_three_spawn();
@@ -1539,6 +1582,58 @@ impl State {
         if attach::run(session_name, &self.pane_to_tab, supports_introspection) {
             self.attach_scan_requested = true;
         }
+    }
+
+    /// Export this session's pane manifest to the runtime cache so external
+    /// tools can map layout slots to pane ids, built from this instance's own
+    /// pane and tab state. No permission gate: every trigger sits behind a
+    /// subscribed event, and Zellij withholds those until the grant exists —
+    /// while a cached grant authorizes each host call even before the
+    /// PermissionRequestResult event arrives (that event needs an attached
+    /// client, which a background session may never have).
+    fn maybe_write_manifest(&mut self) {
+        let Some(session_name) = self.reported_session_name.clone() else {
+            return;
+        };
+        if self.tabs.is_empty() {
+            return;
+        }
+        let Some(pane_manifest) = self.pane_manifest.as_ref() else {
+            return;
+        };
+        let body = manifest::body(&session_name, &self.tabs, pane_manifest);
+        self.dispatch_manifest(body);
+    }
+
+    /// Debounced to one write per second and skipped while the content is
+    /// unchanged, which also keeps per-tab instances from churning over the
+    /// one file: they all derive the same body from the same events. After a
+    /// rename the previous name's manifest is removed; only this plugin ever
+    /// learns a rename happened.
+    fn dispatch_manifest(&mut self, body: manifest::ManifestBody) {
+        if self.manifest_last_body.as_ref() == Some(&body) {
+            self.manifest_pending_body = None;
+            return;
+        }
+        let now = unix_now_ms();
+        if now.saturating_sub(self.manifest_last_write_ms) < MANIFEST_DEBOUNCE_MS {
+            self.manifest_pending_body = Some(body);
+            return;
+        }
+        let payload = manifest::payload_json(&body, now);
+        let previous_session_name = self
+            .manifest_last_body
+            .take()
+            .map(|last| last.zellij_session)
+            .filter(|last_name| *last_name != body.zellij_session);
+        manifest::write(
+            &payload,
+            &body.zellij_session,
+            previous_session_name.as_deref(),
+        );
+        self.manifest_last_body = Some(body);
+        self.manifest_last_write_ms = now;
+        self.manifest_pending_body = None;
     }
 
     /// Compile every template to `~/.config/zellij/layouts/`. Runs once per

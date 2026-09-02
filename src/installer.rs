@@ -3,9 +3,13 @@ use zellij_tile::prelude::run_command;
 
 const HOOK_VERSION_TAG: &str = concat!("# zellaude v", env!("CARGO_PKG_VERSION"));
 
+/// The embedded hook script, shared with the manifest writer, which reuses its
+/// `state_cache_key` function verbatim.
+pub(crate) const HOOK_SCRIPT: &str = include_str!("../scripts/zellaude-hook.sh");
+
 /// Generate hook script content with version tag inserted after the shebang.
 fn hook_script_content() -> String {
-    let original = include_str!("../scripts/zellaude-hook.sh");
+    let original = HOOK_SCRIPT;
     // Insert version tag after the shebang line
     if let Some(pos) = original.find('\n') {
         let (shebang, rest) = original.split_at(pos);
