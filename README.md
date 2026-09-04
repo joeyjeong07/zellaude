@@ -585,11 +585,11 @@ The registered hook command uses `${HOME}/.config/zellij/plugins/zellaude-hook.s
 Codex currently records its active reasoning effort in the hook transcript rather than hook input, while Claude Code reports `ultracode` as ordinary `xhigh` effort. Zellaude resolves both best-effort from the live session transcript and launch flags. Custom Claude launchers that hide `--effort ultracode` can export `ZELLAUDE_CLAUDE_MODE=ultracode` when Claude's active effort remains `xhigh`.
 
 The hook also keeps the last root-session state in a private per-user cache so a
-new plugin instance can restore it. On Linux, attach recovery additionally uses
-Zellij's pane PID and procfs to identify an already-running root session exactly;
-ambiguous matches are ignored. Multiple plugin instances (one per tab) sync
-state automatically via inter-plugin messaging. Cache entries are removed on a
-normal session end, and sessions are cleaned up automatically when tabs close.
+new plugin instance can restore it. On Linux, attach recovery additionally reads
+procfs to identify an already-running root session exactly; ambiguous matches
+are ignored. Multiple plugin instances (one per tab) sync state automatically via
+inter-plugin messaging. Cache entries are removed on a normal session end, and
+sessions are cleaned up automatically when tabs close.
 
 ## License
 

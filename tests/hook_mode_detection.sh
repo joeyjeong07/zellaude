@@ -943,4 +943,35 @@ VENDOR_PRETOOLUSE_JSON
 run_hook claude "$(cat "$VENDOR_PRETOOLUSE")" false
 jq -e '.current_effort_level == "high"' "$CAPTURE_FILE" >/dev/null
 
+# find_agent_pid under macOS's ps, measured 2026-09-03: `-o comm=` answers with
+# a full path while `-o ucomm=` answers with the rewritten process title. Real
+# coverage is impossible on Linux, where comm is already a basename and ucomm
+# merely aliases it, so the stub branches on the flag it is asked for — that is
+# what fails a ucomm implementation, which would otherwise pass here and match
+# nothing on macOS.
+MACOS_PS_BIN="$TEST_DIR/macos-ps-bin"
+mkdir -p "$MACOS_PS_BIN"
+cat > "$MACOS_PS_BIN/ps" <<'FAKE_MACOS_PS'
+#!/usr/bin/env bash
+case " $* " in
+  *" -o comm= "*)  printf '/Users/x/.local/bin/claude\n' ;;
+  *" -o ucomm= "*) printf '2.1.191\n' ;;
+  *" -o ppid= "*)  printf '1\n' ;;
+esac
+FAKE_MACOS_PS
+chmod +x "$MACOS_PS_BIN/ps"
+
+: > "$CAPTURE_FILE"
+printf '%s' '{"session_id":"macos-comm","hook_event_name":"PreToolUse"}' |
+  env -u CLAUDE_EFFORT \
+    -u CLAUDE_CODE_EFFORT_LEVEL \
+    -u ZELLAUDE_CLAUDE_MODE \
+    PATH="$MACOS_PS_BIN:$TEST_DIR/bin:$PATH" \
+    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
+    ZELLIJ_SESSION_NAME="test-session" \
+    ZELLIJ_PANE_ID="7" \
+    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
+    "$PROJECT_DIR/scripts/zellaude-hook.sh" >/dev/null
+jq -e '(.agent_pid | type) == "number"' "$CAPTURE_FILE" >/dev/null
+
 printf 'hook mode detection tests passed\n'

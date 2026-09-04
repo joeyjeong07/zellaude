@@ -280,7 +280,11 @@ find_agent_pid() {
   local pid comm
   pid=$PPID
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+    # macOS `ps -o comm=` returns a full path for claude but a bare name for
+    # fish, so basename it — no uname-keyed strip covers both. Never `ucomm`:
+    # it returns the rewritten process title (measured "2.1.191", 2026-09-03).
     comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    comm=${comm##*/}
     case "$comm" in
       claude*|codex*) printf '%s\n' "$pid"; return 0 ;;
     esac

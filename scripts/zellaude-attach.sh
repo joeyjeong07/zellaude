@@ -2,12 +2,10 @@
 # Discover agent sessions that were already running when Zellaude attached.
 # Arguments:
 #   $1 — Zellij session name
-#   $2 — comma-separated pane_id:leader_pid:client records
-#   $3 — attach scan start time in milliseconds
+#   $2 — attach scan start time in milliseconds
 
 SESSION_NAME=${1:-}
-PANE_RECORDS=${2:-}
-SCAN_STARTED_MS=${3:-}
+SCAN_STARTED_MS=${2:-}
 HOOK_PATH=${ZELLAUDE_ATTACH_HOOK:-"$HOME/.config/zellij/plugins/zellaude-hook.sh"}
 PROC_ROOT=${ZELLAUDE_PROC_ROOT:-/proc}
 
@@ -15,7 +13,7 @@ PROC_ROOT=${ZELLAUDE_PROC_ROOT:-/proc}
 [ -x "$HOOK_PATH" ] || exit 0
 
 # Cached hook state preserves launch-only mode choices that cannot always be
-# reconstructed from a transcript. It is validated and emitted below.
+# reconstructed from a transcript.
 CACHED_STATES=$("$HOOK_PATH" --restore "$SESSION_NAME" 2>/dev/null || true)
 
 proc_env_value() {
@@ -31,11 +29,6 @@ proc_stat_value() {
   stat_rest=${stat_line##*) }
   printf '%s\n' "$stat_rest" |
     awk -v field="$field_after_comm" '{ print $field }'
-}
-
-foreground_pid() {
-  # /proc/<pid>/stat field 8 is tpgid; after removing pid+comm it is field 6.
-  proc_stat_value "$1" 6
 }
 
 valid_nonnegative_number() {
@@ -60,45 +53,59 @@ valid_session_id() {
   esac
 }
 
-record_client_for_pane() {
-  local wanted_pane=$1 remaining record record_tail pane_id client
-  remaining=$PANE_RECORDS
-  while [ -n "$remaining" ]; do
-    case "$remaining" in
-      *,*)
-        record=${remaining%%,*}
-        remaining=${remaining#*,}
-        ;;
-      *)
-        record=$remaining
-        remaining=""
-        ;;
-    esac
-    pane_id=${record%%:*}
-    record_tail=${record#*:}
-    client=${record_tail#*:}
-    if [ "$pane_id" = "$wanted_pane" ]; then
-      printf '%s\n' "$client"
-      return 0
-    fi
-  done
-  return 1
+LOCAL_HOST=$(hostname 2>/dev/null) || LOCAL_HOST=""
+
+# True ONLY on positive evidence that the cached entry's agent is gone: ps
+# exited 1 with no output, or the pid is alive running something else. Every
+# other outcome keeps the entry. Decide on exit status, never on empty output:
+# a ps that cannot run prints nothing too, and it fails for every entry in the
+# same pass, so that reading would blank the whole restore rather than lose one
+# row. A foreign or absent hostname is evidence about nothing local, so validate
+# only when both hostnames are non-empty and equal.
+cached_agent_is_gone() {
+  local agent_pid=$1 client=$2 entry_host=$3 reported_comm status
+  valid_positive_number "$agent_pid" || return 1
+  [ -n "$entry_host" ] && [ -n "$LOCAL_HOST" ] || return 1
+  [ "$entry_host" = "$LOCAL_HOST" ] || return 1
+
+  reported_comm=$(ps -o comm= -p "$agent_pid" 2>/dev/null)
+  status=$?
+  # macOS `ps -o comm=` returns a full path for claude but a bare name for
+  # fish, so basename it — no uname-keyed strip covers both. Never `ucomm`:
+  # it returns the rewritten process title (measured "2.1.191", 2026-09-03).
+  reported_comm=$(printf '%s' "$reported_comm" | tr -d '[:space:]')
+  reported_comm=${reported_comm##*/}
+
+  if [ "$status" -eq 1 ]; then
+    [ -z "$reported_comm" ] && return 0
+    return 1
+  fi
+  [ "$status" -eq 0 ] || return 1
+  [ -n "$reported_comm" ] || return 1
+
+  case "$reported_comm" in
+    "$client"*) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 emit_cached_states() {
   local now_ms cache_max_age_ms line metadata pane_id client ts_ms
-  local record_client age_ms
+  local agent_pid entry_host age_ms
   now_ms=$(jq -nr 'now * 1000 | floor' 2>/dev/null) || return 0
   valid_positive_number "$now_ms" || return 0
   cache_max_age_ms=43200000
 
   while IFS= read -r line; do
     [ -n "$line" ] || continue
+    # agent_pid defaults to 0, not "": tab is IFS whitespace, so an empty field
+    # ahead of `host` would collapse and shift it into agent_pid. 0 is no pid.
     metadata=$(printf '%s\n' "$line" | jq -r '
-      [(.pane_id // ""), (.client // ""), (.ts_ms // "")]
+      [(.pane_id // ""), (.client // ""), (.ts_ms // ""),
+       (.agent_pid // 0), (.host // "")]
       | @tsv
     ' 2>/dev/null) || continue
-    IFS=$'\t' read -r pane_id client ts_ms <<< "$metadata"
+    IFS=$'\t' read -r pane_id client ts_ms agent_pid entry_host <<< "$metadata"
     valid_nonnegative_number "$pane_id" || continue
     valid_positive_number "$ts_ms" || continue
     case "$client" in
@@ -110,9 +117,8 @@ emit_cached_states() {
     [ "$age_ms" -ge -300000 ] || continue
     [ "$age_ms" -le "$cache_max_age_ms" ] || continue
 
-    if [ -n "$PANE_RECORDS" ]; then
-      record_client=$(record_client_for_pane "$pane_id") || continue
-      [ "$record_client" = "$client" ] || continue
+    if cached_agent_is_gone "$agent_pid" "$client" "$entry_host"; then
+      continue
     fi
     printf '%s\n' "$line"
   done <<< "$CACHED_STATES"
@@ -137,9 +143,56 @@ emit_live_payload() {
 emit_cached_states
 
 # Exact process discovery currently relies on Linux procfs. Other platforms
-# use the bounded, command-matched hook cache above.
+# use the bounded, liveness-validated hook cache above.
 [ "$(uname)" = "Linux" ] || exit 0
 [ -d "$PROC_ROOT" ] || exit 0
+
+# Every claude/codex process of this session, as "pane_id<TAB>pid<TAB>client",
+# ascending by pane then pid. printf is a builtin, so the globs never reach an
+# exec: past ARG_MAX execve fails outright, grep never starts, and discovery
+# returns nothing — silently, since the plugin discards the stderr bash writes.
+# -s covers unreadable entries, not that. xargs chunks the exec, and no process
+# is read individually: 20.3 s against 22 ms for 528 processes.
+list_pane_processes() {
+  local chunk=()
+  # Chunk size, set by tests to force more than one xargs invocation at fixture
+  # scale. Not harmless tuning: at 1 the walk becomes one exec per file, the
+  # shape it exists to avoid.
+  [ -z "${ZELLAUDE_PROC_SCAN_MAX_ARGS:-}" ] ||
+    chunk=(-n "$ZELLAUDE_PROC_SCAN_MAX_ARGS")
+  {
+    printf '%s\0' "$PROC_ROOT"/*/comm |
+      xargs -0 "${chunk[@]}" grep -sxH -e claude -e codex
+    printf '%s\0' "$PROC_ROOT"/*/environ |
+      xargs -0 "${chunk[@]}" grep -szH \
+        -e '^ZELLIJ_SESSION_NAME=' -e '^ZELLIJ_PANE_ID=' |
+      tr '\0' '\n'
+  } | awk -v session="$SESSION_NAME" '
+    {
+      separator = index($0, ":")
+      if (separator == 0) next
+      path = substr($0, 1, separator - 1)
+      record = substr($0, separator + 1)
+      depth = split(path, components, "/")
+      process_id = components[depth - 1]
+      if (components[depth] == "comm") {
+        client[process_id] = record
+      } else if (record ~ /^ZELLIJ_SESSION_NAME=/) {
+        process_session[process_id] = substr(record, 21)
+      } else {
+        pane[process_id] = substr(record, 16)
+      }
+    }
+    END {
+      for (process_id in client) {
+        if (process_id !~ /^[0-9]+$/) continue
+        if (process_session[process_id] != session) continue
+        if (pane[process_id] == "") continue
+        printf "%s\t%s\t%s\n", pane[process_id], process_id, client[process_id]
+      }
+    }
+  ' | sort -k1,1n -k2,2n
+}
 
 process_matches_pane() {
   local process_id=$1 pane_id=$2 process_session process_pane
@@ -406,49 +459,20 @@ discover_claude() {
   printf '%s\n' "$payload" | emit_live_payload
 }
 
-remaining=$PANE_RECORDS
-while [ -n "$remaining" ]; do
-  case "$remaining" in
-    *,*)
-      record=${remaining%%,*}
-      remaining=${remaining#*,}
-      ;;
-    *)
-      record=$remaining
-      remaining=""
-      ;;
-  esac
+PANE_PROCESSES=$(list_pane_processes)
 
-  pane_id=${record%%:*}
-  record_tail=${record#*:}
-  leader_pid=${record_tail%%:*}
-  client=${record_tail#*:}
+# A pane is claimed by the lowest-pid candidate that discovers a session; later
+# members of the same set are skipped whether or not they would discover too.
+declare -A pane_discovered=()
+while IFS=$'\t' read -r pane_id process_id client; do
   valid_nonnegative_number "$pane_id" || continue
-  valid_positive_number "$leader_pid" || continue
+  valid_positive_number "$process_id" || continue
+  [ -z "${pane_discovered[$pane_id]+present}" ] || continue
+
   case "$client" in
-    codex|claude|unknown) ;;
+    codex) discover_codex "$pane_id" "$process_id" || continue ;;
+    claude) discover_claude "$pane_id" "$process_id" || continue ;;
     *) continue ;;
   esac
-
-  process_id=$(foreground_pid "$leader_pid")
-  valid_positive_number "$process_id" || continue
-  depth=0
-  while valid_positive_number "$process_id" && [ "$depth" -lt 64 ]; do
-    process_name=$(cat "$PROC_ROOT/$process_id/comm" 2>/dev/null || true)
-    case "$process_name" in
-      codex)
-        discover_codex "$pane_id" "$process_id" && break
-        ;;
-      claude)
-        discover_claude "$pane_id" "$process_id" && break
-        ;;
-    esac
-
-    [ "$process_id" = "$leader_pid" ] && break
-    parent_id=$(proc_stat_value "$process_id" 2)
-    valid_positive_number "$parent_id" || break
-    [ "$parent_id" != "$process_id" ] || break
-    process_id=$parent_id
-    depth=$((depth + 1))
-  done
-done
+  pane_discovered["$pane_id"]=1
+done <<< "$PANE_PROCESSES"

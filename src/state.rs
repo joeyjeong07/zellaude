@@ -247,7 +247,6 @@ pub struct State {
     pub session_template_config_error: Option<String>,
     pub hooks_installed: bool,
     pub attach_scan_requested: bool,
-    pub pane_introspection_supported: Option<bool>,
     pub plugin_id: Option<u32>,
     pub plugin_configuration: BTreeMap<String, String>,
 }

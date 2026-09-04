@@ -450,22 +450,10 @@ impl ZellijPlugin for State {
                             .flat_map(|pane_ids| pane_ids.split(','))
                             .filter_map(|pane_id| pane_id.parse().ok())
                             .collect();
-                        let pane_leaders: BTreeMap<u32, i32> = context
-                            .get("pane_leaders")
-                            .into_iter()
-                            .flat_map(|pane_leaders| pane_leaders.split(','))
-                            .filter_map(|record| {
-                                let (pane_id, leader_pid) = record.split_once(':')?;
-                                Some((pane_id.parse().ok()?, leader_pid.parse().ok()?))
-                            })
-                            .collect();
                         let scan_started_ms = context
                             .get("scan_started_ms")
                             .and_then(|value| value.parse::<u64>().ok())
                             .unwrap_or(0);
-                        let introspection_supported = context
-                            .get("introspection_supported")
-                            .is_some_and(|value| value == "true");
                         let expected_session = self.zellij_session_name.clone();
                         let raw = String::from_utf8_lossy(&stdout);
                         let mut discovered_by_pane: BTreeMap<u32, HookPayload> =
@@ -504,18 +492,6 @@ impl ZellijPlugin for State {
                             if !self.pane_to_tab.contains_key(&pane_id) {
                                 continue;
                             }
-                            if introspection_supported {
-                                let Some(expected_leader) = pane_leaders.get(&pane_id)
-                                else {
-                                    continue;
-                                };
-                                if get_pane_pid(PaneId::Terminal(pane_id)).ok()
-                                    != Some(*expected_leader)
-                                {
-                                    continue;
-                                }
-                            }
-
                             let discovered_id = payload
                                 .session_id
                                 .as_deref()
@@ -1756,12 +1732,11 @@ impl State {
         if self.pane_to_tab.is_empty() || !self.is_on_active_tab() {
             return;
         }
-        let supports_introspection = self.introspection_supported();
         let Some(session_name) = self.zellij_session_name.as_deref() else {
             return;
         };
 
-        if attach::run(session_name, &self.pane_to_tab, supports_introspection) {
+        if attach::run(session_name, &self.pane_to_tab) {
             self.attach_scan_requested = true;
         }
     }
@@ -1908,12 +1883,6 @@ impl State {
             .is_some_and(|manifest| {
                 !tabs.is_empty() && attach::is_active_instance(manifest, tabs, plugin_id)
             })
-    }
-
-    fn introspection_supported(&mut self) -> bool {
-        *self
-            .pane_introspection_supported
-            .get_or_insert_with(|| attach::supports_pane_introspection(&get_zellij_version()))
     }
 
     fn rebuild_pane_map(&mut self) {
