@@ -205,6 +205,9 @@ restore_cached_states() {
         and (.is_subagent == false)
         and ((.session_id // "") != "")
       )
+      # Attach-time consumers read the cache files directly; keeping launch_env
+      # out of this transit path costs them nothing.
+      | del(.launch_env)
     ' "$state_file" 2>/dev/null || true
   done
 }
@@ -287,6 +290,138 @@ find_agent_pid() {
 }
 AGENT_PID=$(find_agent_pid) || AGENT_PID=""
 AGENT_HOST=$(hostname 2>/dev/null) || AGENT_HOST=""
+
+# Launch-time knobs a relaunch must reproduce: backend, auth, model, agent
+# behavior. Exact names, one list for both clients — no prefix matching and no
+# denylist, so a variable the client injects is excluded by not appearing here.
+# In order: claude endpoint and provider, claude identity and config home,
+# claude model and limits, zellaude, codex.
+LAUNCH_ENV_CONFIG_NAMES="ANTHROPIC_BASE_URL \
+CLAUDE_CODE_USE_BEDROCK ANTHROPIC_BEDROCK_BASE_URL \
+ANTHROPIC_BEDROCK_REGION_PREFIX ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION \
+CLAUDE_CODE_SKIP_BEDROCK_AUTH \
+CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_SKIP_MANTLE_AUTH \
+CLAUDE_CODE_USE_VERTEX ANTHROPIC_VERTEX_BASE_URL ANTHROPIC_VERTEX_PROJECT_ID \
+CLAUDE_CODE_SKIP_VERTEX_AUTH \
+CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_FOUNDRY_BASE_URL ANTHROPIC_FOUNDRY_RESOURCE \
+CLAUDE_CODE_SKIP_FOUNDRY_AUTH \
+CLAUDE_CODE_USE_ANTHROPIC_AWS ANTHROPIC_AWS_BASE_URL \
+ANTHROPIC_AWS_WORKSPACE_ID CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH \
+ANTHROPIC_PROFILE ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID \
+ANTHROPIC_WORKSPACE_ID CLAUDE_CODE_OAUTH_SCOPES \
+CLAUDE_CONFIG_DIR CLAUDE_CODE_PROJECT_DIR_NAME \
+ANTHROPIC_MODEL ANTHROPIC_DEFAULT_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_SMALL_FAST_MODEL \
+ANTHROPIC_CUSTOM_MODEL_OPTION CLAUDE_CODE_SUBAGENT_MODEL \
+CLAUDE_CODE_SUBAGENT_MODEL_FORCE CLAUDE_CODE_EFFORT_LEVEL \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_MAX_OUTPUT_TOKENS \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_DISABLE_1M_CONTEXT \
+ZELLAUDE_CLAUDE_MODE \
+CODEX_HOME CODEX_SQLITE_HOME CODEX_CA_CERTIFICATE \
+CODEX_OSS_BASE_URL CODEX_OSS_PORT OPENAI_BASE_URL \
+OPENAI_ORGANIZATION OPENAI_PROJECT OPENAI_FEDERATION_RULE_ID \
+OPENAI_IDENTITY_TOKEN_FILE OPENAI_WORKLOAD_IDENTITY_CONTEXT"
+# ANTHROPIC_SMALL_FAST_MODEL: deprecated upstream in favour of
+# ANTHROPIC_DEFAULT_HAIKU_MODEL; claude 2.1.258 still reads both.
+# CODEX_SQLITE_HOME: single-source, never confirmed against a running codex.
+# OPENAI_BASE_URL: codex ignores it today (openai/codex#16719). Captured anyway
+# — a replay reproduces sameness, not effectiveness, so the relaunched session
+# must ignore it too.
+# OPENAI_ORGANIZATION, OPENAI_PROJECT, CODEX_OSS_*: read by codex source
+# (model-provider-info, `--oss`), absent from its env-var docs.
+LAUNCH_ENV_SECRET_NAMES="ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY \
+CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN \
+ANTHROPIC_FOUNDRY_API_KEY ANTHROPIC_FOUNDRY_AUTH_TOKEN ANTHROPIC_AWS_API_KEY \
+CODEX_API_KEY CODEX_ACCESS_TOKEN OPENAI_API_KEY"
+# OPENAI_API_KEY: current codex reads it only through a provider env_key or
+# `codex login --with-api-key`; kept for older releases and custom providers.
+# A literal set, never a pattern: a pattern would eventually match a real
+# credential. It lets local-proxy sessions replay without a re-source contract.
+LAUNCH_ENV_SAFE_SECRET_VALUE="local"
+LAUNCH_ENV_REDACTED_MARKER="<set>"
+
+PROC_ROOT=${ZELLAUDE_PROC_ROOT:-/proc}
+# Read here for the allowlist and below for the notification mode.
+SETTINGS_FILE="${HOME:-}/.config/zellij/plugins/zellaude.json"
+
+# Built-in names plus the user's, as {config: [...], secret: [...]}. A settings
+# file may only ADD: re-tiering a predefined name is dropped, and the escape set
+# is not readable from here at all, which is the cheaper door to the same
+# boundary. Missing, unreadable or malformed yields the built-ins — a bad file
+# must never capture more, and never capture nothing.
+merged_launch_env_names() {
+  local settings_json
+  settings_json=$(cat "$SETTINGS_FILE" 2>/dev/null) || settings_json=""
+
+  jq -nc \
+    --arg config_names "$LAUNCH_ENV_CONFIG_NAMES" \
+    --arg secret_names "$LAUNCH_ENV_SECRET_NAMES" \
+    --arg settings_json "$settings_json" '
+      # No apostrophe in a comment inside a single-quoted jq program: it closes
+      # the shell string, and bash -n then reports a syntax error lines below.
+      ($settings_json | fromjson? // {}) as $user
+      | ($config_names | split(" ")) as $config
+      | ($secret_names | split(" ")) as $secret
+      | ($config + $secret) as $predefined
+      # The config tier is spelled "verbatim" to the user: the frozen-tier rule
+      # protects predefined names only, so a name they add there is captured
+      # WITH ITS VALUE, and the key should say so.
+      | def added($tier):
+          (try ($user.launch_env_names[$tier]) catch null)
+          | if type == "array"
+            then map(select(type == "string" and . != ""))
+            else []
+            end;
+        ((added("secret") - $predefined) | unique) as $user_secret
+      # A name the user lists under both tiers is a secret: fail closed. Both
+      # subtractions on this line are belt-and-braces — read_launch_env redacts
+      # on the secret list independently — and keep each name in one tier only.
+      # The subtraction on the secret line above is not: dropping it would
+      # redact a predefined verbatim name.
+      | ((added("verbatim") - $predefined - $user_secret) | unique) as $user_config
+      | {
+          config: ($config + $user_config),
+          secret: ($secret + $user_secret)
+        }
+    '
+}
+
+# Emits the launch_env object, or nothing when the environ cannot be read
+# (no /proc, refused read, no agent pid). Never falls back to this hook's own
+# environment: under --inspect that belongs to zellaude-attach.sh, not the agent.
+# jq splits the raw NUL-separated blob so a value containing a newline survives.
+read_launch_env() {
+  local agent_pid=$1 environ_path names
+  [ -n "$agent_pid" ] || return 1
+  environ_path="$PROC_ROOT/$agent_pid/environ"
+  [ -r "$environ_path" ] || return 1
+  names=$(merged_launch_env_names) || return 1
+
+  jq -Rsc \
+    --argjson names "$names" \
+    --arg safe_secret_value "$LAUNCH_ENV_SAFE_SECRET_VALUE" \
+    --arg redacted_marker "$LAUNCH_ENV_REDACTED_MARKER" '
+      $names.config as $config
+      | $names.secret as $secret
+      | [ split("\u0000")[]
+          | (index("=")) as $eq
+          | select($eq != null)
+          | { name: .[:$eq], value: .[$eq + 1:] }
+          | select(.name | IN($config[], $secret[]))
+          | {
+              key: .name,
+              value: (
+                if (.name | IN($secret[])) and .value != $safe_secret_value
+                then $redacted_marker
+                else .value
+                end
+              )
+            }
+        ]
+      | from_entries
+    ' "$environ_path" 2>/dev/null
+}
 
 # Extract fields with jq (required dependency)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
@@ -547,6 +682,18 @@ claude_process_requested_mode() {
   printf 'unknown'
 }
 
+# The agent's effort as of this event, lowercase whichever source answers.
+# `.effort` does not ride every event type, so the inherited launch value is
+# what keeps SessionStart from answering empty.
+resolve_effort_level() {
+  local effort_level
+  effort_level=$(echo "$INPUT" | jq -r '.effort.level? // empty | ascii_downcase')
+  [ -n "$effort_level" ] ||
+    effort_level=$(printf '%s' "${CLAUDE_EFFORT:-}" |
+      tr '[:upper:]' '[:lower:]')
+  printf '%s\n' "$effort_level"
+}
+
 detect_claude_rainbow() {
   local explicit_state transcript_result transcript_state transcript_marker
   local transcript_timestamp transcript_timestamp_ms session_started_at_ms
@@ -684,8 +831,7 @@ detect_claude_rainbow() {
     esac
   fi
 
-  effort_level=$(echo "$INPUT" | jq -r '.effort.level? // empty | ascii_downcase')
-  [ -n "$effort_level" ] || effort_level="${CLAUDE_EFFORT:-}"
+  effort_level=$(resolve_effort_level)
   case "$effort_level" in
     low|medium|high|max)
       printf 'false\t'
@@ -748,6 +894,22 @@ case "$RAINBOW_NAME" in
   *) RAINBOW_NAME="null" ;;
 esac
 
+if [ "$INSPECT_ONLY" = true ]; then
+  # --inspect runs outside the agent's process tree: the environment here is
+  # zellaude-attach.sh's, not the agent's, and substituting it would be a lie.
+  LAUNCH_ENV=null
+else
+  LAUNCH_ENV=$(read_launch_env "$AGENT_PID") || LAUNCH_ENV=null
+fi
+if [ "$CLIENT" = "codex" ]; then
+  # resolve_effort_level reads Claude's instruments — .effort.level and
+  # CLAUDE_EFFORT. On a codex agent an inherited CLAUDE_EFFORT is a Claude
+  # session's effort leaking in, so recording it would name the wrong agent.
+  CURRENT_EFFORT_LEVEL=""
+else
+  CURRENT_EFFORT_LEVEL=$(resolve_effort_level)
+fi
+
 # Build compact JSON payload
 PAYLOAD=$(jq -nc \
   --arg pane_id "$ZELLIJ_PANE_ID" \
@@ -764,6 +926,8 @@ PAYLOAD=$(jq -nc \
   --argjson rainbow_name "$RAINBOW_NAME" \
   --arg rainbow_mode_marker "$RAINBOW_MODE_MARKER" \
   --argjson is_subagent "$IS_SUBAGENT" \
+  --argjson launch_env "$LAUNCH_ENV" \
+  --arg current_effort_level "$CURRENT_EFFORT_LEVEL" \
   '{
     pane_id: ($pane_id | tonumber),
     session_id: $session_id,
@@ -788,6 +952,13 @@ PAYLOAD=$(jq -nc \
       if $rainbow_mode_marker == ""
       then null
       else $rainbow_mode_marker
+      end
+    ),
+    launch_env: $launch_env,
+    current_effort_level: (
+      if $current_effort_level == ""
+      then null
+      else $current_effort_level
       end
     )
   }')
@@ -885,6 +1056,26 @@ persist_root_state() {
           else
             $current
           end
+        # These two keep $previous on any event, SessionStart included: a
+        # SessionStart is the authoritative new signal for rainbow_name, but an
+        # environ is fixed at exec, so within one session a null is only ever a
+        # failed read — never a newer, better answer.
+        | if $previous.session_id == $current.session_id then
+            .launch_env = (
+              if $current.launch_env == null
+              then $previous.launch_env
+              else $current.launch_env
+              end
+            )
+            | .current_effort_level = (
+                if $current.current_effort_level == null
+                then $previous.current_effort_level
+                else $current.current_effort_level
+                end
+              )
+          else
+            .
+          end
       ' "$cache_path" 2>/dev/null
     ) || merged_payload=""
     [ -z "$merged_payload" ] || cache_payload=$merged_payload
@@ -914,7 +1105,6 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
   printf '\a' > /dev/tty 2>/dev/null || true
 
   # Read notification setting (default: Always)
-  SETTINGS_FILE="$HOME/.config/zellij/plugins/zellaude.json"
   NOTIFY_MODE="Always"
   if [ -f "$SETTINGS_FILE" ]; then
     NOTIFY_MODE=$(jq -r '.notifications // "Always"' "$SETTINGS_FILE" 2>/dev/null)

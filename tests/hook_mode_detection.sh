@@ -8,6 +8,10 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 
 mkdir -p "$TEST_DIR/bin"
 mkdir -p "$TEST_DIR/runtime"
+# The hook reads the launch-env allowlist from the settings file under HOME, so
+# without this the developer's own zellaude.json decides what these cases see.
+mkdir -p "$TEST_DIR/home"
+export HOME="$TEST_DIR/home"
 cat > "$TEST_DIR/bin/zellij" <<'FAKE_ZELLIJ'
 #!/usr/bin/env bash
 printf '%s' "${!#}" > "$ZELLAUDE_TEST_CAPTURE"
@@ -492,5 +496,451 @@ jq -e --argjson mode_ts "$LAUNCH_OVERRIDE_MODE_TS" '
 
 run_inline_settings_flag '{"ultracode":true}' true
 run_inline_settings_flag '{"ultracode":false,"other":true}' false
+
+# find_agent_pid matches on comm, and a shebang script reports comm=bash, so the
+# stand-in agent must be a copy of the bash binary named for the client. Kept
+# off PATH: these names would otherwise shadow a real client for other cases.
+LAUNCH_ENV_BIN="$TEST_DIR/launch-bin"
+LAUNCH_ENV_PROC_ROOT="$TEST_DIR/launch-proc"
+LAUNCH_ENV_ENVIRON="$TEST_DIR/launch-environ"
+LAUNCH_ENV_STDOUT="$TEST_DIR/launch-stdout.json"
+mkdir -p "$LAUNCH_ENV_BIN" "$LAUNCH_ENV_PROC_ROOT"
+cp "$(command -v bash)" "$LAUNCH_ENV_BIN/claude"
+cp "$(command -v bash)" "$LAUNCH_ENV_BIN/codex"
+
+# The agent publishes its own environ, because only it knows the pid that
+# find_agent_pid will resolve to. An empty fixture publishes nothing, which is
+# how the not-captured path is reached.
+cat > "$TEST_DIR/launch-agent.sh" <<'LAUNCH_AGENT'
+if [ -s "$ZELLAUDE_TEST_ENVIRON" ]; then
+  mkdir -p "$ZELLAUDE_PROC_ROOT/$$"
+  cp "$ZELLAUDE_TEST_ENVIRON" "$ZELLAUDE_PROC_ROOT/$$/environ"
+fi
+printf '%s' "$ZELLAUDE_TEST_INPUT" |
+  "$ZELLAUDE_TEST_HOOK" ${ZELLAUDE_TEST_HOOK_ARGS:-}
+LAUNCH_AGENT
+
+write_environ() {
+  local entry
+  : > "$LAUNCH_ENV_ENVIRON"
+  for entry in "$@"; do
+    printf '%s\0' "$entry" >> "$LAUNCH_ENV_ENVIRON"
+  done
+}
+
+run_launch_env_hook() {
+  local client=$1 input=$2 hook_args=""
+  shift 2
+  [ "$client" != "codex" ] || hook_args="--client codex"
+
+  : > "$CAPTURE_FILE"
+  env -u CLAUDE_EFFORT \
+    -u CLAUDE_CODE_EFFORT_LEVEL \
+    -u ZELLAUDE_CLAUDE_MODE \
+    PATH="$TEST_DIR/bin:$PATH" \
+    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
+    ZELLIJ_SESSION_NAME="test-session" \
+    ZELLIJ_PANE_ID="7" \
+    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
+    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
+    ZELLAUDE_TEST_HOOK_ARGS="$hook_args" \
+    ZELLAUDE_TEST_INPUT="$input" \
+    ZELLAUDE_TEST_ENVIRON="$LAUNCH_ENV_ENVIRON" \
+    ZELLAUDE_PROC_ROOT="$LAUNCH_ENV_PROC_ROOT" \
+    "$@" \
+    "$LAUNCH_ENV_BIN/$client" "$TEST_DIR/launch-agent.sh" > "$LAUNCH_ENV_STDOUT"
+}
+
+rm -f "$STATE_FILE"
+write_environ \
+  'ANTHROPIC_BASE_URL=http://127.0.0.1:9/' \
+  'ANTHROPIC_AUTH_TOKEN=local' \
+  'ANTHROPIC_API_KEY=not-a-real-key' \
+  'ANTHROPIC_SMALL_FAST_MODEL=fast-model' \
+  'CLAUDE_CODE_EFFORT_LEVEL=high' \
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS=100000' \
+  'ANTHROPIC_BASE_URL_EXTRA=prefix-trap' \
+  'CLAUDE_CODE_BRIDGE_SESSION_ID=injected' \
+  'PATH=/usr/bin'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env","hook_event_name":"SessionStart"}'
+# Config names verbatim, secrets by tier, and the whole key set: an exact-name
+# allowlist cannot leak by construction, so what is worth asserting is that the
+# reader captured nothing beyond its list.
+jq -e '
+  .launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"
+  and .launch_env.ANTHROPIC_AUTH_TOKEN == "local"
+  and .launch_env.ANTHROPIC_API_KEY == "<set>"
+  and .launch_env.ANTHROPIC_SMALL_FAST_MODEL == "fast-model"
+  and .launch_env.CLAUDE_CODE_EFFORT_LEVEL == "high"
+  and .launch_env.CLAUDE_CODE_MAX_CONTEXT_TOKENS == "100000"
+  and (.launch_env | keys) == [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+  ]
+' "$CAPTURE_FILE" >/dev/null
+if grep -q 'not-a-real-key' "$CAPTURE_FILE" "$STATE_FILE"; then
+  printf 'a secret value reached the payload or the cache\n' >&2
+  exit 1
+fi
+
+# A launch environ is fixed at exec, so within one session a null is a failed
+# read, never a newer answer — it must not erase a capture, on any event.
+# Anything non-null still lands, or the guard would be a blanket keep-previous.
+write_environ
+run_launch_env_hook claude \
+  '{"session_id":"launch-env","hook_event_name":"PostToolUse"}' \
+  CLAUDE_EFFORT=max
+jq -e '.launch_env == null and .current_effort_level == "max"' \
+  "$CAPTURE_FILE" >/dev/null
+jq -e '
+  .launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"
+  and .current_effort_level == "max"
+' "$STATE_FILE" >/dev/null
+
+# The two merge rules coexist rather than one swallowing the other: a
+# SessionStart is the authoritative new signal for rainbow_name, and in the same
+# event the launch fields still keep what a failed read could not supply.
+run_launch_env_hook claude \
+  '{"session_id":"launch-env","hook_event_name":"SessionStart"}'
+jq -e '
+  .rainbow_name == null
+  and .launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"
+  and .current_effort_level == "max"
+' "$STATE_FILE" >/dev/null
+
+XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
+  "$PROJECT_DIR/scripts/zellaude-hook.sh" --restore test-session |
+  jq -e '
+    .session_id == "launch-env"
+    and (has("launch_env") | not)
+    and .current_effort_level == "max"
+  ' >/dev/null
+
+# A different session inherits nothing: the previous agent's environ is not this
+# agent's, however recently it was cached.
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-other","hook_event_name":"SessionStart"}'
+jq -e '.launch_env == null and .current_effort_level == null' \
+  "$STATE_FILE" >/dev/null
+
+# Read but nothing matched is not the same as never read.
+write_environ 'PATH=/usr/bin'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-empty","hook_event_name":"SessionStart"}'
+jq -e '.launch_env == {}' "$CAPTURE_FILE" >/dev/null
+
+# --inspect runs outside the agent's process tree, so the environment reachable
+# there is the caller's, not the agent's — null even when a readable environ and
+# a resolvable agent_pid would otherwise produce a capture.
+write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-inspect","hook_event_name":"PostToolUse"}' \
+  ZELLAUDE_TEST_HOOK_ARGS=--inspect
+jq -e '.launch_env == null and (.agent_pid | type) == "number"' \
+  "$LAUNCH_ENV_STDOUT" >/dev/null
+
+# Every effort source is normalized, so an uppercase CLAUDE_EFFORT reaches the
+# payload lowercased and takes the explicit-effort early return instead of
+# falling through to the transcript's ultracode state.
+write_environ
+run_launch_env_hook claude "$(jq -nc \
+  --arg transcript "$CLAUDE_ULTRA_TRANSCRIPT" \
+  '{session_id:"launch-env-effort",hook_event_name:"PreToolUse",transcript_path:$transcript}')" \
+  CLAUDE_EFFORT=HIGH
+jq -e '.current_effort_level == "high" and .rainbow_name == false' \
+  "$CAPTURE_FILE" >/dev/null
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-effort","hook_event_name":"PostToolUse","effort":{"level":"MAX"}}' \
+  CLAUDE_EFFORT=high
+jq -e '.current_effort_level == "max"' "$CAPTURE_FILE" >/dev/null
+
+# The asymmetry on a codex pane is deliberate, and the two halves are asserted
+# together so it cannot be tidied away: an inherited ANTHROPIC_BASE_URL was
+# genuinely in this process's environ at exec, while an inherited CLAUDE_EFFORT
+# would assert a Claude session's effort about a codex agent.
+write_environ \
+  'ANTHROPIC_BASE_URL=http://127.0.0.1:9/' \
+  'CODEX_HOME=/tmp/codex-home' \
+  'CODEX_API_KEY=not-a-real-key'
+run_launch_env_hook codex \
+  '{"session_id":"launch-env-codex","hook_event_name":"PreToolUse"}' \
+  CLAUDE_EFFORT=high
+jq -e '
+  .client == "codex"
+  and .current_effort_level == null
+  and .launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"
+  and .launch_env.CODEX_HOME == "/tmp/codex-home"
+  and .launch_env.CODEX_API_KEY == "<set>"
+' "$CAPTURE_FILE" >/dev/null
+
+LAUNCH_ENV_SETTINGS="$HOME/.config/zellij/plugins/zellaude.json"
+mkdir -p "$(dirname "$LAUNCH_ENV_SETTINGS")"
+
+write_settings() {
+  if [ "$#" -eq 0 ]; then
+    rm -f "$LAUNCH_ENV_SETTINGS"
+  else
+    printf '%s' "$1" > "$LAUNCH_ENV_SETTINGS"
+  fi
+}
+
+# The built-ins are the whole list when no settings file exists — the regression
+# test for a hook that now reads that file on every event, or the suite has gone
+# back to reading whoever runs it.
+write_settings
+write_environ \
+  'CODEX_SQLITE_HOME=/tmp/codex-sqlite' \
+  'OPENAI_BASE_URL=http://127.0.0.1:9/v1' \
+  'OPENAI_BASE_URL_EXTRA=prefix-trap' \
+  'MY_BASE_URL=http://127.0.0.1:9/mine'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-builtin","hook_event_name":"SessionStart"}'
+jq -e '
+  .launch_env.CODEX_SQLITE_HOME == "/tmp/codex-sqlite"
+  and .launch_env.OPENAI_BASE_URL == "http://127.0.0.1:9/v1"
+  and (.launch_env | keys) == ["CODEX_SQLITE_HOME", "OPENAI_BASE_URL"]
+' "$CAPTURE_FILE" >/dev/null
+
+# The complete built-in list, each name under its tier, and nothing beyond it.
+# One line per name on each side, so a name added to the hook fails here until
+# it is classified, and a re-tiered one fails on its value. The two traps are
+# a documented display-label sibling an exact match must not admit, and a
+# codex-injected name.
+LAUNCH_ENV_BUILTIN_VERBATIM_ENTRIES=(
+  'ANTHROPIC_BASE_URL=http://127.0.0.1:9/'
+  'CLAUDE_CODE_USE_BEDROCK=1'
+  'ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:9/bedrock'
+  'ANTHROPIC_BEDROCK_REGION_PREFIX=eu'
+  'ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION=eu-west-1'
+  'CLAUDE_CODE_SKIP_BEDROCK_AUTH=1'
+  'CLAUDE_CODE_USE_MANTLE=1'
+  'CLAUDE_CODE_SKIP_MANTLE_AUTH=1'
+  'CLAUDE_CODE_USE_VERTEX=1'
+  'ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:9/vertex'
+  'ANTHROPIC_VERTEX_PROJECT_ID=my-project'
+  'CLAUDE_CODE_SKIP_VERTEX_AUTH=1'
+  'CLAUDE_CODE_USE_FOUNDRY=1'
+  'ANTHROPIC_FOUNDRY_BASE_URL=http://127.0.0.1:9/foundry'
+  'ANTHROPIC_FOUNDRY_RESOURCE=my-resource'
+  'CLAUDE_CODE_SKIP_FOUNDRY_AUTH=1'
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS=1'
+  'ANTHROPIC_AWS_BASE_URL=http://127.0.0.1:9/aws'
+  'ANTHROPIC_AWS_WORKSPACE_ID=wrkspc_test'
+  'CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH=1'
+  'ANTHROPIC_PROFILE=work'
+  'ANTHROPIC_FEDERATION_RULE_ID=fedrule_test'
+  'ANTHROPIC_ORGANIZATION_ID=org_test'
+  'ANTHROPIC_WORKSPACE_ID=wrkspc_test'
+  'CLAUDE_CODE_OAUTH_SCOPES=user:profile user:inference'
+  'CLAUDE_CONFIG_DIR=/tmp/claude-home'
+  'CLAUDE_CODE_PROJECT_DIR_NAME=my-project'
+  'ANTHROPIC_MODEL=main-model'
+  'ANTHROPIC_DEFAULT_MODEL=opus'
+  'ANTHROPIC_DEFAULT_OPUS_MODEL=opus-model'
+  'ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet-model'
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku-model'
+  'ANTHROPIC_DEFAULT_FABLE_MODEL=fable-model'
+  'ANTHROPIC_SMALL_FAST_MODEL=fast-model'
+  'ANTHROPIC_CUSTOM_MODEL_OPTION=custom-model'
+  'CLAUDE_CODE_SUBAGENT_MODEL=sonnet'
+  'CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1'
+  'CLAUDE_CODE_EFFORT_LEVEL=high'
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS=100000'
+  'CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000'
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW=80000'
+  'CLAUDE_CODE_DISABLE_1M_CONTEXT=1'
+  'ZELLAUDE_CLAUDE_MODE=ultracode'
+  'CODEX_HOME=/tmp/codex-home'
+  'CODEX_SQLITE_HOME=/tmp/codex-sqlite'
+  'CODEX_CA_CERTIFICATE=/tmp/ca.pem'
+  'CODEX_OSS_BASE_URL=http://127.0.0.1:9/v1'
+  'CODEX_OSS_PORT=11434'
+  'OPENAI_BASE_URL=http://127.0.0.1:9/v1'
+  'OPENAI_ORGANIZATION=org-test'
+  'OPENAI_PROJECT=proj_test'
+  'OPENAI_FEDERATION_RULE_ID=fedrule_test'
+  'OPENAI_IDENTITY_TOKEN_FILE=/tmp/token.jwt'
+  'OPENAI_WORKLOAD_IDENTITY_CONTEXT={"run":"test"}'
+)
+LAUNCH_ENV_BUILTIN_SECRET_NAMES=(
+  ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_API_KEY
+  CLAUDE_CODE_OAUTH_TOKEN
+  CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+  ANTHROPIC_FOUNDRY_API_KEY
+  ANTHROPIC_FOUNDRY_AUTH_TOKEN
+  ANTHROPIC_AWS_API_KEY
+  CODEX_API_KEY
+  CODEX_ACCESS_TOKEN
+  OPENAI_API_KEY
+)
+write_settings
+write_environ \
+  "${LAUNCH_ENV_BUILTIN_VERBATIM_ENTRIES[@]}" \
+  "${LAUNCH_ENV_BUILTIN_SECRET_NAMES[@]/%/=not-a-real-key}" \
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME=prefix-trap' \
+  'CODEX_SANDBOX=seatbelt'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-all-builtins","hook_event_name":"SessionStart"}'
+jq -e \
+  --arg verbatim "$(printf '%s\n' "${LAUNCH_ENV_BUILTIN_VERBATIM_ENTRIES[@]}")" \
+  --arg secret "$(printf '%s\n' "${LAUNCH_ENV_BUILTIN_SECRET_NAMES[@]}")" '
+  def lines: split("\n") | map(select(. != ""));
+  (
+    ($verbatim | lines | map(capture("^(?<key>[^=]+)=(?<value>.*)$")))
+    + ($secret | lines | map({key: ., value: "<set>"}))
+    | from_entries
+  ) as $expected
+  | .launch_env == $expected
+' "$CAPTURE_FILE" >/dev/null
+if grep -q 'not-a-real-key' "$CAPTURE_FILE" "$STATE_FILE"; then
+  printf 'a built-in secret reached the payload or the cache by value\n' >&2
+  exit 1
+fi
+
+# Each tier extends, and an added secret is still a secret: the tier the user
+# picks decides the value policy, exactly as for a predefined name.
+write_settings '{"launch_env_names":{"verbatim":["MY_BASE_URL"],"secret":["MY_TOKEN"]}}'
+write_environ \
+  'MY_BASE_URL=http://127.0.0.1:9/mine' \
+  'MY_TOKEN=not-a-real-key'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-extend","hook_event_name":"SessionStart"}'
+jq -e '
+  .launch_env.MY_BASE_URL == "http://127.0.0.1:9/mine"
+  and .launch_env.MY_TOKEN == "<set>"
+' "$CAPTURE_FILE" >/dev/null
+if grep -q 'not-a-real-key' "$CAPTURE_FILE"; then
+  printf 'a user-added secret reached the payload by value\n' >&2
+  exit 1
+fi
+
+# The frozen tiers and the escape set under a hostile config: it lists a
+# predefined secret as verbatim, and offers a safe value of its own. Neither
+# door opens — the escape set is not read from the file at all, so
+# ANTHROPIC_AUTH_TOKEN=hunter2 stays redacted while the built-in escape still
+# admits the literal "local".
+write_settings '{
+  "launch_env_names":{"verbatim":["ANTHROPIC_API_KEY","ANTHROPIC_AUTH_TOKEN"]},
+  "launch_env_safe_values":["hunter2"]
+}'
+write_environ \
+  'ANTHROPIC_API_KEY=not-a-real-key' \
+  'ANTHROPIC_AUTH_TOKEN=hunter2'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-frozen","hook_event_name":"SessionStart"}'
+jq -e '
+  .launch_env.ANTHROPIC_API_KEY == "<set>"
+  and .launch_env.ANTHROPIC_AUTH_TOKEN == "<set>"
+' "$CAPTURE_FILE" >/dev/null
+write_environ 'ANTHROPIC_AUTH_TOKEN=local'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-escape","hook_event_name":"SessionStart"}'
+jq -e '.launch_env.ANTHROPIC_AUTH_TOKEN == "local"' "$CAPTURE_FILE" >/dev/null
+
+# Frozen in the other direction too: a predefined verbatim name listed as secret
+# stays verbatim. Promotion is as much a re-tier as demotion.
+write_settings '{"launch_env_names":{"secret":["ANTHROPIC_BASE_URL"]}}'
+write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-promote","hook_event_name":"SessionStart"}'
+jq -e '.launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"' \
+  "$CAPTURE_FILE" >/dev/null
+
+# A name under both tiers is a secret: the ambiguity resolves fail-closed.
+write_settings '{"launch_env_names":{"verbatim":["MY_DUAL"],"secret":["MY_DUAL"]}}'
+write_environ 'MY_DUAL=not-a-real-key'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-dual","hook_event_name":"SessionStart"}'
+jq -e '.launch_env.MY_DUAL == "<set>"' "$CAPTURE_FILE" >/dev/null
+
+# An environ entry can begin with '=', so an empty name in the settings file
+# would capture it under an empty key. The name never enters the list, which is
+# why nothing on the environ side has to defend against it.
+write_settings '{"launch_env_names":{"verbatim":["","MY_BASE_URL"]}}'
+write_environ '=weird-empty-name' 'MY_BASE_URL=http://mine/'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-empty-name","hook_event_name":"SessionStart"}'
+jq -e '(.launch_env | keys) == ["MY_BASE_URL"]' "$CAPTURE_FILE" >/dev/null
+
+# A bad file yields the built-ins: never fail-open, never fail-dead. Malformed
+# and unreadable are separate paths — one fails to parse, one fails to open.
+write_settings '{"launch_env_names":{"verbatim":['
+write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/' 'MY_BASE_URL=ignored'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-malformed","hook_event_name":"SessionStart"}'
+jq -e '
+  (.launch_env | keys) == ["ANTHROPIC_BASE_URL"]
+' "$CAPTURE_FILE" >/dev/null
+
+# A bare array is a SUPPORTED settings shape, not a malformed one: it is custom
+# states without the `custom_states` wrapper (README) and `parse_config_document`
+# matches `Value::Array` ahead of both object arms. Worth its own case despite
+# asserting the same outcome as the malformed one, because the failure it guards
+# differs in kind: indexing an array with a string errors, so if `added`'s `try`
+# is ever dropped the jq exits non-zero, read_launch_env returns 1, and
+# launch_env is null on every event for that user — a documented config silently
+# losing the feature outright, not merely getting the wrong list. Asserting the
+# key set catches exactly that, since `null | keys` fails.
+write_settings '[{"id":"claude6","width":3,"height":2,"commands":["claude"]}]'
+write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/' 'MY_BASE_URL=ignored'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-array","hook_event_name":"SessionStart"}'
+jq -e '
+  (.launch_env | keys) == ["ANTHROPIC_BASE_URL"]
+' "$CAPTURE_FILE" >/dev/null
+
+# Skipped for root, which can read a 000 file and would fail this for the wrong
+# reason.
+if [ "$(id -u)" -ne 0 ]; then
+  write_settings '{"launch_env_names":{"verbatim":["MY_BASE_URL"]}}'
+  chmod 000 "$LAUNCH_ENV_SETTINGS"
+  run_launch_env_hook claude \
+    '{"session_id":"launch-env-unreadable","hook_event_name":"SessionStart"}'
+  chmod 600 "$LAUNCH_ENV_SETTINGS"
+  jq -e '
+    (.launch_env | keys) == ["ANTHROPIC_BASE_URL"]
+  ' "$CAPTURE_FILE" >/dev/null
+fi
+
+# Narrowing is the null rule's sibling: the config is a redaction control, so a
+# name the user just removed must not survive in the cache. The smaller object
+# is non-null, so the merge takes it wholesale — this is the one place a
+# shrinking launch_env is correct rather than the bug it resembles.
+write_settings '{"launch_env_names":{"verbatim":["MY_BASE_URL"]}}'
+write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/' 'MY_BASE_URL=http://mine/'
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-narrow","hook_event_name":"SessionStart"}'
+jq -e '.launch_env.MY_BASE_URL == "http://mine/"' "$STATE_FILE" >/dev/null
+write_settings
+run_launch_env_hook claude \
+  '{"session_id":"launch-env-narrow","hook_event_name":"PostToolUse"}'
+jq -e '
+  (.launch_env | has("MY_BASE_URL") | not)
+  and .launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"
+' "$STATE_FILE" >/dev/null
+
+# A redacted subset of a real claude 2.1.252 PreToolUse payload: fields removed,
+# none altered. It is the evidence that the vendor populates `.effort`, so
+# current_effort_level has a source on the events that carry one. The harness
+# unsets CLAUDE_EFFORT, which is what makes "high" attributable to the payload
+# rather than to the environment.
+VENDOR_PRETOOLUSE="$TEST_DIR/vendor-pretooluse.json"
+cat > "$VENDOR_PRETOOLUSE" <<'VENDOR_PRETOOLUSE_JSON'
+{
+  "effort": {
+    "level": "high"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash"
+}
+VENDOR_PRETOOLUSE_JSON
+run_hook claude "$(cat "$VENDOR_PRETOOLUSE")" false
+jq -e '.current_effort_level == "high"' "$CAPTURE_FILE" >/dev/null
 
 printf 'hook mode detection tests passed\n'

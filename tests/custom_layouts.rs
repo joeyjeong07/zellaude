@@ -635,6 +635,133 @@ fn generated_kdl_round_trips_quotes_newlines_backslashes_and_unicode_controls() 
 }
 
 #[test]
+fn a_multi_tab_document_focuses_only_the_first_tab_and_keeps_every_grid() {
+    let tabs = [
+        rows_layout("impl", &[&["A1", "A2"], &["A3"]]),
+        rows_layout("crit", &[&["B1"]]),
+    ];
+    let kdl = custom_layouts::tabs_to_kdl(
+        &tabs,
+        ZELLAUDE_URL,
+        &plugin_configuration(),
+        Some("/work/tree"),
+        &TabChrome::default(),
+    )
+    .unwrap();
+    let parsed = Layout::from_kdl(&kdl, Some("tabs.kdl".to_string()), None, None).unwrap();
+
+    assert_eq!(parsed.tabs.len(), 2);
+    assert_eq!(parsed.focused_tab_index, Some(0));
+    assert_eq!(
+        parsed
+            .tabs
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect::<Vec<_>>(),
+        vec![Some("impl".to_string()), Some("crit".to_string())]
+    );
+    assert_eq!(
+        kdl.lines()
+            .filter(|line| line.trim_start().starts_with("tab name=") && line.contains("focus=true"))
+            .count(),
+        1
+    );
+    for (tab, expected) in parsed.tabs.iter().zip([
+        vec!["A1".to_string(), "A2".to_string(), "A3".to_string()],
+        vec!["B1".to_string()],
+    ]) {
+        let mut commands: Vec<String> = tab
+            .1
+            .extract_run_instructions()
+            .iter()
+            .filter_map(maybe_shell_command)
+            .collect();
+        commands.sort();
+        assert_eq!(commands, expected);
+    }
+
+    assert!(custom_layouts::tabs_to_kdl(
+        &[],
+        ZELLAUDE_URL,
+        &BTreeMap::new(),
+        None,
+        &TabChrome::default()
+    )
+    .is_err());
+}
+
+#[test]
+fn a_one_tab_document_still_emits_exactly_what_the_single_state_emitter_did() {
+    let layout = rows_layout("one", &[&["A1"]]);
+    let kdl = layout
+        .to_kdl(
+            ZELLAUDE_URL,
+            &BTreeMap::new(),
+            Some("/work"),
+            &TabChrome::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        kdl,
+        r#"layout {
+    tab name="one" focus=true cwd="/work" {
+        pane size=1 borderless=true {
+            plugin location="file:/tmp/zellaude.wasm" {
+            }
+        }
+        pane split_direction="horizontal" {
+            pane split_direction="vertical" {
+                pane command="sh" focus=true {
+                    args "-lc" "A1"
+                }
+            }
+        }
+    }
+}
+"#
+    );
+    assert_eq!(
+        kdl,
+        custom_layouts::tabs_to_kdl(
+            std::slice::from_ref(&layout),
+            ZELLAUDE_URL,
+            &BTreeMap::new(),
+            Some("/work"),
+            &TabChrome::default(),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn bar_rows_counts_every_bar_the_generated_tab_will_carry() {
+    let mirrored = TabChrome {
+        top: vec![ZELLAUDE_URL.to_string()],
+        bottom: vec!["zellij:status-bar".to_string()],
+    };
+    assert_eq!(mirrored.bar_rows(ZELLAUDE_URL), 2);
+
+    // Without Zellaude's own bar in the manifest the emitter adds one.
+    let foreign_bar_only = TabChrome {
+        top: vec!["zellij:tab-bar".to_string()],
+        bottom: Vec::new(),
+    };
+    assert_eq!(foreign_bar_only.bar_rows(ZELLAUDE_URL), 2);
+    assert_eq!(TabChrome::default().bar_rows(ZELLAUDE_URL), 1);
+
+    for chrome in [mirrored, foreign_bar_only, TabChrome::default()] {
+        let kdl = example_layout()
+            .to_kdl(ZELLAUDE_URL, &BTreeMap::new(), None, &chrome)
+            .unwrap();
+        assert_eq!(
+            kdl.matches("pane size=1 borderless=true").count(),
+            chrome.bar_rows(ZELLAUDE_URL)
+        );
+    }
+}
+
+#[test]
 fn runtime_reconfigure_preserves_the_targeted_tab_binding() {
     let desired = custom_layouts::bindings(TEST_PLUGIN_ID);
     let parsed = Config::from_kdl(
@@ -887,6 +1014,19 @@ fn example_layout() -> CustomLayout {
         width: Some(3),
         height: Some(2),
         commands: CommandGrid::Flat(command_names()),
+    }
+}
+
+fn rows_layout(id: &str, rows: &[&[&str]]) -> CustomLayout {
+    CustomLayout {
+        id: id.to_string(),
+        width: None,
+        height: None,
+        commands: CommandGrid::Rows(
+            rows.iter()
+                .map(|row| row.iter().map(|command| command.to_string()).collect())
+                .collect(),
+        ),
     }
 }
 

@@ -196,20 +196,12 @@ impl CustomLayout {
         Ok(())
     }
 
-    /// Build a complete tab with the source tab's bars and the configured
-    /// command grid. Explicit plugin-created layouts do not inherit the
-    /// session's default tab template, so every bar the new tab should keep --
-    /// Zellaude's own and Zellij's status bar below the grid -- has to be
-    /// written into the layout, along with the caller's plugin URL and
-    /// complete configuration.
-    ///
-    /// A flat command array is mapped left-to-right, top-to-bottom. Columns
-    /// are the first-level grid children and each column owns its rows,
-    /// producing equal column widths while `row * width + column` assigns
-    /// each command to its visual reading-order position. Nested command rows
-    /// are emitted rows-first instead: each inner array becomes one row of
-    /// equal-width panes, so rows may hold different pane counts and no
-    /// filler cells exist.
+    /// The single-tab form of `tabs_to_kdl`, which the tests exercise; the
+    /// plugin itself always emits through `tabs_to_kdl`. `cfg(test)` keeps it
+    /// out of the shipped wasm; `allow(dead_code)` covers the `src/main.rs`
+    /// `--test` build, which compiles this module but calls it from nowhere.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn to_kdl(
         &self,
         plugin_location: &str,
@@ -217,20 +209,48 @@ impl CustomLayout {
         cwd: Option<&str>,
         chrome: &TabChrome,
     ) -> Result<String, String> {
-        self.validate()?;
-        if plugin_location.is_empty() {
-            return Err("Zellaude plugin location is unavailable".to_string());
-        }
+        tabs_to_kdl(
+            std::slice::from_ref(self),
+            plugin_location,
+            plugin_configuration,
+            cwd,
+            chrome,
+        )
+    }
+}
 
-        // The pane manifest may not describe this instance yet, and a tab
-        // without the Zellaude bar is not worth generating.
-        let mut top = chrome.top.clone();
-        if !top.iter().any(|location| location == plugin_location) {
-            top.insert(0, plugin_location.to_string());
-        }
+/// Build one layout document opening `tabs` in order, each repeating the
+/// source tab's bars around its own command grid. Explicit plugin-created
+/// layouts do not inherit the session's default tab template, so every bar the
+/// new tabs should keep -- Zellaude's own and Zellij's status bar below the
+/// grid -- has to be written into the layout, along with the caller's plugin
+/// URL and complete configuration.
+///
+/// Only the first tab is focused: Zellij rejects a document with two.
+pub fn tabs_to_kdl(
+    tabs: &[CustomLayout],
+    plugin_location: &str,
+    plugin_configuration: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+    chrome: &TabChrome,
+) -> Result<String, String> {
+    if tabs.is_empty() {
+        return Err("no custom state tabs to open".to_string());
+    }
+    for tab in tabs {
+        tab.validate()?;
+    }
+    if plugin_location.is_empty() {
+        return Err("Zellaude plugin location is unavailable".to_string());
+    }
 
-        let mut kdl = String::from("layout {\n");
-        let _ = write!(kdl, "    tab name={} focus=true", kdl_string(&self.id));
+    let top = chrome.top_with_own_bar(plugin_location);
+    let mut kdl = String::from("layout {\n");
+    for (index, tab) in tabs.iter().enumerate() {
+        let _ = write!(kdl, "    tab name={}", kdl_string(&tab.id));
+        if index == 0 {
+            kdl.push_str(" focus=true");
+        }
         if let Some(cwd) = cwd {
             let _ = write!(kdl, " cwd={}", kdl_string(cwd));
         }
@@ -238,51 +258,63 @@ impl CustomLayout {
         for location in &top {
             write_bar(&mut kdl, location, plugin_location, plugin_configuration);
         }
-        match &self.commands {
-            CommandGrid::Flat(commands) => {
-                let (Some(width), Some(height)) = (self.width, self.height) else {
-                    return Err(format!(
-                        "custom state {:?} must set width and height for a flat command list",
-                        self.id
-                    ));
-                };
-                kdl.push_str("        pane split_direction=\"vertical\" {\n");
-                for column in 0..width {
-                    kdl.push_str("            pane split_direction=\"horizontal\" {\n");
-                    for row in 0..height {
-                        let command_index = row * width + column;
-                        if let Some(command) = commands.get(command_index) {
-                            write_command_pane(&mut kdl, command, command_index == 0);
-                        } else {
-                            // Keep a rectangular grid for balanced non-factor counts
-                            // (eg. seven commands in a 4x2 grid). Unfilled cells are
-                            // ordinary shell panes and naturally land at bottom-right
-                            // because command indices use visual reading order.
-                            kdl.push_str("                pane\n");
-                        }
-                    }
-                    kdl.push_str("            }\n");
-                }
-                kdl.push_str("        }\n");
-            }
-            CommandGrid::Rows(rows) => {
-                kdl.push_str("        pane split_direction=\"horizontal\" {\n");
-                for (row_index, row) in rows.iter().enumerate() {
-                    kdl.push_str("            pane split_direction=\"vertical\" {\n");
-                    for (column_index, command) in row.iter().enumerate() {
-                        write_command_pane(&mut kdl, command, row_index == 0 && column_index == 0);
-                    }
-                    kdl.push_str("            }\n");
-                }
-                kdl.push_str("        }\n");
-            }
-        }
+        write_command_grid(&mut kdl, tab)?;
         for location in &chrome.bottom {
             write_bar(&mut kdl, location, plugin_location, plugin_configuration);
         }
-        kdl.push_str("    }\n}\n");
-        Ok(kdl)
+        kdl.push_str("    }\n");
     }
+    kdl.push_str("}\n");
+    Ok(kdl)
+}
+
+/// A flat command array is mapped left-to-right, top-to-bottom. Columns are
+/// the first-level grid children and each column owns its rows, producing
+/// equal column widths while `row * width + column` assigns each command to
+/// its visual reading-order position. Nested command rows are emitted
+/// rows-first instead: each inner array becomes one row of equal-width panes,
+/// so rows may hold different pane counts and no filler cells exist.
+fn write_command_grid(kdl: &mut String, tab: &CustomLayout) -> Result<(), String> {
+    match &tab.commands {
+        CommandGrid::Flat(commands) => {
+            let (Some(width), Some(height)) = (tab.width, tab.height) else {
+                return Err(format!(
+                    "custom state {:?} must set width and height for a flat command list",
+                    tab.id
+                ));
+            };
+            kdl.push_str("        pane split_direction=\"vertical\" {\n");
+            for column in 0..width {
+                kdl.push_str("            pane split_direction=\"horizontal\" {\n");
+                for row in 0..height {
+                    let command_index = row * width + column;
+                    if let Some(command) = commands.get(command_index) {
+                        write_command_pane(kdl, command, command_index == 0);
+                    } else {
+                        // Keep a rectangular grid for balanced non-factor counts
+                        // (eg. seven commands in a 4x2 grid). Unfilled cells are
+                        // ordinary shell panes and naturally land at bottom-right
+                        // because command indices use visual reading order.
+                        kdl.push_str("                pane\n");
+                    }
+                }
+                kdl.push_str("            }\n");
+            }
+            kdl.push_str("        }\n");
+        }
+        CommandGrid::Rows(rows) => {
+            kdl.push_str("        pane split_direction=\"horizontal\" {\n");
+            for (row_index, row) in rows.iter().enumerate() {
+                kdl.push_str("            pane split_direction=\"vertical\" {\n");
+                for (column_index, command) in row.iter().enumerate() {
+                    write_command_pane(kdl, command, row_index == 0 && column_index == 0);
+                }
+                kdl.push_str("            }\n");
+            }
+            kdl.push_str("        }\n");
+        }
+    }
+    Ok(())
 }
 
 /// The one-row plugin panes that frame a tab: Zellaude's bar above the
@@ -292,6 +324,25 @@ impl CustomLayout {
 pub struct TabChrome {
     pub top: Vec<String>,
     pub bottom: Vec<String>,
+}
+
+impl TabChrome {
+    /// Rows a generated tab spends on bars -- one per bar -- and so cannot
+    /// give to its command grid.
+    pub fn bar_rows(&self, plugin_location: &str) -> usize {
+        self.top_with_own_bar(plugin_location).len() + self.bottom.len()
+    }
+
+    /// The pane manifest may not describe this instance yet, and a tab without
+    /// the Zellaude bar is not worth generating, so its own bar leads when the
+    /// manifest lacks it.
+    fn top_with_own_bar(&self, plugin_location: &str) -> Vec<String> {
+        let mut top = self.top.clone();
+        if !top.iter().any(|location| location == plugin_location) {
+            top.insert(0, plugin_location.to_string());
+        }
+        top
+    }
 }
 
 /// Read the bars of the tab a custom state is opened from, so the generated
@@ -467,6 +518,9 @@ pub struct Prompt {
     pub error: Option<String>,
     pub return_pane_id: u32,
     pub cwd: Option<String>,
+    /// Every submitted input: Enter records it here and reloads, and the
+    /// reload's result opens it.
+    pub pending_submit: Option<String>,
     focus_acquired: bool,
     focus_requested_ms: Option<u64>,
 }
@@ -479,6 +533,7 @@ impl Prompt {
             error: None,
             return_pane_id,
             cwd,
+            pending_submit: None,
             focus_acquired: false,
             focus_requested_ms: None,
         }

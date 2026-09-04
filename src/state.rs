@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zellij_tile::prelude::*;
 
-use crate::{custom_layouts, manifest, session_templates, split_three};
+use crate::{custom_layouts, layout_generators, manifest, session_templates, split_three};
 
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -236,6 +236,10 @@ pub struct State {
     pub custom_layouts_from_plugin_configuration: bool,
     pub custom_layout_config_error: Option<String>,
     pub custom_layout_prompt: Option<custom_layouts::Prompt>,
+    pub layout_generators: Vec<layout_generators::LayoutGenerator>,
+    pub layout_generator_config_error: Option<String>,
+    /// Floors from zellaude.json, under every generator file's own floors.
+    pub pane_floor_overrides: layout_generators::FloorOverrides,
     /// `None` until the settings file has been read; `Some` afterwards, even
     /// when the key is absent, so the built-in still compiles.
     pub session_templates: Option<Vec<session_templates::SessionTemplate>>,

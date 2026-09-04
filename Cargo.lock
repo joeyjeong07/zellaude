@@ -2723,6 +2723,7 @@ dependencies = [
 name = "zellaude"
 version = "0.5.9"
 dependencies = [
+ "kdl",
  "serde",
  "serde_json",
  "unicode-width",
