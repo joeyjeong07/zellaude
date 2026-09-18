@@ -156,10 +156,16 @@ pub struct LayoutGenerator {
     pub command: String,
     /// File basename, so every refusal names the file that caused it.
     pub source: String,
-    args: Vec<String>,
+    args: Vec<ArgDeclaration>,
     flags: Vec<FlagDeclaration>,
     floors: FloorOverrides,
     body: Vec<TabNode>,
+}
+
+#[derive(Debug)]
+struct ArgDeclaration {
+    name: String,
+    kind: ValueKind,
 }
 
 #[derive(Debug)]
@@ -173,10 +179,50 @@ struct FlagDeclaration {
 #[derive(Debug)]
 struct FlagValue {
     variable: String,
-    /// `--flag` may stand alone; `default` then supplies the integer.
+    kind: ValueKind,
+    /// `--flag` may stand alone; `default` then supplies the value.
     optional: bool,
     /// Absent means the flag itself is required on the prompt line.
-    default: Option<i64>,
+    default: Option<BoundValue>,
+}
+
+/// What a positional or a flag value parses as on the prompt line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueKind {
+    Integer,
+    Text,
+}
+
+impl ValueKind {
+    fn variable_kind(self) -> VariableKind {
+        match self {
+            Self::Integer => VariableKind::Integer,
+            Self::Text => VariableKind::Text,
+        }
+    }
+
+    /// A string takes any token that is not a flag, so `-1` and `42` bind as
+    /// text when text is what was declared.
+    fn parse_token(self, token: &str) -> Option<BoundValue> {
+        match self {
+            Self::Integer => token.parse().ok().map(BoundValue::Integer),
+            Self::Text => (!token.starts_with("--")).then(|| BoundValue::Text(token.to_string())),
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Integer => "an integer",
+            Self::Text => "a string",
+        }
+    }
+}
+
+/// One bound value: what `{name}` substitutes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoundValue {
+    Integer(i64),
+    Text(String),
 }
 
 /// A node in tab position: the top level, or inside an `each` rooted there.
@@ -253,7 +299,8 @@ enum Sign {
 enum VariableKind {
     Integer,
     Presence,
-    /// The built-in `tab` -- the only string, and never an operand.
+    /// The built-in `tab` and every `type="string"` declaration: substituted
+    /// in templates, never an operand.
     Text,
 }
 
@@ -319,28 +366,50 @@ pub fn parse_generator_files(files: &[GeneratorFile]) -> Result<Vec<LayoutGenera
 /// refuses, and the parser already refused a duplicate declaration.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Bindings {
-    integers: Vec<(String, i64)>,
+    values: Vec<(String, BoundValue)>,
     presences: Vec<String>,
 }
 
 impl Bindings {
     pub(crate) fn integer(&self, name: &str) -> Option<i64> {
-        self.integers
-            .iter()
-            .find(|(bound, _)| bound == name)
-            .map(|(_, value)| *value)
+        match self.value(name)? {
+            BoundValue::Integer(value) => Some(*value),
+            BoundValue::Text(_) => None,
+        }
+    }
+
+    /// Inspected by the binding tests; the plugin reads strings only through
+    /// `render`. `allow(dead_code)` covers the `src/main.rs` `--test` build.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn text(&self, name: &str) -> Option<&str> {
+        match self.value(name)? {
+            BoundValue::Text(text) => Some(text),
+            BoundValue::Integer(_) => None,
+        }
     }
 
     pub(crate) fn is_present(&self, name: &str) -> bool {
         self.presences.iter().any(|bound| bound == name)
     }
 
+    fn value(&self, name: &str) -> Option<&BoundValue> {
+        self.values
+            .iter()
+            .find(|(bound, _)| bound == name)
+            .map(|(_, value)| value)
+    }
+
+    fn bind(&mut self, name: &str, value: BoundValue) {
+        self.values.push((name.to_string(), value));
+    }
+
     fn bind_loop(&mut self, name: &str, value: i64) {
-        self.integers.push((name.to_string(), value));
+        self.bind(name, BoundValue::Integer(value));
     }
 
     fn unbind_loop(&mut self) {
-        self.integers.pop();
+        self.values.pop();
     }
 }
 
@@ -370,12 +439,12 @@ impl LayoutGenerator {
     /// flags in any order, defaults for whatever the line left out.
     pub(crate) fn bind_arguments(&self, tokens: &[&str]) -> Result<Bindings, String> {
         let mut bindings = Bindings::default();
-        let mut positionals: Vec<(&str, i64)> = Vec::new();
+        let mut positionals: Vec<&str> = Vec::new();
         let mut index = 0;
         while let Some(token) = tokens.get(index) {
             index += 1;
             let Some(name) = token.strip_prefix("--") else {
-                positionals.push((token, parse_integer_token(token)?));
+                positionals.push(token);
                 continue;
             };
             let flag = self
@@ -388,40 +457,43 @@ impl LayoutGenerator {
             }
             bindings.presences.push(flag.presence.clone());
             let Some(value) = &flag.value else { continue };
-            match tokens.get(index).and_then(|token| token.parse::<i64>().ok()) {
-                Some(number) => {
-                    bindings.integers.push((value.variable.clone(), number));
+            let noun = value.kind.noun();
+            match tokens.get(index).and_then(|token| value.kind.parse_token(token)) {
+                Some(parsed) => {
+                    bindings.bind(&value.variable, parsed);
                     index += 1;
                 }
                 None if value.optional => {}
                 None => {
                     return Err(match tokens.get(index) {
-                        Some(token) => {
-                            format!("flag --{name} needs an integer value, got {token:?}")
-                        }
-                        None => format!("flag --{name} needs an integer value"),
+                        Some(token) => format!("flag --{name} needs {noun} value, got {token:?}"),
+                        None => format!("flag --{name} needs {noun} value"),
                     })
                 }
             }
         }
 
-        for (position, name) in self.args.iter().enumerate() {
-            let Some((_, value)) = positionals.get(position) else {
-                return Err(format!("missing argument {name:?}"));
+        for (position, arg) in self.args.iter().enumerate() {
+            let Some(token) = positionals.get(position) else {
+                return Err(format!("missing argument {:?}", arg.name));
             };
-            bindings.integers.push((name.clone(), *value));
+            let parsed = arg
+                .kind
+                .parse_token(token)
+                .ok_or_else(|| format!("argument {token:?} must be {}", arg.kind.noun()))?;
+            bindings.bind(&arg.name, parsed);
         }
-        if let Some((token, _)) = positionals.get(self.args.len()) {
+        if let Some(token) = positionals.get(self.args.len()) {
             return Err(format!("unexpected argument {token:?}"));
         }
 
         for flag in &self.flags {
             let Some(value) = &flag.value else { continue };
-            if bindings.integer(&value.variable).is_some() {
+            if bindings.value(&value.variable).is_some() {
                 continue;
             }
-            match value.default {
-                Some(default) => bindings.integers.push((value.variable.clone(), default)),
+            match &value.default {
+                Some(default) => bindings.bind(&value.variable, default.clone()),
                 None => return Err(format!("missing required flag --{}", flag.flag)),
             }
         }
@@ -451,12 +523,14 @@ struct EmittedTab {
     commands: Vec<String>,
 }
 
-/// How `{tab}` renders in each position. A tab name is not shell, so it takes
-/// the source name raw; a command is, so it takes it single-quoted and can
-/// never be re-parsed by `sh -lc` however the tab was named.
-struct SourceTabText {
-    raw: String,
-    quoted: String,
+/// Where a template renders, which decides how a string goes in. A tab name is
+/// not shell, so it takes the string raw; a command is, so it takes it
+/// single-quoted, and nothing typed on the prompt line or held in a tab name
+/// can be re-parsed by `sh -lc`.
+#[derive(Clone, Copy)]
+enum TemplateTarget {
+    TabName,
+    ShellCommand,
 }
 
 impl LayoutGenerator {
@@ -467,12 +541,9 @@ impl LayoutGenerator {
         global_floors: FloorOverrides,
     ) -> Result<Vec<CustomLayout>, String> {
         let mut bindings = self.bind_arguments(tokens)?;
-        let source_text = SourceTabText {
-            raw: source.name.clone(),
-            quoted: shell_quote(&source.name),
-        };
+        bindings.bind(SOURCE_TAB_VARIABLE, BoundValue::Text(source.name.clone()));
         let mut tabs = Vec::new();
-        expand_tabs(&self.body, &mut bindings, &source_text, &mut tabs)?;
+        expand_tabs(&self.body, &mut bindings, &source.name, &mut tabs)?;
         if tabs.is_empty() {
             return Err("this invocation opens no tabs".to_string());
         }
@@ -486,7 +557,7 @@ impl LayoutGenerator {
 fn expand_tabs(
     nodes: &[TabNode],
     bindings: &mut Bindings,
-    source: &SourceTabText,
+    source_name: &str,
     tabs: &mut Vec<EmittedTab>,
 ) -> Result<(), String> {
     for node in nodes {
@@ -500,12 +571,12 @@ fn expand_tabs(
                     continue;
                 }
                 let name = match name {
-                    Some(pieces) => render(pieces, bindings, &source.raw)?,
-                    None => format!("{}-{}", source.raw, tabs.len() + 1),
+                    Some(pieces) => render(pieces, bindings, TemplateTarget::TabName)?,
+                    None => format!("{source_name}-{}", tabs.len() + 1),
                 };
                 validate_tab_name(&name)?;
                 let mut commands = Vec::new();
-                expand_panes(body, bindings, source, &name, &mut commands)?;
+                expand_panes(body, bindings, &name, &mut commands)?;
                 if commands.is_empty() {
                     return Err(format!("tab {name:?} has no panes"));
                 }
@@ -527,7 +598,7 @@ fn expand_tabs(
                 }
                 for value in evaluate_range(range, bindings)? {
                     bindings.bind_loop(variable, value);
-                    let expanded = expand_tabs(body, bindings, source, tabs);
+                    let expanded = expand_tabs(body, bindings, source_name, tabs);
                     bindings.unbind_loop();
                     expanded?;
                 }
@@ -540,7 +611,6 @@ fn expand_tabs(
 fn expand_panes(
     nodes: &[PaneNode],
     bindings: &mut Bindings,
-    source: &SourceTabText,
     tab: &str,
     commands: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -548,7 +618,7 @@ fn expand_panes(
         match node {
             PaneNode::Pane { command, condition } => {
                 if condition.holds(bindings) {
-                    commands.push(render(command, bindings, &source.quoted)?);
+                    commands.push(render(command, bindings, TemplateTarget::ShellCommand)?);
                     if commands.len() > MAX_PANES {
                         return Err(format!(
                             "tab {tab:?} opens more than {MAX_PANES} panes"
@@ -567,7 +637,7 @@ fn expand_panes(
                 }
                 for value in evaluate_range(range, bindings)? {
                     bindings.bind_loop(variable, value);
-                    let expanded = expand_panes(body, bindings, source, tab, commands);
+                    let expanded = expand_panes(body, bindings, tab, commands);
                     bindings.unbind_loop();
                     expanded?;
                 }
@@ -623,21 +693,22 @@ fn evaluate_term(term: &Term, bindings: &Bindings) -> Result<i64, String> {
 fn render(
     pieces: &[TemplatePiece],
     bindings: &Bindings,
-    source_tab: &str,
+    target: TemplateTarget,
 ) -> Result<String, String> {
     let mut rendered = String::new();
     for piece in pieces {
         match piece {
             TemplatePiece::Literal(text) => rendered.push_str(text),
-            TemplatePiece::Variable(name) if name == SOURCE_TAB_VARIABLE => {
-                rendered.push_str(source_tab)
-            }
-            TemplatePiece::Variable(name) => {
-                let value = bindings
-                    .integer(name)
-                    .ok_or_else(|| format!("variable {name:?} is not bound"))?;
-                let _ = write!(rendered, "{value}");
-            }
+            TemplatePiece::Variable(name) => match bindings.value(name) {
+                Some(BoundValue::Integer(value)) => {
+                    let _ = write!(rendered, "{value}");
+                }
+                Some(BoundValue::Text(text)) => match target {
+                    TemplateTarget::TabName => rendered.push_str(text),
+                    TemplateTarget::ShellCommand => rendered.push_str(&shell_quote(text)),
+                },
+                None => return Err(format!("variable {name:?} is not bound")),
+            },
         }
     }
     Ok(rendered)
@@ -649,7 +720,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Judge a resolved name here, so a hostile or oversized `{tab}` refuses in the
+/// Judge a resolved name here, so a hostile or oversized string refuses in the
 /// generator's voice rather than as a custom-state id further down.
 fn validate_tab_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
@@ -726,12 +797,6 @@ fn build_layout(
     Ok(layout)
 }
 
-fn parse_integer_token(token: &str) -> Result<i64, String> {
-    token
-        .parse::<i64>()
-        .map_err(|_| format!("argument {token:?} must be an integer"))
-}
-
 fn parse_generator(content: &str, source: &str) -> Result<LayoutGenerator, String> {
     let document = content
         .parse::<KdlDocument>()
@@ -773,7 +838,7 @@ fn parse_generator(content: &str, source: &str) -> Result<LayoutGenerator, Strin
 #[derive(Debug)]
 struct Declarations {
     command: Option<String>,
-    args: Vec<String>,
+    args: Vec<ArgDeclaration>,
     flags: Vec<FlagDeclaration>,
     floors: FloorOverrides,
     scope: Scope,
@@ -806,8 +871,12 @@ impl Declarations {
             }
             Declaration::Arg => {
                 let name = single_string_argument(node)?;
-                self.scope.declare(name, VariableKind::Integer)?;
-                self.args.push(name.to_string());
+                let kind = parse_value_kind(node)?;
+                self.scope.declare(name, kind.variable_kind())?;
+                self.args.push(ArgDeclaration {
+                    name: name.to_string(),
+                    kind,
+                });
             }
             Declaration::Flag => self.declare_flag(node)?,
             Declaration::MinPaneWidth => set_floor(&mut self.floors.min_pane_width, node)?,
@@ -823,7 +892,8 @@ impl Declarations {
         let presence = flag.replace('-', "_");
         self.scope.declare(&presence, VariableKind::Presence)?;
         if let Some(value) = &value {
-            self.scope.declare(&value.variable, VariableKind::Integer)?;
+            self.scope
+                .declare(&value.variable, value.kind.variable_kind())?;
         }
         self.flags.push(FlagDeclaration {
             flag: flag.to_string(),
@@ -834,16 +904,36 @@ impl Declarations {
     }
 }
 
+/// The `type` property of an arg or flag; integer when absent.
+fn parse_value_kind(node: &KdlNode) -> Result<ValueKind, String> {
+    match property_string(node, "type")? {
+        None | Some("integer") => Ok(ValueKind::Integer),
+        Some("string") => Ok(ValueKind::Text),
+        Some(_) => Err("property \"type\" must be \"integer\" or \"string\"".to_string()),
+    }
+}
+
+fn parse_default(node: &KdlNode, kind: ValueKind) -> Result<Option<BoundValue>, String> {
+    Ok(match kind {
+        ValueKind::Integer => property_integer(node, "default")?.map(BoundValue::Integer),
+        ValueKind::Text => {
+            property_string(node, "default")?.map(|text| BoundValue::Text(text.to_string()))
+        }
+    })
+}
+
 fn parse_flag_value(node: &KdlNode, flag: &str) -> Result<Option<FlagValue>, String> {
     let required_value = property_string(node, "value")?;
     let optional_value = property_string(node, "optional-value")?;
-    let default = property_integer(node, "default")?;
+    let kind = parse_value_kind(node)?;
+    let default = parse_default(node, kind)?;
     match (required_value, optional_value) {
         (Some(_), Some(_)) => Err(format!(
             "flag {flag:?} sets both value and optional-value"
         )),
         (Some(variable), None) => Ok(Some(FlagValue {
             variable: variable.to_string(),
+            kind,
             optional: false,
             default,
         })),
@@ -856,12 +946,16 @@ fn parse_flag_value(node: &KdlNode, flag: &str) -> Result<Option<FlagValue>, Str
             }
             Ok(Some(FlagValue {
                 variable: variable.to_string(),
+                kind,
                 optional: true,
                 default,
             }))
         }
         (None, None) if default.is_some() => {
             Err(format!("flag {flag:?} sets a default without a value"))
+        }
+        (None, None) if node.get("type").is_some() => {
+            Err(format!("flag {flag:?} sets a type without a value"))
         }
         (None, None) => Ok(None),
     }
@@ -1057,7 +1151,7 @@ fn parse_term(raw: &str, scope: &Scope) -> Result<Term, String> {
 }
 
 /// Split a name or command into literals and substitutions. Only a brace group
-/// naming a declared integer or `tab` substitutes, so shell syntax such as
+/// naming an integer or string variable substitutes, so shell syntax such as
 /// `${HOME}` and `{a,b}` survives verbatim.
 fn parse_template(raw: &str, scope: &Scope) -> Result<Vec<TemplatePiece>, String> {
     let mut pieces = Vec::new();
@@ -1124,7 +1218,8 @@ fn validate_flag_name(flag: &str) -> Result<(), String> {
 
 fn allowed_properties(node_name: &str) -> &'static [&'static str] {
     match node_name {
-        "flag" => &["value", "optional-value", "default"],
+        "arg" => &["type"],
+        "flag" => &["value", "optional-value", "default", "type"],
         "tab" | "pane" => &["if", "unless"],
         "each" => &["for", "in", "if", "unless"],
         _ => &[],

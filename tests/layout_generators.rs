@@ -50,6 +50,22 @@ tab if="single_tab" {
 }
 "#;
 
+/// Every string shape: a positional, a `value` flag with a default and an
+/// `optional-value` flag, used in a tab name and in a command.
+pub const STRING_GENERATOR: &str = r#"
+command "g"
+arg "feature" type="string"
+arg "n" type="integer"
+flag "branch" value="b" type="string" default="main"
+flag "model" optional-value="model_name" type="string" default="opus"
+
+tab "{tab}-{feature}" {
+    each for="i" in="1..=n" {
+        pane "claude -n {feature}{i} '/madev-impl {feature}{i} {b}' --model {model_name}"
+    }
+}
+"#;
+
 fn file(path: &str, content: &str) -> GeneratorFile {
     GeneratorFile {
         path: path.to_string(),
@@ -190,6 +206,52 @@ fn refuses_an_optional_value_flag_without_a_default() {
             .contains("both value and optional-value")
     );
     assert!(refusal("command \"c\"\nflag \"a\" default=1\n").contains("default without a value"));
+}
+
+#[test]
+fn accepts_string_args_and_flag_values() {
+    assert_eq!(parse_one(STRING_GENERATOR).command, "g");
+}
+
+#[test]
+fn refuses_a_malformed_type() {
+    assert_eq!(
+        refusal("command \"c\"\narg \"a\" type=\"float\"\n"),
+        "impl.kdl: property \"type\" must be \"integer\" or \"string\""
+    );
+    assert_eq!(
+        refusal("command \"c\"\narg \"a\" type=1\n"),
+        "impl.kdl: property \"type\" must be a string"
+    );
+    assert_eq!(
+        refusal("command \"c\"\nflag \"solo\" type=\"string\"\n"),
+        "impl.kdl: flag \"solo\" sets a type without a value"
+    );
+}
+
+#[test]
+fn refuses_a_default_of_the_wrong_type() {
+    assert_eq!(
+        refusal("command \"c\"\nflag \"b\" value=\"b\" type=\"string\" default=1\n"),
+        "impl.kdl: property \"default\" must be a string"
+    );
+    assert_eq!(
+        refusal("command \"c\"\nflag \"m\" value=\"m\" default=\"x\"\n"),
+        "impl.kdl: property \"default\" must be an integer"
+    );
+}
+
+#[test]
+fn refuses_a_string_in_a_range_or_a_condition() {
+    let declared = "command \"c\"\narg \"s\" type=\"string\"\n";
+    assert!(
+        refusal(&format!("{declared}tab if=\"s\" {{ pane \"a\"; }}\n"))
+            .contains("variable \"s\" in if is not a flag presence")
+    );
+    assert!(refusal(&format!(
+        "{declared}each for=\"i\" in=\"1..s\" {{ tab {{ pane \"a\"; }}; }}\n"
+    ))
+    .contains("range bound \"s\" is not an integer variable"));
 }
 
 #[test]
@@ -457,6 +519,52 @@ fn refuses_a_non_integer_missing_or_leftover_positional() {
     assert_eq!(madev_refusal("impl 4 5"), "unexpected argument \"5\"");
 }
 
+fn string_bindings(line: &str) -> Bindings {
+    bind(STRING_GENERATOR, line).unwrap_or_else(|error| panic!("{line:?} refused: {error}"))
+}
+
+#[test]
+fn binds_string_positionals_and_flag_values_as_whole_tokens() {
+    let given = string_bindings("g auth 2 --branch dev");
+    assert_eq!(given.text("feature"), Some("auth"));
+    assert_eq!(given.text("b"), Some("dev"));
+    assert_eq!(given.integer("n"), Some(2));
+
+    // A string takes any token that is not a flag, digits and dashes included.
+    let odd = string_bindings("g -1 2");
+    assert_eq!(odd.text("feature"), Some("-1"));
+    assert_eq!(odd.text("b"), Some("main"));
+}
+
+#[test]
+fn takes_an_optional_string_value_unless_a_flag_follows() {
+    assert_eq!(
+        string_bindings("g auth 2 --model sonnet").text("model_name"),
+        Some("sonnet")
+    );
+    for line in ["g auth 2 --model", "g auth 2 --model --branch dev"] {
+        let bindings = string_bindings(line);
+        assert_eq!(bindings.text("model_name"), Some("opus"), "{line}");
+        assert!(bindings.is_present("model"), "{line}");
+    }
+    // Unlike an integer flag, a string flag swallows a following positional.
+    assert_eq!(
+        bind(STRING_GENERATOR, "g auth --model 2").unwrap_err(),
+        "missing argument \"n\""
+    );
+}
+
+#[test]
+fn refuses_a_missing_string_flag_value() {
+    assert_eq!(
+        bind(STRING_GENERATOR, "g auth 2 --branch").unwrap_err(),
+        "flag --branch needs a string value"
+    );
+    assert_eq!(
+        bind(STRING_GENERATOR, "g auth 2 --branch --model").unwrap_err(),
+        "flag --branch needs a string value, got \"--model\""
+    );
+}
 
 /// A tab big enough for 64 panes under the default floors: 17 columns fit, so
 /// four rows of 13 content rows each clear the 12-row floor.
@@ -567,6 +675,37 @@ fn substitutes_declared_names_and_leaves_other_braces_alone() {
     let content = "command \"g\"\narg \"n\"\ntab \"t\" {\n each for=\"i\" in=\"1..=n\" {\n pane \"run {i} ${HOME}/{a,b} {nope}\"\n }\n}\n";
     let layouts = open(content, "g 1", &source("src")).unwrap();
     assert_eq!(commands(&layouts[0]), ["run 1 ${HOME}/{a,b} {nope}"]);
+}
+
+#[test]
+fn renders_strings_raw_in_tab_names_and_single_quoted_in_commands() {
+    let layouts = open(STRING_GENERATOR, "g auth 2 --model", &source("src")).unwrap();
+    assert_eq!(names(&layouts), ["src-auth"]);
+    assert_eq!(
+        commands(&layouts[0]),
+        [
+            "claude -n 'auth'1 '/madev-impl 'auth'1 'main'' --model 'opus'",
+            "claude -n 'auth'2 '/madev-impl 'auth'2 'main'' --model 'opus'",
+        ]
+    );
+}
+
+#[test]
+fn a_hostile_string_cannot_leave_its_shell_word() {
+    let content = "command \"g\"\narg \"s\" type=\"string\"\ntab \"t\" {\n pane \"echo {s}\"\n}\n";
+    let layouts = open(content, "g ';rm${HOME}'$(id)", &source("src")).unwrap();
+    assert_eq!(commands(&layouts[0]), ["echo ''\\'';rm${HOME}'\\''$(id)'"]);
+}
+
+#[test]
+fn judges_a_string_in_a_tab_name_as_it_judges_the_source_tab() {
+    let content = "command \"g\"\narg \"s\" type=\"string\"\ntab \"{s}\" {\n pane \"p\"\n}\n";
+    let long = format!("g {}", "x".repeat(200));
+    let refusal = open(content, &long, &source("src")).unwrap_err();
+    assert!(refusal.starts_with("impl.kdl: tab name"), "{refusal}");
+    assert!(refusal.contains("exceeds"), "{refusal}");
+    let control = open(content, "g a\u{1}b", &source("src")).unwrap_err();
+    assert!(control.contains("control characters"), "{control}");
 }
 
 #[test]

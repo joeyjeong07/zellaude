@@ -165,12 +165,14 @@ Declarations come first, before any `tab`, `pane` or `each`:
 | --- | --- |
 | `command "impl"` | the first word of the prompt line; unique across files |
 | `arg "n"` | a positional integer, required, in declaration order |
+| `arg "feature" type="string"` | a positional string: one whitespace-free word, required, in declaration order |
 | `flag "crit-per-impl" value="m" default=1` | `--crit-per-impl <int>`, bound to `m`. `default` supplies the value when the flag is absent; a `value` flag without a `default` is required on the line |
 | `flag "single-tab"` | a flag that carries no value |
 | `flag "only-crit" optional-value="from" default=1` | `--only-crit [<int>]`: the value may be left off and `default` then supplies it. `optional-value` without a `default` is an error, since the bare form would leave `from` unbound |
+| `flag "branch" value="b" type="string" default="main"` | `--branch <word>`, bound to `b` as a string. `type` is `integer` unless set, and `default` must match it |
 | `min_pane_width 54`, `min_pane_height 12` | this file's minimum pane size, in content cells |
 
-Every flag also declares a **presence** variable named after it, with `-` replaced by `_`, so `single-tab` gives `single_tab`. Presences are what `if` and `unless` test. Integers — positionals, flag values and `each` variables — are what `{…}` substitutes and what ranges count over. Using either kind in the other's place is an error, as is naming anything twice.
+Every flag also declares a **presence** variable named after it, with `-` replaced by `_`, so `single-tab` gives `single_tab`. Presences are what `if` and `unless` test. Integers — positionals, flag values and `each` variables — are what `{…}` substitutes and what ranges count over. Strings — positionals and flag values declared `type="string"` — substitute like integers but cannot be counted over. Using one kind in another's place is an error, as is naming anything twice.
 
 #### Body
 
@@ -186,7 +188,7 @@ A `tab` that ends up with no panes refuses, and so does a line that opens no tab
 
 `{name}` is replaced for the names a file declares, plus the built-in `{tab}` — the name of the tab the prompt was opened from. **Anything else in braces is left alone**, so `${HOME}` and `{a,b}` reach the shell untouched. That is also the one place the language stays quiet rather than refusing: a misspelt `{crti}` is passed through as text instead of reported.
 
-`{tab}` goes into a tab name raw and into a command single-quoted, so no tab name can change how `sh -lc` parses the command around it. Being a name rather than a number, it belongs only in templates: it cannot be tested by `if` or counted over in a range.
+A string — `{tab}` or a declared one — goes into a tab name raw and into a command single-quoted, so nothing typed on the prompt line or held in a tab name can change how `sh -lc` parses the command around it. With `arg "feature" type="string"`, the line `impl auth` renders `pane "claude -n {feature} '/madev-impl {feature}'"` as `claude -n 'auth' '/madev-impl 'auth''`, and adjacent single-quoted pieces concatenate, so the program receives `auth` and then the one word `/madev-impl auth`. Put a string inside single quotes or none, not double quotes, where the quote marks would reach the program as text. Being text rather than a number, a string belongs only in templates: it cannot be tested by `if` or counted over in a range.
 
 #### Pane size
 
@@ -203,11 +205,11 @@ Zellaude plans each generated tab from the live size of the tab the prompt was o
 
 Two separate limits share the number 64. A single `each` may not run for more than 64 steps, checked before the range runs; and one prompt line may not open more than 64 tabs, checked as each tab is created. Nesting is why both exist: `each` inside `each` multiplies past the first limit, and the second catches the product. A tab still holds at most 64 panes, as a fixed state does. A typo such as `impl 1000000000` therefore costs nothing.
 
-On the line itself, positionals fill in declaration order and may sit among the flags, which may come in any order. An unknown flag, a missing required flag, a missing or non-integer value, a repeated flag, or a leftover argument all refuse. A flag whose value is optional takes the next token whenever it reads as an integer, so write `impl 4 --only-crit`, not `impl --only-crit 4`.
+On the line itself, positionals fill in declaration order and may sit among the flags, which may come in any order. A string is one whitespace-delimited word, since the prompt line has no quoting, and any word not starting with `--` will do. An unknown flag, a missing required flag, a missing value or one of the wrong type, a repeated flag, or a leftover argument all refuse. A flag whose value is optional takes the next token whenever it reads as the declared type — an integer, or for a string any word not starting with `--` — so write `impl 4 --only-crit`, not `impl --only-crit 4`.
 
 Every refusal from a generator names the file it came from, so `madev.kdl: unknown node "pnae"` points at the file to fix. A file that fails to parse holds back the whole set: Zellaude reports the error and keeps the generators from the last successful read, so one broken file never silently drops the others. A line matching no state and no generator refuses on its own, without a file name.
 
-Generator files run their pane commands through `sh -lc`, exactly as custom states do, and are equally trusted local shell code. The file itself contains nothing Zellaude evaluates: every value in it is an integer, a presence, or a tab name.
+Generator files run their pane commands through `sh -lc`, exactly as custom states do, and are equally trusted local shell code. The file itself contains nothing Zellaude evaluates: every value in it is an integer, a string, a presence, or a tab name, and a string from the prompt line reaches the command as one quoted word, whatever it holds.
 
 ### Session templates
 
