@@ -618,7 +618,6 @@ impl ZellijPlugin for State {
                 false
             }
             "zellaude:request" => {
-                // Another instance asking for state — respond with ours
                 if self.holds_shareable_sessions() {
                     self.broadcast_sessions();
                 }
@@ -1823,10 +1822,7 @@ impl State {
         self.manifest_pending_body = None;
     }
 
-    /// Compile every template to `~/.config/zellij/layouts/`. Runs once per
-    /// plugin instance on the active tab, as soon as both the settings file and
-    /// this plugin's own URL are known — the URL only becomes available once a
-    /// pane manifest describing this pane arrives.
+    /// Compile every template to `~/.config/zellij/layouts/` once this plugin's URL is known.
     fn maybe_compile_session_templates(&mut self) {
         if self.attach_work_done
             || self.session_templates_compiled
@@ -1928,8 +1924,7 @@ impl State {
         pipe_message_to_plugin(MessageToPlugin::new(ATTACH_DONE_PIPE));
     }
 
-    /// Only the instance whose tab is visible should spend host calls on
-    /// discovery and the session-wide attach work.
+    /// Only the visible tab's instance spends host calls on discovery and the attach work.
     fn is_on_active_tab(&mut self) -> bool {
         let plugin_id = *self
             .plugin_id
@@ -2868,7 +2863,7 @@ mod tests {
         assert!(state.attach_scan_requested);
     }
 
-    /// The plugin sits in tab 0 beside terminal pane 7; `on_active_tab` picks whether tab 0 is active.
+    /// The plugin sits in tab 0 beside terminal pane 7; `on_active_tab` sets tab 0 active.
     fn attach_ready_state(on_active_tab: bool) -> State {
         let mut manifest = PaneManifest::default();
         manifest.panes.insert(

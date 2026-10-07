@@ -12,8 +12,7 @@ mkdir -p "$TEST_DIR/runtime"
 # without this the developer's own zellaude.json decides what these cases see.
 mkdir -p "$TEST_DIR/home"
 export HOME="$TEST_DIR/home"
-# The fake zellij captures the payload and logs each call to the timeline. With
-# ZELLAUDE_TEST_ZELLIJ_HANGS set it stands in for a session that never answers.
+# Logs each call; with ZELLAUDE_TEST_ZELLIJ_HANGS set it never answers.
 TIMELINE="$TEST_DIR/timeline.log"
 cat > "$TEST_DIR/bin/zellij" <<'FAKE_ZELLIJ'
 #!/usr/bin/env bash
@@ -29,17 +28,12 @@ fi
 FAKE_ZELLIJ
 chmod +x "$TEST_DIR/bin/zellij"
 
-# The hook climbs its process tree for the agent and its launch flags, so every
-# run gets a fixture tree: otherwise the climb reaches whatever runs the suite,
-# such as a `claude --effort xhigh` session.
+# A fixture tree, or the climb reaches whatever runs the suite (a real claude).
 TREE_ROOT="$TEST_DIR/tree"
 mkdir -p "$TREE_ROOT"
 HOOK_PARENT="$TEST_DIR/hook-parent.sh"
 cat > "$HOOK_PARENT" <<'HOOK_PARENT_SCRIPT'
-# Stands in for the process that runs the hook: publishes itself into the tree
-# fixture, when that root exists, and its environ, when given one; then runs the
-# hook as its direct child. Its entries go when it does, as in /proc, so a memo
-# naming it afterwards misses.
+# The hook's parent; its fixture entries go when it does, as in /proc.
 published=()
 if [ -d "$ZELLAUDE_TREE_PROC_ROOT" ]; then
   node="$ZELLAUDE_TREE_PROC_ROOT/$$"
@@ -64,9 +58,7 @@ rm -rf "${published[@]}"
 exit "$hook_status"
 HOOK_PARENT_SCRIPT
 
-# Runs one hook event under HOOK_PARENT, whose comm defaults to bash so no agent
-# is found. NAME=value arguments override the defaults; then comes the command,
-# ending in HOOK_PARENT and its argv. The coalescing window defaults to none.
+# hook_process INPUT [NAME=value]... CMD...; parent comm bash, so no agent.
 hook_process() {
   local input=$1
   shift
@@ -89,9 +81,7 @@ hook_process() {
     "$@"
 }
 
-# Runs "$@" and waits for everything it started, detached deliverers included:
-# they all inherit fd 9, the write end of a pipe cat drains until the last
-# holder exits.
+# Runs "$@" until every process it started, deliverers included, closes fd 9.
 await_descendants() {
   { { "$@" 9>&1 1>&3 3>&-; } | cat; } 3>&1
 }
@@ -544,9 +534,7 @@ jq -e --argjson mode_ts "$LAUNCH_OVERRIDE_MODE_TS" '
 run_inline_settings_flag '{"ultracode":true}' true
 run_inline_settings_flag '{"ultracode":false,"other":true}' false
 
-# The agent is HOOK_PARENT under the client's comm, and publishes its own
-# environ because only it knows the pid find_agent_pid resolves to. An empty
-# fixture publishes nothing, which is how the not-captured path is reached.
+# HOOK_PARENT plays the agent; an empty environ fixture means "not captured".
 LAUNCH_ENV_PROC_ROOT="$TEST_DIR/launch-proc"
 LAUNCH_ENV_ENVIRON="$TEST_DIR/launch-environ"
 LAUNCH_ENV_STDOUT="$TEST_DIR/launch-stdout.json"
@@ -967,9 +955,7 @@ VENDOR_PRETOOLUSE_JSON
 run_hook claude "$(cat "$VENDOR_PRETOOLUSE")" false
 jq -e '.current_effort_level == "high"' "$CAPTURE_FILE" >/dev/null
 
-# Exec counts pin the hook's cost per event. The hook's PATH holds only logging
-# shims, so a command missing from EXEC_SHIM_NAMES logs as MISSING instead of
-# running unseen.
+# The hook's PATH holds only shims: a name not in EXEC_SHIM_NAMES logs MISSING.
 EXEC_SHIM_BIN="$TEST_DIR/exec-shim-bin"
 EXEC_LOG="$TEST_DIR/exec.log"
 EXEC_SHIM_NAMES="awk cat chmod date grep head hostname id jq mkdir mktemp mv od
@@ -995,9 +981,7 @@ command_not_found_handle() {
 }
 EXEC_BASH_ENV
 
-# Runs one event like run_hook_process and prints each exec'd command's count,
-# sorted by name. sleep is left out: the delivery reaper's is exec'd or not
-# depending on how fast the fake zellij answers.
+# Prints "name=count" per exec'd command; sleep is left out, its count races.
 exec_profile() {
   local input=$1
   shift
@@ -1029,8 +1013,7 @@ expect_equal() {
   fi
 }
 
-# Process facts. Under the tree fixture HOOK_PARENT sits below
-# ZELLAUDE_TEST_GRANDPARENT_PID; 4242 and 4343 are fixture-only agents.
+# Process facts: fixture agents 4242 and 4343 serve as HOOK_PARENT's parent.
 plant_process() {
   local pid=$1 comm=$2
   mkdir -p "$TREE_ROOT/$pid"
@@ -1063,8 +1046,7 @@ rm -f "$STATE_FILE"
 run_tree_hook "$TREE_SESSION_START" 4242 ZELLAUDE_TEST_PARENT_COMM='sh (x) y'
 expect_agent_pid "climb through a parent named with parens" 4242
 
-# The record names 4242, so a tool event trusts it over a tree that has moved
-# on; SessionStart never does, because a resume reuses the session id.
+# The memo outranks a moved tree, except on SessionStart: a resume reuses ids.
 run_tree_hook "$TREE_TOOL_EVENT" 4343
 expect_agent_pid "memo hit" 4242
 run_tree_hook "$TREE_SESSION_START" 4343
@@ -1096,8 +1078,7 @@ run_tree_hook \
   4343
 expect_agent_pid "subagent event" 4343
 
-# --inspect runs outside the agent's tree: it never reads the record, nor
-# writes it.
+# --inspect, outside the agent's tree, neither reads nor writes the record.
 cp "$STATE_FILE" "$TEST_DIR/record.before"
 run_hook_process '{"session_id":"tree-root","hook_event_name":"SessionRestore"}' \
   ZELLAUDE_TEST_GRANDPARENT_PID=4343 \
@@ -1112,8 +1093,7 @@ printf 'claude\0--effort\0ultracode\0' > "$TREE_ROOT/4444/cmdline"
 run_tree_hook '{"session_id":"tree-mode","hook_event_name":"SessionStart"}' 4444
 jq -e '.rainbow_name == true and .agent_pid == 4444' "$CAPTURE_FILE" >/dev/null
 
-# The climb is builtins only, so a memo hit and a climb cost the same execs on
-# Linux, and neither runs ps.
+# The Linux climb is builtins only: a memo hit and a climb cost the same execs.
 run_tree_hook "$TREE_SESSION_START" 4242
 LINUX_TOOL_EVENT_EXECS=$(exec_profile "$TREE_TOOL_EVENT" \
   ZELLAUDE_TEST_GRANDPARENT_PID=4343)
@@ -1131,8 +1111,7 @@ LINUX_URGENT_EVENT_EXECS=$(exec_profile "$TREE_SESSION_START" \
 expect_equal "Linux SessionStart execs" \
   "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=2 tr=1 zellij=1" \
   "$LINUX_URGENT_EVENT_EXECS"
-# A subagent event has no state record to write, but its stream marker lives
-# in the same private cache.
+# A subagent writes no state record, but its stream marker is in the cache.
 expect_equal "Linux subagent tool event execs" \
   "hostname=1 jq=2 mv=1 stat=2 tr=1 zellij=1" \
   "$(exec_profile \
@@ -1151,8 +1130,7 @@ jq -e '.launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"' \
 # The plugin orders racing events by ts_ms, so it stays in milliseconds.
 jq -e '(.ts_ms - now * 1000 | fabs) < 60000' "$CAPTURE_FILE" >/dev/null
 
-# /effort is a local command, so the transcript scan runs only at a turn
-# boundary or in attach recovery; mid-turn events resolve from .effort alone.
+# Only turn boundaries and attach recovery scan; mid-turn reads .effort alone.
 claude_ultra_event() {
   jq -nc --arg event "$1" --arg session_id "$2" \
     --arg transcript "$CLAUDE_ULTRA_TRANSCRIPT" '{
@@ -1173,8 +1151,7 @@ for event in SessionStart UserPromptSubmit SessionRestore; do
   expect_equal "$event: tail" 2 "$(exec_count tail)"
 done
 
-# Rainbow off sends null, never false, so the cache keeps what it last saw; and
-# it skips detection outright.
+# Rainbow off skips detection and sends null, never false: the cache keeps true.
 rm -f "$STATE_FILE"
 run_hook claude "$(claude_ultra_event UserPromptSubmit rainbow-off)" true
 write_settings '{"rainbow":false}'
@@ -1188,8 +1165,7 @@ jq -e '.session_id == "rainbow-off" and .rainbow_name == true' \
 run_hook codex \
   '{"session_id":"rainbow-off-codex","hook_event_name":"PreToolUse","reasoning_effort":"ultra"}' \
   null
-# Only a literal false turns it off: absent, true and an unparseable or array
-# settings file all leave detection on.
+# Only a literal false turns it off: any other value or a bad file leaves it on.
 for settings in '{"rainbow":true}' '{"rainbow":"no"}' '{"rainbow":' \
   '[{"id":"claude6","width":3,"height":2,"commands":["claude"]}]'; do
   write_settings "$settings"
@@ -1197,8 +1173,7 @@ for settings in '{"rainbow":true}' '{"rainbow":"no"}' '{"rainbow":' \
 done
 write_settings
 
-# The cache write: one stat per directory for owner and mode, and chmod only
-# when a mode is not already 700.
+# The cache write: one stat per directory, and chmod only when not already 700.
 CACHE_DIR="$TEST_DIR/runtime/zellaude-$(id -u)"
 is_private_dir() {
   [ "$(ls -ld "$1" | cut -c1-10)" = "drwx------" ]
@@ -1210,8 +1185,7 @@ is_private_dir "$CACHE_DIR"
 exec_profile "$TREE_TOOL_EVENT" >/dev/null
 expect_equal "private cache dir: chmod" 0 "$(exec_count chmod)"
 
-# A runtime dir others can write is no home for the cache, so it falls back to
-# ~/.cache, at one stat per level.
+# A group-writable runtime dir falls back to ~/.cache, at one stat per level.
 HOME_STATE_FILE="$HOME/.cache/zellaude/runtime/test-session.7.json"
 chmod 770 "$TEST_DIR/runtime"
 run_tree_hook "$TREE_TOOL_EVENT" 1
@@ -1222,8 +1196,7 @@ expect_equal "home cache execs" \
   "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rmdir=2 stat=3 tr=1 zellij=1" \
   "$(exec_profile "$TREE_TOOL_EVENT" XDG_RUNTIME_DIR=)"
 
-# One jq reads the record and merges into it. A record it cannot read, empty
-# or malformed, is replaced rather than kept forever.
+# A record jq cannot read, empty or malformed, is replaced, not kept forever.
 for record in '' '{"session_id":'; do
   printf '%s' "$record" > "$STATE_FILE"
   run_tree_hook "$TREE_TOOL_EVENT" 4242
@@ -1231,8 +1204,7 @@ for record in '' '{"session_id":'; do
     "$STATE_FILE" >/dev/null
 done
 
-# A cache dir that reads as 700 but belongs to someone else is refused, not
-# taken by the 700 fast path. The event still reaches the plugin.
+# A 700 cache dir owned by someone else is refused; the event still pipes.
 FOREIGN_STAT_BIN="$TEST_DIR/foreign-stat-bin"
 mkdir -p "$FOREIGN_STAT_BIN"
 cat > "$FOREIGN_STAT_BIN/stat" <<'FAKE_STAT'
@@ -1252,10 +1224,7 @@ run_tree_hook "$TREE_TOOL_EVENT" 4242 \
 [ ! -e "$STATE_FILE" ]
 jq -e '.session_id == "tree-root"' "$CAPTURE_FILE" >/dev/null
 
-# Delivery. The hook hands each event to a detached deliverer and returns.
-# Urgent events pipe at once; the rest wait out the window, and then only each
-# stream's newest pipes, and only to a session with a client attached. The
-# fake sleep logs to the timeline, "slept" only when it ran to the end.
+# Delivery. The fake sleep logs to the timeline, "slept" only when it ran out.
 DELIVERY_BIN="$TEST_DIR/delivery-bin"
 mkdir -p "$DELIVERY_BIN"
 cat > "$DELIVERY_BIN/sleep" <<'FAKE_SLEEP'
@@ -1271,8 +1240,7 @@ chmod +x "$DELIVERY_BIN/sleep"
 # Distinct from the reaper's 1 second, so the timeline tells them apart.
 DELIVERY_WINDOW=1.5
 
-# Runs one hook event per input, back to back, so they share one window; await
-# the whole burst with await_descendants.
+# One event per input, sharing one window; wrap in await_descendants to wait.
 run_delivery_burst() {
   local input
   for input in "$@"; do
@@ -1330,8 +1298,7 @@ EXPECTED_DELIVERED="PreToolUse:last"
 expect_delivered "Notification is superseded like any coalesced event" \
   "$(delivery_event Notification)" "$(delivery_event PreToolUse last)"
 
-# A subagent event can never displace the root event that owns the pane, nor
-# a root urgent event the subagents' pending one.
+# Root and subagent streams never displace each other, urgent events included.
 EXPECTED_DELIVERED="PreToolUse:root PreToolUse:sub@subagent"
 expect_delivered "streams are separate" \
   "$(delivery_event PreToolUse root)" \
@@ -1340,8 +1307,7 @@ EXPECTED_DELIVERED="PreToolUse:sub@subagent Stop"
 expect_delivered "root urgent leaves the subagent stream" \
   "$(delivery_event PreToolUse sub child-1)" "$(delivery_event Stop)"
 
-# Presence: a session with no client gets urgent events only. Missing or
-# unexpected metadata means deliver.
+# Presence: no client gets urgent events only; missing or odd metadata delivers.
 case "$OSTYPE" in
   darwin*) ZELLIJ_CACHE="$HOME/Library/Caches/org.Zellij-Contributors.Zellij" ;;
   *) ZELLIJ_CACHE="$TEST_DIR/xdg-cache/zellij" ;;
@@ -1362,8 +1328,7 @@ printf 'connected_clients zero\n' > "$SESSION_INFO_DIR/session-metadata.kdl"
 expect_delivered "unparseable metadata fails open" "$(delivery_event PreToolUse)"
 rm -rf "$ZELLIJ_CACHE"
 
-# The reaper goes with a client that answers, sleep included; a client that
-# never answers is killed after a second, and the hook never waits for it.
+# The reaper dies with an answered client; a hung one is killed at 1 s.
 EXPECTED_DELIVERED="Stop"
 expect_delivered "reaper, answered" "$(delivery_event Stop)"
 if grep -qx 'slept 1' "$TIMELINE"; then
@@ -1387,8 +1352,7 @@ if grep -q '^zellij ' "$TIMELINE"; then
   exit 1
 fi
 
-# Codex reads the Stop hook stdout as JSON, to EOF: the deliverer neither
-# writes to it nor holds it open, even while its pipe hangs.
+# Codex reads Stop stdout as JSON to EOF: no deliverer may hold it, hung or not.
 codex_stop_stdout() {
   local stdout
   stdout=$(hook_process '{"session_id":"delivery","hook_event_name":"Stop"}' \
@@ -1401,8 +1365,7 @@ expect_equal "codex Stop stdout" "stdout closed {}|zellij killed" \
   "$(grep -e '^stdout closed' -e '^zellij killed' "$TIMELINE" |
     tr '\n' '|' | sed 's/|$//')"
 
-# SessionEnd takes this host's stream markers for the pane with it; another
-# host sharing the cache keeps its own.
+# SessionEnd removes this host's stream markers for the pane, not another's.
 STREAM_PREFIX="$CACHE_DIR/test-session.7.$(hostname)"
 compgen -G "$STREAM_PREFIX.root.*" >/dev/null
 run_hook_process '{"session_id":"delivery","hook_event_name":"SessionEnd"}' \
@@ -1414,11 +1377,7 @@ if compgen -G "$STREAM_PREFIX.root.*" >/dev/null ||
 fi
 compgen -G "$CACHE_DIR/test-session.7.other-host.invalid.root.*" >/dev/null
 
-# macOS has no procfs, so one batched ps answers the climb. Its comm is a full
-# path, measured 2026-09-03, while `-o ucomm=` answers the rewritten process
-# title. The stub branches on the flags it is asked for, so a ucomm reader, or
-# an awk that forgets the basename, matches nothing here as on macOS. Linux
-# cannot cover this for real: its comm is already a basename.
+# The stub answers as macOS ps does: comm a full path, ucomm the process title.
 MACOS_PS_BIN="$TEST_DIR/macos-ps-bin"
 mkdir -p "$MACOS_PS_BIN"
 cat > "$MACOS_PS_BIN/ps" <<'FAKE_MACOS_PS'
@@ -1462,8 +1421,7 @@ macos_exec_profile '{"session_id":"macos-root","hook_event_name":"PreToolUse"}' 
 expect_agent_pid "macOS batched ps" 4242
 expect_equal "macOS batched ps: ps, awk" "1 1" \
   "$(exec_count ps) $(exec_count awk)"
-# An empty table would send the climb to the per-process fallback; the memo
-# answers first, unconfirmed, since macOS offers no fork-free check.
+# The memo answers first, unconfirmed: macOS has no fork-free comm check.
 macos_exec_profile '{"session_id":"macos-root","hook_event_name":"PreToolUse"}' empty
 expect_agent_pid "macOS memo hit" 4242
 expect_equal "macOS memo hit: ps, awk" "0 0" \

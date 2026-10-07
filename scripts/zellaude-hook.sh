@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# zellaude-hook.sh — agent hook → zellij pipe bridge
+# zellaude-hook.sh — agent hook → zellij action pipe bridge
 # Forwards Claude Code and Codex hook events to the zellaude Zellij plugin.
 #
 # Usage:
@@ -252,8 +252,7 @@ if [ -f "$SETTINGS_FILE" ]; then
   IFS= read -r -d '' SETTINGS_JSON 2>/dev/null < "$SETTINGS_FILE"
 fi
 
-# One jq pass over the hook input on stdin, emitting shell assignments: its
-# fields, the send time, and the settings this hook reads.
+# Reads the hook input on stdin; prints shell assignments for eval.
 parse_hook_input() {
   jq -r \
     --arg claude_effort "${CLAUDE_EFFORT:-}" \
@@ -271,8 +270,7 @@ parse_hook_input() {
         end;
 
       assign("HOOK_EVENT"; .hook_event_name),
-      # The send time, so the plugin can order events that race through
-      # parallel hook subprocesses.
+      # Send time: the plugin orders racing hook subprocesses by it.
       assign("TS_MS"; now * 1000 | floor),
       assign("SESSION_ID"; .session_id),
       assign("TOOL_NAME"; .tool_name),
@@ -280,14 +278,12 @@ parse_hook_input() {
       assign("TRANSCRIPT_PATH"; .transcript_path),
       assign("TURN_ID"; .turn_id),
       assign("AGENT_ID"; .agent_id),
-      # .effort does not ride every event type, so the inherited launch value
-      # is what keeps SessionStart from answering empty.
+      # Not every event carries .effort; CLAUDE_EFFORT covers SessionStart.
       assign("EFFORT_LEVEL";
         (.effort.level? // "" | lowercase_text) as $level
         | if $level != "" then $level else $claude_effort | ascii_downcase end),
       assign("CONFIGURED_EFFORT_LEVEL"; $configured_effort | ascii_downcase),
-      # Accept an explicit field if Claude exposes one in a future hook version
-      # (or an SDK host supplies it today).
+      # For a future Claude hook field, or an SDK host that sends one today.
       assign("EXPLICIT_RAINBOW_STATE";
         if has("ultracode") and .ultracode != null then
           .ultracode | as_state
@@ -310,8 +306,6 @@ parse_hook_input() {
         | map(select((type == "string") and length > 0))
         | first // ""
         | ascii_downcase),
-      # Attach recovery (SessionRestore) supplies the target process launch
-      # state and start time.
       assign("RESTORE_LAUNCH_STATE";
         if has("launch_ultracode") and .launch_ultracode != null then
           .launch_ultracode | as_state
@@ -360,15 +354,12 @@ finish() {
 [ -z "${ZELLIJ_PANE_ID:-}" ] && finish 0
 [ -z "$HOOK_EVENT" ] && finish 0
 
-# Tree reads only: the launch-env harness plants just <pid>/environ under
-# ZELLAUDE_PROC_ROOT.
+# Not PROC_ROOT: the launch-env harness plants only <pid>/environ there.
 TREE_PROC_ROOT=${ZELLAUDE_TREE_PROC_ROOT:-/proc}
 TREE_HAS_PROCFS=false
 [ -r "$TREE_PROC_ROOT/$PPID/stat" ] && TREE_HAS_PROCFS=true
 
-# macOS `ps -o comm=` returns a full path for claude but a bare name for fish,
-# so basename it — no uname-keyed strip covers both. Never `ucomm`: it returns
-# the rewritten process title (measured "2.1.191", 2026-09-03).
+# Basenamed: macOS ps prints claude's comm as a full path, fish's bare.
 is_agent_comm() {
   case "${1##*/}" in
     claude*|codex*) return 0 ;;
@@ -376,13 +367,13 @@ is_agent_comm() {
   return 1
 }
 
-# The read_process_* helpers set the variable named $2 to a fact about
-# process $1: from procfs with builtins alone, else from one ps per fact.
+# read_process_<fact> PID VAR sets VAR: procfs builtins, else one ps.
 read_process_comm() {
   local process_comm=""
   if [ "$TREE_HAS_PROCFS" = true ]; then
     read -r process_comm 2>/dev/null < "$TREE_PROC_ROOT/$1/comm"
   else
+    # comm, never ucomm: ucomm holds the rewritten process title.
     process_comm=$(ps -o comm= -p "$1" 2>/dev/null | tr -d '[:space:]')
   fi
   printf -v "$2" '%s' "$process_comm"
@@ -415,8 +406,7 @@ read_process_ppid() {
   printf -v "$2" '%s' "$parent"
 }
 
-# This session's agent pid as the pane's state record holds it. SessionStart
-# never trusts it, because a resumed session reuses its id in a new process.
+# The pane record's agent pid; never on SessionStart: a resume reuses the id.
 memo_agent_pid() {
   local record memo_pid memo_comm
   local session_pattern='"session_id":"([^"\]*)"'
@@ -476,8 +466,7 @@ climb_to_agent_pid() {
 find_agent_pid() {
   local process_table
   memo_agent_pid && return 0
-  # A working ps lists at least init, the agent and this hook, so empty
-  # output means it failed.
+  # Empty means ps failed: a working one lists init, the agent and this hook.
   if [ "$TREE_HAS_PROCFS" = false ] &&
      process_table=$(ps -A -o pid= -o ppid= -o comm= 2>/dev/null) &&
      [ -n "$process_table" ]; then
@@ -555,35 +544,24 @@ read_launch_env() {
     --arg settings_json "$SETTINGS_JSON" \
     --arg safe_secret_value "$LAUNCH_ENV_SAFE_SECRET_VALUE" \
     --arg redacted_marker "$LAUNCH_ENV_REDACTED_MARKER" '
-      # No apostrophe in a comment inside a single-quoted jq program: it closes
-      # the shell string, and bash -n then reports a syntax error lines below.
+      # No apostrophes in these comments: one would end the shell string.
 
-      # Built-in names plus user-added ones, as {config: [...], secret: [...]}.
-      # A settings file may only ADD: re-tiering a predefined name is dropped,
-      # and the escape set is not readable from here at all, which is the
-      # cheaper door to the same boundary. Missing, unreadable or malformed
-      # yields the built-ins — a bad file must never capture more, and never
-      # capture nothing.
+      # Built-ins plus user additions; a missing or malformed file adds none.
       def launch_env_names:
         ($settings_json | fromjson? // {}) as $user
         | ($config_names | split(" ")) as $config
         | ($secret_names | split(" ")) as $secret
         | ($config + $secret) as $predefined
-        # The config tier is spelled "verbatim" to the user: the frozen-tier
-        # rule protects predefined names only, so a name they add there is
-        # captured WITH ITS VALUE, and the key should say so.
+        # "verbatim" is the config tier: a name added there keeps its value.
         | def added($tier):
             (try ($user.launch_env_names[$tier]) catch null)
             | if type == "array"
               then map(select(type == "string" and . != ""))
               else []
               end;
+          # Only additions: a predefined name re-tiered to secret is dropped.
           ((added("secret") - $predefined) | unique) as $user_secret
-        # A name the user lists under both tiers is a secret: fail closed. Both
-        # subtractions on this line are belt-and-braces — the redaction below
-        # keys on the secret list independently — and keep each name in one
-        # tier only. The subtraction on the secret line above is not: dropping
-        # it would redact a predefined verbatim name.
+        # A name listed in both tiers is a secret: fail closed.
         | ((added("verbatim") - $predefined - $user_secret) | unique) as $user_config
         | {
             config: ($config + $user_config),
@@ -862,16 +840,14 @@ detect_claude_rainbow() {
     return
   fi
 
-  # Claude reports ultracode's model effort as xhigh, so recover the separate
-  # session setting from the latest successful /effort command when available.
-  # /effort is a local command and cannot change mid-turn, so only a turn
-  # boundary or attach recovery scans.
+  # /effort cannot change mid-turn: only turn boundaries and recovery scan.
   case "$HOOK_EVENT" in
     SessionStart) tail_lines=4096 ;;
     UserPromptSubmit) tail_lines=1024 ;;
     SessionRestore) tail_lines=512 ;;
     *) tail_lines="" ;;
   esac
+  # Claude reports ultracode as xhigh, so the transcript's /effort recovers it.
   transcript_result=$'null\t\t'
   if [ -n "$tail_lines" ] && [ -r "$TRANSCRIPT_PATH" ]; then
     transcript_result=$(
@@ -991,8 +967,7 @@ if [ "$IS_SUBAGENT" = true ]; then
   RAINBOW_NAME=null
   RAINBOW_MODE_MARKER=""
 elif [ "$RAINBOW_ENABLED" = false ]; then
-  # null is "not looked", so the cache keeps what it last saw rather than
-  # recording a false fact.
+  # null is "not looked", so the cache keeps its last value instead of false.
   RAINBOW_NAME=null
   RAINBOW_MODE_MARKER=""
 elif [ "$CLIENT" = "codex" ]; then
@@ -1009,9 +984,7 @@ case "$RAINBOW_NAME" in
   *) RAINBOW_NAME="null" ;;
 esac
 
-# This pane's files in the private cache share PANE_CACHE_PREFIX: the root
-# state record (the attach-time cache and the agent-pid memo) and the delivery
-# stream markers.
+# Prefix of this pane's cache files: the state record and the stream markers.
 PANE_CACHE_PREFIX=""
 PANE_STATE_PATH=""
 if [ "$INSPECT_ONLY" = false ] &&
@@ -1033,9 +1006,7 @@ else
   LAUNCH_ENV=$(read_launch_env "$AGENT_PID") || LAUNCH_ENV=null
 fi
 if [ "$CLIENT" = "codex" ]; then
-  # EFFORT_LEVEL reads Claude's instruments — .effort.level and
-  # CLAUDE_EFFORT. On a codex agent an inherited CLAUDE_EFFORT is a Claude
-  # session's effort leaking in, so recording it would name the wrong agent.
+  # Under codex, EFFORT_LEVEL may be a Claude session's inherited CLAUDE_EFFORT.
   CURRENT_EFFORT_LEVEL=""
 else
   CURRENT_EFFORT_LEVEL=$EFFORT_LEVEL
@@ -1114,8 +1085,7 @@ persist_root_state() {
 
   if [ "$HOOK_EVENT" = "SessionEnd" ]; then
     if [ -f "$cache_path" ]; then
-      # ts first: tab is IFS whitespace, so an empty owner ahead of it would
-      # collapse and shift the ts into cached_owner.
+      # ts first: tab is IFS whitespace, so an empty first field would vanish.
       IFS=$'\t' read -r cached_ts cached_owner <<< "$(
         jq -r '[.ts_ms // 0, .session_id // ""] | @tsv' "$cache_path" 2>/dev/null
       )"
@@ -1133,8 +1103,7 @@ persist_root_state() {
 
   cache_payload=$PAYLOAD
 
-  # Empty output means the cached state is newer than this event. A record
-  # jq cannot read fails the call, and the current payload replaces it.
+  # Empty: the cache is newer. A record jq cannot read fails, and is replaced.
   if [ -f "$cache_path" ] &&
      merged_payload=$(
       jq -nc --argjson current "$PAYLOAD" '
@@ -1317,8 +1286,7 @@ fi
 
 DELIVERY_COALESCE_SECONDS=${ZELLAUDE_DELIVERY_COALESCE_SECONDS:-0.2}
 
-# True only when zellij's session metadata reads connected_clients 0, so an
-# unreadable or unexpected file means deliver.
+# True only on connected_clients 0, so missing or odd metadata means deliver.
 session_is_clientless() {
   local zellij_cache metadata newline=$'\n'
   case "$OSTYPE" in
@@ -1333,9 +1301,7 @@ session_is_clientless() {
   return 1
 }
 
-# A dying session accepts a pipe but never answers it (SessionEnd races the
-# server shutdown), so the client gets one second. Hand-rolled instead of
-# timeout(1), which stock macOS lacks.
+# Reaped at 1 s: a dying session never answers, and macOS has no timeout(1).
 pipe_payload() {
   local client_pid reaper_pid
   zellij action pipe --name zellaude -- "$PAYLOAD" &
@@ -1349,9 +1315,7 @@ pipe_payload() {
   kill -- "-$reaper_pid" 2>/dev/null
 }
 
-# True when token $1 is still its stream's newest, and claims it. The claim
-# renames the pending marker, so a newer token moved along with it is still
-# found, in the claimed marker, by its own deliverer.
+# True, claiming it, when token $1 is still its stream's newest.
 claim_stream_event() {
   local newest
   read -r newest 2>/dev/null < "$STREAM_PENDING"
@@ -1359,6 +1323,7 @@ claim_stream_event() {
      mv -f "$STREAM_PENDING" "$STREAM_CLAIMED" 2>/dev/null; then
     return 0
   fi
+  # A token written just before a rename is found in the claimed marker.
   [ ! -e "$STREAM_PENDING" ] &&
     read -r newest 2>/dev/null < "$STREAM_CLAIMED" &&
     [ "$newest" = "$1" ]
@@ -1370,19 +1335,14 @@ deliver_if_newest() {
   session_is_clientless || pipe_payload
 }
 
-# Runs "$@" in its own process group with stdio closed, so it outlives this
-# hook without holding the agent's output pipes open.
+# Runs "$@" detached: own process group, stdio closed, no agent pipe held.
 start_deliverer() {
   set -m
   ( "$@" ) </dev/null >/dev/null 2>&1 &
   set +m
 }
 
-# Hands the payload to a detached deliverer and returns at once. Urgent events
-# pipe now and supersede their stream's pending event. The rest wait out
-# DELIVERY_COALESCE_SECONDS, then only the stream's newest pipes, and only to
-# a session with a client attached. A stream is one pane's root agent or its
-# subagents, on this host.
+# Hands the payload to a detached deliverer and returns at once.
 deliver_payload() {
   local stream_prefix token
   if [ -z "$PANE_CACHE_PREFIX" ]; then
@@ -1408,8 +1368,7 @@ deliver_payload() {
       start_deliverer pipe_payload
       ;;
     *)
-      # Notification only refreshes a timestamp: it never displaces an event
-      # its stream has pending.
+      # Notification only refreshes a timestamp; it yields to a pending event.
       if [ "$HOOK_EVENT" = "Notification" ] && [ -e "$STREAM_PENDING" ]; then
         return
       fi
@@ -1423,7 +1382,6 @@ deliver_payload() {
   esac
 }
 
-# Forwarding is best-effort: a missing Zellij session/plugin should never fail
-# the agent's own hook.
+# Best-effort: a missing Zellij session or plugin never fails the agent's hook.
 deliver_payload
 finish 0

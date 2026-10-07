@@ -86,7 +86,6 @@ assert_install() {
 
   [ "$(owned_count "$CLAUDE_SETTINGS" "$CLAUDE_OWNED")" -eq 11 ]
   [ "$(owned_count "$CODEX_HOOKS" "$CODEX_OWNED")" -eq 9 ]
-  # Each event holds exactly one owned entry, in exactly this shape.
   jq -e --argjson events "$claude_events" --arg owned "$CLAUDE_OWNED" '
     . as $root
     | all(
