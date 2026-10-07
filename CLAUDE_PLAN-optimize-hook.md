@@ -175,7 +175,7 @@ const ATTACH_DONE_PIPE: &str = "zellaude:attach-done"; // one-shot, sent only af
     - a failed-install arm, where hidden instances still do the work on first visit;
     - `InitialKeybinds` per instance per visit ≤ 2, and split-three and custom-layout keys still act in every visited tab;
     - two clients attached to the 8-tab session on different tabs, idle 10 s: the pass is no `InitialKeybinds` after the initial ones, and the keys acting in the first client's tab. Keys acting in the second client's tab too is the aim, not a pass condition: if `get_focused_pane_info` or `PluginIds.client_id` answers only for one client, it is a stated residual (`develop` fails both tabs);
-    - the keys act on a fresh 8-tab session's starting tab, and on every tab's first visit after a re-attach. `develop` fails on tab 1, and on tabs 1 and 4 after a re-attach.
+    - the keys act on a fresh 8-tab session's starting tab, and on every tab's first visit after a re-attach, with 0 failures over ≥3 repeats. Baselines: `develop` fails the fresh starting tab every time, and fails intermittently on first visits after a re-attach (3 of 24; the branch before T16, 7 of 24 split-three and 6 of 24 prompt visits).
   - Idle `Timer` events per instance after 3 re-attaches stay at the configured rate (1/s, or 4/s with a live flash or rainbow), at 8 tabs.
   - Late ticks: with a live flash in an 8-tab session, stop the zellij server (`SIGSTOP`) for 2 s, resume it, and confirm every instance's `Timer` rate returns to 4/s. If the throttling arm runs, repeat the rate check after it.
 - **E2E** on km-kim-4, isolated: `HOME`, `XDG_*` and `ZELLIJ_SOCKET_DIR` under `/tmp/optimize-hook`.
