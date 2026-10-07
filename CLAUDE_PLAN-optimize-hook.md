@@ -109,7 +109,7 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
 DELIVERY_COALESCE_SECONDS=0.2        # hook constant; env ZELLAUDE_DELIVERY_COALESCE_SECONDS overrides (tests)
 ZELLAUDE_TREE_PROC_ROOT              # env, default /proc: process-tree reads only
 find_agent_pid()                     # unchanged name: memo → /proc climb | batched ps → per-process ps
-deliver_payload()                    # urgent: pipe now; coalesced: record stream's latest, start detached deliverer
+deliver_payload()                    # urgent: detached pipe now; coalesced: record stream's latest, start detached deliverer; never waits
 session_is_clientless()              # true only when connected_clients reads 0; unknown → false (deliver)
 # zellaude.json: "rainbow": bool (absent = true) — written by the plugin, read by the hook
 ```
