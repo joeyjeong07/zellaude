@@ -321,6 +321,9 @@ impl ZellijPlugin for State {
                                                 self.settings.smart_focus =
                                                     !self.settings.smart_focus;
                                             }
+                                            state::SettingKey::Rainbow => {
+                                                self.settings.rainbow = !self.settings.rainbow;
+                                            }
                                         }
                                         self.save_config();
                                     }
@@ -535,15 +538,15 @@ impl ZellijPlugin for State {
                 let flash_changed = self.cleanup_expired_flashes();
                 let orphan_flashes_pruned = self.prune_orphan_flashes();
                 let has_flashes = self.has_active_flashes();
-                let has_rainbows = self.has_rainbow_sessions();
-                if has_rainbows {
+                let animates_rainbow = self.should_animate_rainbow();
+                if animates_rainbow {
                     set_timeout(rainbow::ANIMATION_TICK_SECONDS);
                 } else if has_flashes {
                     set_timeout(FLASH_TICK);
                 } else {
                     set_timeout(TIMER_INTERVAL);
                 }
-                has_rainbows
+                animates_rainbow
                     || has_flashes
                     || stale_changed
                     || flash_changed
@@ -1947,6 +1950,10 @@ impl State {
         self.sessions.values().any(|session| session.rainbow_name)
     }
 
+    fn should_animate_rainbow(&self) -> bool {
+        self.settings.rainbow && self.has_rainbow_sessions()
+    }
+
     fn cleanup_expired_flashes(&mut self) -> bool {
         let before = self.flash_deadlines.len();
         let now = unix_now_ms();
@@ -2196,6 +2203,36 @@ mod tests {
         state.sessions.clear();
         assert!(state.prune_orphan_flashes());
         assert!(!state.has_active_flashes());
+    }
+
+    #[test]
+    fn rainbow_setting_defaults_on_and_is_saved_when_off() {
+        let absent: Settings = serde_json::from_str("{}").unwrap();
+        assert!(absent.rainbow);
+        let off: Settings = serde_json::from_str(r#"{"rainbow":false}"#).unwrap();
+        assert!(!off.rainbow);
+
+        let mut state = State::default();
+        state.settings.rainbow = false;
+        let saved: serde_json::Value = serde_json::from_str(&state.serialized_settings()).unwrap();
+        assert_eq!(saved["rainbow"], false);
+    }
+
+    #[test]
+    fn rainbow_off_stops_the_ticker_while_sessions_stay_rainbow() {
+        let mut state = State::default();
+        state.sessions.insert(
+            7,
+            SessionInfo {
+                rainbow_name: true,
+                ..session("ultra", 1_000, false)
+            },
+        );
+        assert!(state.should_animate_rainbow());
+
+        state.settings.rainbow = false;
+        assert!(!state.should_animate_rainbow());
+        assert!(state.has_rainbow_sessions());
     }
 
     #[test]

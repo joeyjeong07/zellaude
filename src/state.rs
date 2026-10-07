@@ -145,6 +145,7 @@ pub struct Settings {
     pub elapsed_time: bool,
     pub mode_indicator: bool,
     pub smart_focus: bool,
+    pub rainbow: bool,
 }
 
 impl Default for Settings {
@@ -155,6 +156,7 @@ impl Default for Settings {
             elapsed_time: true,
             mode_indicator: true,
             smart_focus: true,
+            rainbow: true,
         }
     }
 }
@@ -173,6 +175,7 @@ pub enum SettingKey {
     ElapsedTime,
     ModeIndicator,
     SmartFocus,
+    Rainbow,
 }
 
 pub enum MenuAction {
