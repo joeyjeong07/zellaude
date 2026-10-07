@@ -49,3 +49,10 @@
   3. Keep 1 s and loosen the pass conditions — no code / the bar stays wrong under load, which is the user's complaint.
 - Selected: 1, as a new row T14 on impl1. T12 waits on it for every arm the change touches.
 - Pinned at checkpoint 4 (round 2): `SessionEnd` is never superseded (T6's cleanup and the tombstone ride on it, and `/clear` sends it right before `SessionStart`); urgent events jump coalesced waiters; a stale lock is judged by age, not pid; a waiter's bound (3 × the reaper) exceeds the reaper, and on give-up an urgent event pipes anyway. Verification adds urgent hook-fire→bar p95 ≤ 0.5 s and a count of superseded urgent events.
+
+### README follows T14 (rev 3)
+- Reported by impl2: T9's README sentence (56e4333, `README.md:578`) says urgent events "go out at once". After T14 they queue behind the session's one running pipe, and a superseded non-`SessionEnd` urgent event never pipes.
+- Options, ranked:
+  1. (rec) A new row T15 on impl2 after T14, before T12, with impl2's wording — the README stays true, and the author of T9 fixes its own sentence / one more row.
+  2. Fold it into T11-style cleanup at the end — no new row / T11 is closed, and the verifier would read a false README.
+- Selected: 1.
