@@ -74,6 +74,11 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
       - Case: a coalesced event skipped during the ≤1 s attach lag that landed after the scan. The next tab's scan used to pick it up; now only that pane's next event repairs it.
       - Urgent events always deliver, so this stays bounded to mid-turn tool glyphs.
     - *Config load* stays per instance, because every instance needs settings. What it cost before was its per-instance template compile, which now runs once.
+  - **Two older plugin costs found by T12, fixed here** (rev 4):
+    - Measured on km-kim-4: a first tab visit after a re-attach costs 5.1 pod CPU-s with zellaude's bar (7.1 on `develop`), against 0.17 with zellij's own tab-bar and 0.13 with no bar. 0.7–1.4 s of it is plugin code; the rest is zellij delivering events to the 8 instances. Switching itself still shows in ~0.05 s.
+    - *Keybinding reloads per visit:* every `TabUpdate` on the active instance resets the runtime-binding flags, so each visit reconfigures the client's keybindings again. All 8 instances got ~14 `InitialKeybinds` each per visit, about 7 reconfigures where retargeting needs at most 2. A probe that skipped the reset cut a visit from 6.3 to 2.2 pod CPU-s. The bindings name one instance (`MessagePluginId`), so a visit must still retarget them to the newly active instance. Fix: reconfigure only when the bindings do not already target this instance, and send split-three and custom-layout bindings in one reconfigure. Suspected cause, unverified: the already-installed check compares whole action lists and never matches what zellij parsed back.
+    - *Timer chains leak, one per re-attach:* a rebuilt instance keeps the plugin id, so the previous instance's pending timer fires into it, and every `Timer` re-arms. Idle `Timer` events per instance went 1.0 → 2.0 → 3.0 → 4.1 over three re-attaches, at 1, 4 and 8 tabs, without bound. Every tick's work and render multiplies with session age. Plausibly part of the user's 280–470 % steady plugin-exec CPU; unverified there. Fix: a tick earlier than its due time by more than half an interval re-arms nothing, so a leaked chain dies on its next tick. A tick at or past its due time re-arms from now however late it is: on a throttled pod late ticks are ordinary, and rejecting one would end the instance's only chain and stop its cleanup, flash expiry and elapsed display for good.
+    - Left as is: during visits, `SessionUpdate` reaches every instance at ~13/s whatever the plugin does (a no-work `Timer` did not change it). Its source is untraced.
   - **Persist-flash leak fix:**
     - Bug: `FlashMode::Persist` stores a `u64::MAX` deadline. `SessionEnd` removes the session but not the deadline, and `clear_flashes_on_tab` reaches only panes that still have sessions, so the deadline lives forever and keeps the 0.25 s ticker running.
     - Fix: `SessionEnd` drops the pane's deadline, and the Timer arm prunes deadlines whose pane has no session.
@@ -127,6 +132,7 @@ pub enum SettingKey { /* … */ Rainbow }
 fn should_animate_rainbow(&self) -> bool;           // settings.rainbow && has_rainbow_sessions(); has_rainbow_sessions stays truthful
 fn prune_orphan_flashes(&mut self) -> bool;         // Timer arm: drop deadlines of panes with no session
 fn holds_shareable_sessions(&self) -> bool;         // gate for answering zellaude:request
+fn arm_tick(&mut self, seconds: f64);              // set_timeout + record next_tick_due_ms; the Timer arm skips re-arming only for an early tick
 const ATTACH_DONE_PIPE: &str = "zellaude:attach-done"; // one-shot, sent only after install + scan + compile all succeed
 ```
 
@@ -161,7 +167,10 @@ const ATTACH_DONE_PIPE: &str = "zellaude:attach-done"; // one-shot, sent only af
     - pod CPU-s ≤ 0.6× `develop`;
     - no installer, attach-scan or template-compile spawn during the 8 first visits, logged by an `sh` shim on the server's `PATH` (manifest writes, which follow tab changes, are excluded by signature);
     - first-visit switch time no worse than `develop`;
-    - a failed-install arm, where hidden instances still do the work on first visit.
+    - a failed-install arm, where hidden instances still do the work on first visit;
+    - `InitialKeybinds` per instance per visit ≤ 2, and split-three and custom-layout keys still act in every visited tab.
+  - Idle `Timer` events per instance after 3 re-attaches stay at the configured rate (1/s, or 4/s with a live flash or rainbow), at 8 tabs.
+  - Late ticks: with a live flash in an 8-tab session, stop the zellij server (`SIGSTOP`) for 2 s, resume it, and confirm every instance's `Timer` rate returns to 4/s. If the throttling arm runs, repeat the rate check after it.
 - **E2E** on km-kim-4, isolated: `HOME`, `XDG_*` and `ZELLIJ_SOCKET_DIR` under `/tmp/optimize-hook`.
   - Setup:
     - zellij 0.44.3 with the branch's plugin wasm, 8 tabs; the plugin installs the branch hook itself.
@@ -203,7 +212,7 @@ const ATTACH_DONE_PIPE: &str = "zellaude:attach-done"; // one-shot, sent only af
   - (T3) cache write subset;
   - (T4) delivery: urgent/coalesced, detached deliverer, presence skip, `action pipe`;
   - (T5) Codex `async` entry.
-- Plugin, impl2, in parallel: (T6) flash fix, (T7) rainbow toggle, (T8) quiet attach.
+- Plugin, impl2, in parallel: (T6) flash fix, (T7) rainbow toggle, (T8) quiet attach; after T12's findings (T16) one reconfigure per visit and (T17) one timer chain per instance.
 - Docs, impl2: (T9) README, after T4, T5 and T7.
 - Finalize, impl3: (T10–T13) merge `develop`, compact comments, verification with E2E, archive.
 

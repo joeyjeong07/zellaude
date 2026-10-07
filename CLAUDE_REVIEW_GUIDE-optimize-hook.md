@@ -63,3 +63,11 @@
   - A deliverer SIGKILLed mid-pipe leaves its urgent marker live for 22 s, longer than the 15 s give-up. Measured: the next urgent event piped after 14.7 s, and a coalesced event behind it was dropped. Selected: accept — only a single-process kill or OOM shows it, and a pod restart outlasts 22 s.
   - Each waiting deliverer polls with `sleep 0.1`, about 10 execs a second, bounded by the collapse to each stream's newest (~160 execs/s at 16 waiters). Selected: accept, pending T12's CPU numbers.
   - A two-step race could let a stale `UNREADABLE_LOCK_SINCE` clock remove a waiter's fresh lock. Selected: fix now, a one-line follow-up commit to T14 reviewed by impl1-crit1, since T14 had already flipped.
+
+### Fix two older plugin costs in this branch (rev 4)
+- Found by T12's re-attach arm and impl3's control and root-cause probes (numbers in the PLAN). Both causes predate the branch: a keybinding reconfigure on every `TabUpdate`, about two thirds of a visit's cost; and a timer chain leaked per re-attach, growing without bound.
+- Options, ranked:
+  1. (rec) Fix both here as T16 and T17 on impl2, keeping the re-attach bar — they sit on tab switching and steady plugin CPU, the user's named symptoms, and the delegation covers in-scope optimization / two more rows and another verification pass.
+  2. Restate the bar to the attach phase and park both as seeds — the run closes sooner / leaves the largest per-visit cost and an unbounded leak in place.
+  3. Fix only the timer leak — one small row / leaves two thirds of each visit's cost.
+- Selected: 1. The user is told and can push either one to a seed.

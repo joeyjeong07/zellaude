@@ -26,13 +26,15 @@ Critics: plan=1 impl=1
 | T8 | impl2 | Quiet attach in `src/main.rs`: a `zellaude:request` is answered only when `holds_shareable_sessions`. The active tab's instance runs the session-wide attach work — installer, attach scan, session-template compile — and broadcasts `ATTACH_DONE_PIPE` only when all three succeed; receivers mark all three done for their lifetime; with no broadcast, hidden instances keep today's first-visit fallback. Config load stays per instance. Tests: the sync gate; attach-done only on success; receivers skip; fallback without it. | T7 | [x] |
 | T9 | impl2 | `README.md`: the delivery description (`zellij pipe` → `zellij action pipe`, near :577 and :581) and a Rainbow row in the Settings table (near :337). | T4, T7 | [x] |
 | T15 | impl2 | README delivery sentences after T14 (rev 3): `README.md:578` (from T9, 56e4333) says urgent events "go out at once", which T14 makes false. Replace those two sentences with: "Each session runs one pipe at a time, so a backlog delivers only each agent's newest state, though a session end always goes out. Session start, prompt, permission, stop and session end events go ahead of the rest; tool, subagent and notification events first wait 0.2 s, and skip sessions with no client attached." Adjust only if T14 as built differs. | T14 | [x] |
+| T16 | impl2 | One reconfigure per tab visit (rev 4): confirm first why a visit reconfigures ~7 times (all 8 instances get ~14 `InitialKeybinds` each); the suspected cause is the already-installed check in `split_three` / `custom_layouts` never matching the bindings zellij parsed back. Then reconfigure only when the bindings do not already target this instance (`MessagePluginId`), and send split-three and custom-layout bindings in one reconfigure; keep the retarget a visit needs. If the cause differs from the suspicion, report before changing the contract. Tests: repeated `TabUpdate`s on one tab reconfigure nothing after the first; a visit to a new tab reconfigures once; keys still route to the active tab's instance. | T15 | [ ] |
+| T17 | impl2 | One timer chain per instance (rev 4): `arm_tick` wraps `set_timeout` and records `next_tick_due_ms`. The `Timer` arm skips re-arming only for an EARLY tick (now < due − interval/2), so a stray tick from a chain leaked by a rebuilt instance re-arms nothing; a tick at or past its due time re-arms from now however late it is. Load and the `Timer` arm both arm through it. Tests: stray early `Timer` events add no chain; a tick two intervals late still re-arms; the due tick re-arms at 1 s, or 0.25 s with a flash or rainbow. | T16 | [ ] |
 
 ### Finalize
 | ID | Agent | Task | Depends on | Status |
 |----|-------|------|------------|--------|
 | T10 | impl3 | Merge from the integration branch: the moment deps clear — no gate — merge `develop` into the feature branch, resolving conflicts with best judgment. An extra merge loop appends fresh rows — this one never re-runs. Protocol: `madev:impl` Finalization. | T1, T2, T3, T4, T5, T6, T7, T8, T9 | [x] |
 | T11 | impl3 | Compact-comments pass over the touched files per the session's coding standards: default none, one line each, no history or rationale; light touch-ups, no behavior change; remove resolved CLAUDE notes; commit. | T10 | [x] |
-| T12 | impl3 | Run the PLAN's Verification on the merged + tidied state — tests and builds, load-independent cost, the E2E, the `dump-layout` arm, the throttling arm and the `action pipe` floor check — preflight first, then run unattended when it fits; artifacts to `/tmp/optimize-hook`. On failure or preflight no-go, report to the planner and wait for the routed fix — never self-fix, never free up resources; loop until clean. | T11, T14, T15 | [ ] |
+| T12 | impl3 | Run the PLAN's Verification on the merged + tidied state — tests and builds, load-independent cost, the E2E, the `dump-layout` arm, the throttling arm and the `action pipe` floor check — preflight first, then run unattended when it fits; artifacts to `/tmp/optimize-hook`. On failure or preflight no-go, report to the planner and wait for the routed fix — never self-fix, never free up resources; loop until clean. | T11, T14, T15, T16, T17 | [ ] |
 | T13 | impl3 | Archive on the planner's explicit go: clear leftover feature CLAUDE notes, append the History entry, delete/prune this feature's in-flight seeds, `git rm` the PLAN, TODO and review guide (`[archive]`), `macoord cleanup`. Protocol: `madev:impl` Finalization. | T12 | (Not possible to mark after deletion) |
 
 **Dependency graph**
@@ -46,6 +48,9 @@ graph TD
   T14 --> T12
   T14 --> T15[T15 · impl2 · README after T14]
   T15 --> T12
+  T15 --> T16[T16 · impl2 · one reconfigure per visit]
+  T16 --> T17[T17 · impl2 · one timer chain]
+  T17 --> T12
   T5[T5 · impl1 · Codex async]
   T6[T6 · impl2 · flash fix] --> T7[T7 · impl2 · rainbow toggle]
   T7 --> T8[T8 · impl2 · quiet attach]
