@@ -56,3 +56,10 @@
   1. (rec) A new row T15 on impl2 after T14, before T12, with impl2's wording — the README stays true, and the author of T9 fixes its own sentence / one more row.
   2. Fold it into T11-style cleanup at the end — no new row / T11 is closed, and the verifier would read a false README.
 - Selected: 1.
+
+### T14 review findings left in
+- From impl1-crit1 at T14 (31f33ed). Options for each: fix now / accept / defer as a seed.
+  - A `UserPromptSubmit` superseded under backlog drops its rainbow scan, since only `SessionStart` and `UserPromptSubmit` scan. A rainbow change then stays unseen until the next prompt. Selected: accept — cosmetic, overload only.
+  - A deliverer SIGKILLed mid-pipe leaves its urgent marker live for 22 s, longer than the 15 s give-up. Measured: the next urgent event piped after 14.7 s, and a coalesced event behind it was dropped. Selected: accept — only a single-process kill or OOM shows it, and a pod restart outlasts 22 s.
+  - Each waiting deliverer polls with `sleep 0.1`, about 10 execs a second, bounded by the collapse to each stream's newest (~160 execs/s at 16 waiters). Selected: accept, pending T12's CPU numbers.
+  - A two-step race could let a stale `UNREADABLE_LOCK_SINCE` clock remove a waiter's fresh lock. Selected: fix now, a one-line follow-up commit to T14 reviewed by impl1-crit1, since T14 had already flipped.
