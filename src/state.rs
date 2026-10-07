@@ -247,9 +247,15 @@ pub struct State {
     /// when the key is absent, so the built-in still compiles.
     pub session_templates: Option<Vec<session_templates::SessionTemplate>>,
     pub session_templates_compiled: bool,
+    pub session_template_commands_pending: usize,
+    pub session_template_command_failed: bool,
     pub session_template_config_error: Option<String>,
+    pub hook_install_requested: bool,
     pub hooks_installed: bool,
     pub attach_scan_requested: bool,
+    pub attach_scan_succeeded: bool,
+    /// Install, attach scan and template compile, done here or by a peer; never repeated.
+    pub attach_work_done: bool,
     pub plugin_id: Option<u32>,
     pub plugin_configuration: BTreeMap<String, String>,
 }

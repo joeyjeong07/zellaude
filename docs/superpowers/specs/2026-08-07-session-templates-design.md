@@ -163,8 +163,10 @@ layout {
 ```
 
 The plugin's own location comes from its pane in the pane manifest, as
-`CustomLayout::to_kdl` already does. Compilation runs once per plugin instance,
-after `load_config` succeeds and that location is known.
+`CustomLayout::to_kdl` already does. Compilation runs on the active tab's plugin
+instance once per attach, after `load_config` succeeds and that location is
+known; a hidden instance compiles on its first visit only if no
+`zellaude:attach-done` arrived.
 
 ## File ownership
 

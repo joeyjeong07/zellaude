@@ -25,6 +25,7 @@ const TIMER_INTERVAL: f64 = 1.0;
 const MANIFEST_DEBOUNCE_MS: u64 = 1000;
 const FLASH_TICK: f64 = 0.25;
 const SPLIT_THREE_ACTION_TIMEOUT_MS: u64 = 5000;
+const ATTACH_DONE_PIPE: &str = "zellaude:attach-done";
 const SAVE_CONFIG_SCRIPT: &str = r#"
 set -eu
 if [ "$#" -ge 2 ]; then
@@ -178,7 +179,9 @@ impl ZellijPlugin for State {
                 self.rebuild_pane_map();
                 self.maybe_cancel_custom_layout_prompt_on_focus_loss();
                 self.maybe_install_runtime_bindings();
+                self.maybe_run_installer();
                 self.maybe_start_attach_scan();
+                self.maybe_compile_session_templates();
                 self.maybe_write_manifest();
                 true
             }
@@ -189,6 +192,7 @@ impl ZellijPlugin for State {
                 self.maybe_recover_pending_split_three_spawn();
                 self.maybe_finish_split_three_validation();
                 self.maybe_install_runtime_bindings();
+                self.maybe_run_installer();
                 self.maybe_start_attach_scan();
                 self.maybe_compile_session_templates();
                 self.maybe_write_manifest();
@@ -418,6 +422,7 @@ impl ZellijPlugin for State {
                                 String::from_utf8_lossy(&stderr).trim()
                             );
                         }
+                        self.record_session_template_command(exit_code == Some(0));
                         false
                     }
                     Some("write_manifest") => {
@@ -439,6 +444,7 @@ impl ZellijPlugin for State {
                                 String::from_utf8_lossy(&stderr).trim()
                             );
                         }
+                        self.record_session_template_command(exit_code == Some(0));
                         false
                     }
                     Some("attach_scan") => {
@@ -446,6 +452,7 @@ impl ZellijPlugin for State {
                             self.attach_scan_requested = false;
                             return false;
                         }
+                        self.attach_scan_succeeded = true;
 
                         let allowed_panes: Vec<u32> = context
                             .get("pane_ids")
@@ -520,6 +527,7 @@ impl ZellijPlugin for State {
                         if changed {
                             self.broadcast_sessions();
                         }
+                        self.maybe_broadcast_attach_done();
                         changed
                     }
                     _ => false,
@@ -611,7 +619,13 @@ impl ZellijPlugin for State {
             }
             "zellaude:request" => {
                 // Another instance asking for state — respond with ours
-                self.broadcast_sessions();
+                if self.holds_shareable_sessions() {
+                    self.broadcast_sessions();
+                }
+                false
+            }
+            ATTACH_DONE_PIPE => {
+                self.attach_work_done = true;
                 false
             }
             "zellaude:settings" => {
@@ -1656,9 +1670,7 @@ impl State {
 
         if newly_granted {
             self.request_sync();
-            if !self.hooks_installed {
-                installer::run_install();
-            }
+            self.maybe_run_installer();
         }
         if !self.config_loaded {
             self.load_config();
@@ -1727,8 +1739,21 @@ impl State {
         self.maybe_install_runtime_bindings();
     }
 
+    fn maybe_run_installer(&mut self) {
+        if self.attach_work_done
+            || self.hook_install_requested
+            || !self.command_permissions_granted
+            || !self.is_on_active_tab()
+        {
+            return;
+        }
+        self.hook_install_requested = true;
+        installer::run_install();
+    }
+
     fn maybe_start_attach_scan(&mut self) {
-        if self.attach_scan_requested
+        if self.attach_work_done
+            || self.attach_scan_requested
             || !self.command_permissions_granted
             || !self.hooks_installed
         {
@@ -1799,11 +1824,15 @@ impl State {
     }
 
     /// Compile every template to `~/.config/zellij/layouts/`. Runs once per
-    /// plugin instance, as soon as both the settings file and this plugin's own
-    /// URL are known — the URL only becomes available once a pane manifest
-    /// describing this pane arrives.
+    /// plugin instance on the active tab, as soon as both the settings file and
+    /// this plugin's own URL are known — the URL only becomes available once a
+    /// pane manifest describing this pane arrives.
     fn maybe_compile_session_templates(&mut self) {
-        if self.session_templates_compiled || !self.command_permissions_granted {
+        if self.attach_work_done
+            || self.session_templates_compiled
+            || !self.command_permissions_granted
+            || !self.is_on_active_tab()
+        {
             return;
         }
         let Some(templates) = self.session_templates.clone() else {
@@ -1849,6 +1878,7 @@ impl State {
             let mut ctx = BTreeMap::new();
             ctx.insert("type".into(), "write_layout".into());
             ctx.insert("layout".into(), basename.clone());
+            self.session_template_commands_pending += 1;
             run_command(
                 &[
                     "sh",
@@ -1864,6 +1894,7 @@ impl State {
 
         let mut ctx = BTreeMap::new();
         ctx.insert("type".into(), "prune_layouts".into());
+        self.session_template_commands_pending += 1;
         run_command(
             &[
                 "sh",
@@ -1876,8 +1907,29 @@ impl State {
         );
     }
 
+    fn record_session_template_command(&mut self, succeeded: bool) {
+        self.session_template_commands_pending =
+            self.session_template_commands_pending.saturating_sub(1);
+        self.session_template_command_failed |= !succeeded;
+        self.maybe_broadcast_attach_done();
+    }
+
+    /// Peers skip their own attach work on this, so send it only once all of it succeeded here.
+    fn maybe_broadcast_attach_done(&mut self) {
+        let attach_work_succeeded = self.hooks_installed
+            && self.attach_scan_succeeded
+            && self.session_templates_compiled
+            && self.session_template_commands_pending == 0
+            && !self.session_template_command_failed;
+        if self.attach_work_done || !attach_work_succeeded {
+            return;
+        }
+        self.attach_work_done = true;
+        pipe_message_to_plugin(MessageToPlugin::new(ATTACH_DONE_PIPE));
+    }
+
     /// Only the instance whose tab is visible should spend host calls on
-    /// discovery.
+    /// discovery and the session-wide attach work.
     fn is_on_active_tab(&mut self) -> bool {
         let plugin_id = *self
             .plugin_id
@@ -1981,6 +2033,12 @@ impl State {
 
     fn request_sync(&self) {
         pipe_message_to_plugin(MessageToPlugin::new("zellaude:request"));
+    }
+
+    fn holds_shareable_sessions(&self) -> bool {
+        self.sessions
+            .values()
+            .any(|session| !placeholder::is_placeholder(session))
     }
 
     fn broadcast_sessions(&self) {
@@ -2725,6 +2783,158 @@ mod tests {
             }],
             ..State::default()
         }
+    }
+
+    #[test]
+    fn only_an_instance_holding_real_sessions_answers_a_sync_request() {
+        let mut state = State::default();
+        assert!(!state.holds_shareable_sessions());
+
+        state
+            .sessions
+            .insert(7, placeholder::placeholder_session(7));
+        assert!(!state.holds_shareable_sessions());
+
+        state.sessions.insert(8, session("real", 1_000, false));
+        assert!(state.holds_shareable_sessions());
+    }
+
+    #[test]
+    fn attach_done_is_sent_once_install_scan_and_compile_all_succeed() {
+        let mut state = attach_ready_state(true);
+
+        run_attach_work(&mut state, None);
+
+        assert!(state.attach_work_done);
+    }
+
+    #[test]
+    fn a_failed_attach_step_sends_no_attach_done() {
+        for failing_step in [
+            "install_hooks",
+            "attach_scan",
+            "write_layout",
+            "prune_layouts",
+        ] {
+            let mut state = attach_ready_state(true);
+
+            run_attach_work(&mut state, Some(failing_step));
+
+            assert!(
+                !state.attach_work_done,
+                "{failing_step} failed, attach-done went out"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_attach_done_stops_this_instance_repeating_the_attach_work() {
+        let mut state = attach_ready_state(true);
+        state.hooks_installed = true;
+
+        state.pipe(PipeMessage::new(
+            PipeSource::Plugin(1),
+            ATTACH_DONE_PIPE,
+            &None,
+            &None,
+            false,
+        ));
+        state.maybe_run_installer();
+        state.maybe_start_attach_scan();
+        state.maybe_compile_session_templates();
+
+        assert!(!state.hook_install_requested);
+        assert!(!state.attach_scan_requested);
+        assert!(!state.session_templates_compiled);
+    }
+
+    #[test]
+    fn without_attach_done_a_hidden_instance_does_the_attach_work_on_first_visit() {
+        let mut state = attach_ready_state(false);
+        state.maybe_run_installer();
+        state.maybe_compile_session_templates();
+        assert!(!state.hook_install_requested);
+        assert!(!state.session_templates_compiled);
+
+        let mut tabs = state.tabs.clone();
+        for tab in &mut tabs {
+            tab.active = tab.position == 0;
+        }
+        state.update(Event::TabUpdate(tabs));
+        assert!(state.hook_install_requested);
+        assert!(state.session_templates_compiled);
+
+        state.update(command_result("install_hooks", 0));
+        assert!(state.attach_scan_requested);
+    }
+
+    /// The plugin sits in tab 0 beside terminal pane 7; `on_active_tab` picks whether tab 0 is active.
+    fn attach_ready_state(on_active_tab: bool) -> State {
+        let mut manifest = PaneManifest::default();
+        manifest.panes.insert(
+            0,
+            vec![
+                PaneInfo {
+                    id: 42,
+                    is_plugin: true,
+                    plugin_url: Some("file:/zellaude.wasm".to_string()),
+                    ..PaneInfo::default()
+                },
+                PaneInfo {
+                    id: 7,
+                    ..PaneInfo::default()
+                },
+            ],
+        );
+        let mut state = State {
+            plugin_id: Some(42),
+            pane_manifest: Some(manifest),
+            tabs: vec![
+                TabInfo {
+                    position: 0,
+                    active: on_active_tab,
+                    ..TabInfo::default()
+                },
+                TabInfo {
+                    position: 1,
+                    active: !on_active_tab,
+                    ..TabInfo::default()
+                },
+            ],
+            command_permissions_granted: true,
+            zellij_session_name: Some("work".to_string()),
+            session_templates: Some(session_templates::effective(None)),
+            ..State::default()
+        };
+        state.rebuild_pane_map();
+        state
+    }
+
+    fn run_attach_work(state: &mut State, failing_step: Option<&str>) {
+        let exit_code = |step: &str| if failing_step == Some(step) { 1 } else { 0 };
+        state.maybe_run_installer();
+        state.update(command_result("install_hooks", exit_code("install_hooks")));
+        state.maybe_compile_session_templates();
+        let template_commands = state.session_template_commands_pending;
+        assert_eq!(
+            template_commands,
+            state.session_templates.as_ref().unwrap().len() + 1,
+            "every template should dispatch a write, plus one prune"
+        );
+        state.update(command_result("attach_scan", exit_code("attach_scan")));
+        for _ in 1..template_commands {
+            state.update(command_result("write_layout", exit_code("write_layout")));
+        }
+        state.update(command_result("prune_layouts", exit_code("prune_layouts")));
+    }
+
+    fn command_result(kind: &str, exit_code: i32) -> Event {
+        Event::RunCommandResult(
+            Some(exit_code),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::from([("type".to_string(), kind.to_string())]),
+        )
     }
 
     #[test]

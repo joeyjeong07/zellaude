@@ -4,7 +4,7 @@
 
 **Goal:** Let a user describe a multi-tab Zellij session in `zellaude.json` and start it with `zellij -s work -n <name>`.
 
-**Architecture:** A new module `src/session_templates.rs` parses `session_templates` from the settings file, validates it, and compiles each template to a Zellij layout KDL document. The status bar writes those documents to `~/.config/zellij/layouts/<name>.kdl` by shelling out, once per plugin instance, after `load_config` succeeds and the plugin's own URL is known. Zellij then reads them natively — no new binary, no shell wrapper.
+**Architecture:** A new module `src/session_templates.rs` parses `session_templates` from the settings file, validates it, and compiles each template to a Zellij layout KDL document. The status bar writes those documents to `~/.config/zellij/layouts/<name>.kdl` by shelling out from the active tab's plugin instance once per attach, after `load_config` succeeds and the plugin's own URL is known. Zellij then reads them natively — no new binary, no shell wrapper.
 
 **Tech Stack:** Rust 2021 targeting `wasm32-wasip1`, `zellij-tile` 0.44.3, `serde`/`serde_json`, POSIX `sh` for host-side file writes. Tests are plain `cargo test --target x86_64-unknown-linux-gnu` on the host target and parse generated KDL back through `zellij_utils::input::layout::Layout`.
 
