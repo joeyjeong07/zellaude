@@ -103,7 +103,7 @@ mod event_handler;
 #[path = "../src/placeholder.rs"]
 mod placeholder;
 
-use state::{Activity, HookPayload, State};
+use state::{Activity, FlashMode, HookPayload, State};
 
 fn payload(
     session_id: &str,
@@ -438,6 +438,39 @@ fn subagent_events_cannot_claim_a_placeholder_pane() {
     let session = state.sessions.get(&7).unwrap();
     assert_eq!(session.activity, Activity::Idle);
     assert!(state.flash_deadlines.is_empty());
+}
+
+#[test]
+fn session_end_drops_the_panes_persist_flash() {
+    let mut state = State::default();
+    state.settings.flash = FlashMode::Persist;
+    let mut waiting = payload("s1", None, None, 1_000);
+    waiting.hook_event = "PermissionRequest".to_string();
+    event_handler::handle_hook_event(&mut state, waiting);
+    assert_eq!(state.flash_deadlines.get(&7), Some(&u64::MAX));
+
+    let mut end = payload("s1", None, None, 2_000);
+    end.hook_event = "SessionEnd".to_string();
+    event_handler::handle_hook_event(&mut state, end);
+
+    assert!(!state.sessions.contains_key(&7));
+    assert!(state.flash_deadlines.is_empty());
+}
+
+#[test]
+fn a_stale_session_end_keeps_the_running_sessions_flash() {
+    let mut state = State::default();
+    state.settings.flash = FlashMode::Persist;
+    let mut waiting = payload("s2", None, None, 1_000);
+    waiting.hook_event = "PermissionRequest".to_string();
+    event_handler::handle_hook_event(&mut state, waiting);
+
+    let mut stale_end = payload("s1", None, None, 2_000);
+    stale_end.hook_event = "SessionEnd".to_string();
+    event_handler::handle_hook_event(&mut state, stale_end);
+
+    assert!(state.sessions.contains_key(&7));
+    assert_eq!(state.flash_deadlines.get(&7), Some(&u64::MAX));
 }
 
 #[test]

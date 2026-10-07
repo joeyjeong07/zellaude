@@ -132,6 +132,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
             .unwrap_or(false);
         if should_remove {
             state.sessions.remove(&payload.pane_id);
+            state.flash_deadlines.remove(&payload.pane_id);
         }
         return;
     }

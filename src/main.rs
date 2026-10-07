@@ -533,6 +533,7 @@ impl ZellijPlugin for State {
                 self.recover_stalled_split_three();
                 let stale_changed = self.cleanup_stale_sessions();
                 let flash_changed = self.cleanup_expired_flashes();
+                let orphan_flashes_pruned = self.prune_orphan_flashes();
                 let has_flashes = self.has_active_flashes();
                 let has_rainbows = self.has_rainbow_sessions();
                 if has_rainbows {
@@ -546,6 +547,7 @@ impl ZellijPlugin for State {
                     || has_flashes
                     || stale_changed
                     || flash_changed
+                    || orphan_flashes_pruned
                     || custom_layout_prompt_changed
                     || self.has_elapsed_display()
             }
@@ -1952,6 +1954,13 @@ impl State {
         self.flash_deadlines.len() != before
     }
 
+    fn prune_orphan_flashes(&mut self) -> bool {
+        let before = self.flash_deadlines.len();
+        self.flash_deadlines
+            .retain(|pane_id, _| self.sessions.contains_key(pane_id));
+        self.flash_deadlines.len() != before
+    }
+
     fn has_elapsed_display(&self) -> bool {
         if !self.settings.elapsed_time {
             return false;
@@ -2170,6 +2179,23 @@ mod tests {
         state.merge_sessions(BTreeMap::from([(7, session("ended", 40, false))]));
         assert_eq!(state.sessions.get(&7).unwrap().last_ts_ms, 40);
         assert!(state.session_end_tombstones.is_empty());
+    }
+
+    #[test]
+    fn orphaned_persist_flashes_are_pruned_so_the_timer_returns_to_1_hz() {
+        let mut state = State::default();
+        state.sessions.insert(7, session("live", 1_000, false));
+        state.flash_deadlines.insert(7, u64::MAX);
+        state.flash_deadlines.insert(8, u64::MAX);
+
+        assert!(state.prune_orphan_flashes());
+        assert_eq!(state.flash_deadlines.get(&7), Some(&u64::MAX));
+        assert!(!state.flash_deadlines.contains_key(&8));
+        assert!(!state.prune_orphan_flashes());
+
+        state.sessions.clear();
+        assert!(state.prune_orphan_flashes());
+        assert!(!state.has_active_flashes());
     }
 
     #[test]
