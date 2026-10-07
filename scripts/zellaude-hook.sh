@@ -1009,14 +1009,18 @@ case "$RAINBOW_NAME" in
   *) RAINBOW_NAME="null" ;;
 esac
 
-# The pane's state record: the attach-time cache, and the agent-pid memo.
+# This pane's files in the private cache share PANE_CACHE_PREFIX: the root
+# state record (the attach-time cache and the agent-pid memo) and the delivery
+# stream markers.
+PANE_CACHE_PREFIX=""
 PANE_STATE_PATH=""
 if [ "$INSPECT_ONLY" = false ] &&
-   [ "$IS_SUBAGENT" = false ] &&
-   [ -n "$SESSION_ID" ] &&
    STATE_CACHE_DIR=$(state_cache_dir) &&
    STATE_CACHE_KEY=$(state_cache_key "$ZELLIJ_SESSION_NAME"); then
-  PANE_STATE_PATH="$STATE_CACHE_DIR/$STATE_CACHE_KEY.$ZELLIJ_PANE_ID.json"
+  PANE_CACHE_PREFIX="$STATE_CACHE_DIR/$STATE_CACHE_KEY.$ZELLIJ_PANE_ID"
+  if [ "$IS_SUBAGENT" = false ] && [ -n "$SESSION_ID" ]; then
+    PANE_STATE_PATH="$PANE_CACHE_PREFIX.json"
+  fi
 fi
 AGENT_HOST=$(hostname 2>/dev/null) || AGENT_HOST=""
 AGENT_PID=$(find_agent_pid) || AGENT_PID=""
@@ -1311,18 +1315,115 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
   fi
 fi
 
+DELIVERY_COALESCE_SECONDS=${ZELLAUDE_DELIVERY_COALESCE_SECONDS:-0.2}
+
+# True only when zellij's session metadata reads connected_clients 0, so an
+# unreadable or unexpected file means deliver.
+session_is_clientless() {
+  local zellij_cache metadata newline=$'\n'
+  case "$OSTYPE" in
+    darwin*) zellij_cache="${HOME:-}/Library/Caches/org.Zellij-Contributors.Zellij" ;;
+    *) zellij_cache="${XDG_CACHE_HOME:-${HOME:-}/.cache}/zellij" ;;
+  esac
+  IFS= read -r -d '' metadata 2>/dev/null \
+    < "$zellij_cache/contract_version_1/session_info/$ZELLIJ_SESSION_NAME/session-metadata.kdl"
+  case "$metadata" in
+    *"${newline}connected_clients 0${newline}"*) return 0 ;;
+  esac
+  return 1
+}
+
+# A dying session accepts a pipe but never answers it (SessionEnd races the
+# server shutdown), so the client gets one second. Hand-rolled instead of
+# timeout(1), which stock macOS lacks.
+pipe_payload() {
+  local client_pid reaper_pid
+  zellij action pipe --name zellaude -- "$PAYLOAD" &
+  client_pid=$!
+  # Its own process group, so one kill also takes its sleep.
+  set -m
+  ( sleep 1; kill "$client_pid" 2>/dev/null ) &
+  reaper_pid=$!
+  set +m
+  wait "$client_pid"
+  kill -- "-$reaper_pid" 2>/dev/null
+}
+
+# True when token $1 is still its stream's newest, and claims it. The claim
+# renames the pending marker, so a newer token moved along with it is still
+# found, in the claimed marker, by its own deliverer.
+claim_stream_event() {
+  local newest
+  read -r newest 2>/dev/null < "$STREAM_PENDING"
+  if [ "$newest" = "$1" ] &&
+     mv -f "$STREAM_PENDING" "$STREAM_CLAIMED" 2>/dev/null; then
+    return 0
+  fi
+  [ ! -e "$STREAM_PENDING" ] &&
+    read -r newest 2>/dev/null < "$STREAM_CLAIMED" &&
+    [ "$newest" = "$1" ]
+}
+
+deliver_if_newest() {
+  sleep "$DELIVERY_COALESCE_SECONDS"
+  claim_stream_event "$1" || return 0
+  session_is_clientless || pipe_payload
+}
+
+# Runs "$@" in its own process group with stdio closed, so it outlives this
+# hook without holding the agent's output pipes open.
+start_deliverer() {
+  set -m
+  ( "$@" ) </dev/null >/dev/null 2>&1 &
+  set +m
+}
+
+# Hands the payload to a detached deliverer and returns at once. Urgent events
+# pipe now and supersede their stream's pending event. The rest wait out
+# DELIVERY_COALESCE_SECONDS, then only the stream's newest pipes, and only to
+# a session with a client attached. A stream is one pane's root agent or its
+# subagents, on this host.
+deliver_payload() {
+  local stream_prefix token
+  if [ -z "$PANE_CACHE_PREFIX" ]; then
+    start_deliverer pipe_payload
+    return
+  fi
+  stream_prefix="$PANE_CACHE_PREFIX.${AGENT_HOST//\//_}"
+  if [ "$IS_SUBAGENT" = true ]; then
+    STREAM_PENDING="$stream_prefix.subagents.pending"
+    STREAM_CLAIMED="$stream_prefix.subagents.claimed"
+  else
+    STREAM_PENDING="$stream_prefix.root.pending"
+    STREAM_CLAIMED="$stream_prefix.root.claimed"
+  fi
+
+  case "$HOOK_EVENT" in
+    SessionEnd)
+      rm -f "$stream_prefix".root.* "$stream_prefix".subagents.*
+      start_deliverer pipe_payload
+      ;;
+    SessionStart|UserPromptSubmit|PermissionRequest|Stop)
+      [ ! -e "$STREAM_PENDING" ] || rm -f "$STREAM_PENDING"
+      start_deliverer pipe_payload
+      ;;
+    *)
+      # Notification only refreshes a timestamp: it never displaces an event
+      # its stream has pending.
+      if [ "$HOOK_EVENT" = "Notification" ] && [ -e "$STREAM_PENDING" ]; then
+        return
+      fi
+      token="$TS_MS.$$"
+      if printf '%s\n' "$token" 2>/dev/null > "$STREAM_PENDING"; then
+        start_deliverer deliver_if_newest "$token"
+      else
+        start_deliverer pipe_payload
+      fi
+      ;;
+  esac
+}
+
 # Forwarding is best-effort: a missing Zellij session/plugin should never fail
-# the agent's own hook. Redirect output so Codex sees only the JSON it expects.
-# A dying session accepts the pipe but never answers it (SessionEnd races the
-# server shutdown), so a watchdog bounds the wait — unbounded, these hooks pile
-# up forever. Hand-rolled instead of timeout(1), which stock macOS lacks.
-zellij pipe --name "zellaude" -- "$PAYLOAD" >/dev/null 2>&1 &
-PIPE_PID=$!
-# Stay within the 3-second Codex hook deadline. Detach watchdog stdio so
-# its sleep cannot hold the hook output pipes open after Zellij returns.
-( sleep 1; kill "$PIPE_PID" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
-WATCHDOG_PID=$!
-wait "$PIPE_PID" 2>/dev/null || true
-kill "$WATCHDOG_PID" 2>/dev/null || true
-wait "$WATCHDOG_PID" 2>/dev/null || true
+# the agent's own hook.
+deliver_payload
 finish 0
