@@ -55,7 +55,14 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
     - Inferred from the queue behaviour, not measured directly: a pipe completes when every instance has processed it, so the wait, and the "CliPipe did not complete within 1s timeout" log lines, are queue time. Fewer and cheaper deliveries shorten that queue. The hand-off below means the hook never waits on it.
   - **Detached hand-off:**
     - The hook returns once it hands off. Today it waits up to 1 s for zellij: Codex's synchronous hook stalls the agent that long, and once the entry is async, each such hook would hold one of Codex's 8 background slots.
-    - A detached deliverer does the rest (own process group, stdio closed per commit bfda51f's lesson, a 1 s reaper for a session that never answers) and must leave no orphans: today's watchdog kills its subshell but leaves the `sleep` reparented to init (measured).
+    - A detached deliverer does the rest (own process group, stdio closed per commit bfda51f's lesson, a reaper for a session that never answers) and must leave no orphans: today's watchdog kills its subshell but leaves the `sleep` reparented to init (measured).
+  - **One pipe in flight per session, 5 s reaper** (rev 2, from T12's E2E):
+    - Failure measured with the original 1 s reaper (km-kim-4, 8 tabs): once the server's pipe queue passed 1 s, every client was reaped. A client killed while its pipe still waits behind others loses the event for every instance not yet reached (on an idle queue a client killed at 50 ms still delivered 40/40), and triples the server's cost (4.54 vs 1.49 CPUs over 20 pipes at 2/s), so the queue never recovered, even at 0.5 pipes/s. Bars ended with 67–73 of 76 urgent events staggered and 44–54 under heavy load (`develop`: 51–52 and 25–61). The same branch with a 5 s reaper passed every staggered check.
+    - Design: a per-session delivery lock, fork-free and kept beside T4's stream markers, lets one pipe run at a time. A deliverer that takes it re-checks that it is still its stream's newest, so events that pile up behind a running pipe collapse to each stream's latest.
+    - Urgent events skip the window and take the lock ahead of coalesced waiters: a coalesced waiter yields while any urgent event of the session is waiting. A newer event of its own stream may supersede a waiting urgent event, except `SessionEnd`, which always pipes. It sets the plugin's tombstone and drops the pane's flash deadline (T6), and `/clear` fires `SessionEnd` then `SessionStart` back to back in one pane.
+    - Bounds: the running pipe is reaped at `DELIVERY_REAPER_SECONDS=5`. A lock older than the reaper plus 2 s is stale and broken, judged by age, never pid (pids get reused). A waiter gives up after 3 × the reaper, longer than any legitimate holder; a coalesced event is then dropped, and an urgent one pipes without the lock.
+    - Why over only raising the reaper: concurrency is the cause. One pipe per session keeps the server's queue near empty, bounds live pipe clients to one per session (no pile-up like the 8 × 8 deadlock seen earlier), and under overload degrades to each stream's latest state instead of dropping arbitrary events. zellij tops out near 6–7 pipes/s at 8 tabs, so only fewer pipes help there.
+    - Cost: an urgent event waits behind the running pipe and any urgent events ahead of it: ~0.1–0.2 s per pipe idle, ~0.7–1.1 s per pipe on the throttled pod at 8 tabs. A non-`SessionEnd` urgent event superseded while waiting never pipes.
   - **Quiet attach:**
     - *Sync:* only an instance holding a non-placeholder session answers a `zellaude:request`. Today every fresh instance answers every request with a broadcast to all: 64 syncs reach each instance at 8 tabs (N³). Removing the grant-time sync alone halved an 8-tab re-attach (10.2 → 5.4 pod CPU-s).
     - *Attach work once:*
@@ -109,7 +116,8 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
 DELIVERY_COALESCE_SECONDS=0.2        # hook constant; env ZELLAUDE_DELIVERY_COALESCE_SECONDS overrides (tests)
 ZELLAUDE_TREE_PROC_ROOT              # env, default /proc: process-tree reads only
 find_agent_pid()                     # unchanged name: memo → /proc climb | batched ps → per-process ps
-deliver_payload()                    # urgent: detached pipe now; coalesced: record stream's latest, start detached deliverer; never waits
+deliver_payload()                    # urgent: detached deliverer now; coalesced: after the window; either way one pipe per session at a time; never waits
+DELIVERY_REAPER_SECONDS=5            # a running pipe client is killed after this
 session_is_clientless()              # true only when connected_clients reads 0; unknown → false (deliver)
 # zellaude.json: "rainbow": bool (absent = true) — written by the plugin, read by the hook
 ```
@@ -158,13 +166,15 @@ const ATTACH_DONE_PIPE: &str = "zellaude:attach-done"; // one-shot, sent only af
   - Setup:
     - zellij 0.44.3 with the branch's plugin wasm, 8 tabs; the plugin installs the branch hook itself.
     - One fake agent per tab (a shebang script named `claude`, so the climb finds it) replays a scripted burst of real-schema events, including Pre/Post pairs 50 ms apart, ending in `Stop`.
-    - Hundreds of events across ≥3 blocks.
+    - Hundreds of events across ≥3 blocks, at a realistic rate (agents staggered, about 2 pipes/s), plus one overload block with all 8 agents at once.
   - Pass when all hold:
     1. Every tab's bar, read per bar, shows each pane's final state from its last event.
-    2. A counter build sees every urgent event on every bar.
+    2. A counter build sees, on every bar, every urgent event that no newer event of its own stream superseded before its turn to pipe, and every `SessionEnd`. Report the count of superseded urgent events per staggered block.
+    6. In the staggered blocks, urgent hook-fire→bar latency (the counter's increment seen in the pty capture) has p95 ≤ 0.5 s.
+  - Passes 2–6 apply to the staggered blocks. The overload block passes on its own list: pass 1, no deadlock, a drained backlog, and no hook, `sleep` or `zellij` client process alive 7 s after the drain.
     3. A client-less run (ctrl-o d first) pipes urgent events only, counted by a `zellij` shim on `PATH` that logs each invocation before exec'ing the real binary. The same log shows superseded events never pipe.
     4. Re-attach restores the sessions from the cache.
-    5. No zellaude-hook or `sleep` process outlives the run by more than 2 s.
+    5. No zellaude-hook, `sleep` or `zellij` client process is alive 7 s after the last event (the 5 s reaper plus 2 s).
   - **Preflight:** for every arm except the throttling arm, km-kim-4's `nr_throttled` must not rise during the run; ≥8 idle CPUs, scratch socket dir empty, and the user's default `zellij list-sessions` answering (the guard). Never touch the user's real `~/.cache` or sessions.
   - **Artifacts:** `/tmp/optimize-hook/` holds pty captures, cost tables and the burst script.
 - **The goal itself: interactive latency under throttling**, on km-kim-4, `develop` vs branch, interleaved, ≥3 blocks each.

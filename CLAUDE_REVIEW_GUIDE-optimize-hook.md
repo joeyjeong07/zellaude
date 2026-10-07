@@ -40,3 +40,12 @@
 
 ### Hook header comment goes to T11
 - `scripts/zellaude-hook.sh:2` still calls the hook a "zellij pipe bridge" after T4. Options: fix it in T5 (T5 never touches the hook) / route it to T11's comment pass. Selected: T11, sent to impl3.
+
+### One pipe in flight per session (rev 2)
+- T12's E2E failed passes 1 and 2 whenever the server's pipe queue passed 1 s: the PLAN's 1 s reaper killed clients mid-pipe, which drops the event for instances not yet reached and triples the server's cost, so the queue never recovered (impl3, km-kim-4; numbers in the PLAN).
+- Options, ranked:
+  1. (rec) One pipe in flight per session plus a 5 s reaper — removes the cause; bounded live clients; under overload each stream still ends on its latest state / more design in T4's area, and an urgent event can wait behind one pipe or be superseded while waiting.
+  2. Only raise the reaper to 5 s — one constant, and staggered load already passed with it / concurrency stays unbounded (up to rate × 5 s live clients, near the earlier 8 × 8 deadlock), and heavy load still lost 14 of 76 urgent events per bar.
+  3. Keep 1 s and loosen the pass conditions — no code / the bar stays wrong under load, which is the user's complaint.
+- Selected: 1, as a new row T14 on impl1. T12 waits on it for every arm the change touches.
+- Pinned at checkpoint 4 (round 2): `SessionEnd` is never superseded (T6's cleanup and the tombstone ride on it, and `/clear` sends it right before `SessionStart`); urgent events jump coalesced waiters; a stale lock is judged by age, not pid; a waiter's bound (3 × the reaper) exceeds the reaper, and on give-up an urgent event pipes anyway. Verification adds urgent hook-fire→bar p95 ≤ 0.5 s and a count of superseded urgent events.
