@@ -12,19 +12,22 @@ mkdir -p "$TEST_DIR/runtime"
 # without this the developer's own zellaude.json decides what these cases see.
 mkdir -p "$TEST_DIR/home"
 export HOME="$TEST_DIR/home"
-# Logs each call; with ZELLAUDE_TEST_ZELLIJ_HANGS set it never answers.
+# Logs each call and its end; ZELLAUDE_TEST_ZELLIJ_SECONDS slows each pipe,
+# ZELLAUDE_TEST_ZELLIJ_HANGS makes it never answer.
 TIMELINE="$TEST_DIR/timeline.log"
 cat > "$TEST_DIR/bin/zellij" <<'FAKE_ZELLIJ'
 #!/usr/bin/env bash
 printf '%s' "${!#}" > "$ZELLAUDE_TEST_CAPTURE"
 printf 'zellij %s\n' "$*" >> "$ZELLAUDE_TEST_TIMELINE"
-if [ -n "${ZELLAUDE_TEST_ZELLIJ_HANGS:-}" ]; then
+seconds=${ZELLAUDE_TEST_ZELLIJ_SECONDS:-0}
+[ -z "${ZELLAUDE_TEST_ZELLIJ_HANGS:-}" ] || seconds=30
+if [ "$seconds" != 0 ]; then
   trap 'kill "$sleeper"; printf "zellij killed\n" >> "$ZELLAUDE_TEST_TIMELINE"; exit 143' TERM
-  command -p sleep 30 &
+  command -p sleep "$seconds" &
   sleeper=$!
   wait "$sleeper"
-  printf 'zellij finished\n' >> "$ZELLAUDE_TEST_TIMELINE"
 fi
+printf 'zellij done\n' >> "$ZELLAUDE_TEST_TIMELINE"
 FAKE_ZELLIJ
 chmod +x "$TEST_DIR/bin/zellij"
 
@@ -59,6 +62,7 @@ exit "$hook_status"
 HOOK_PARENT_SCRIPT
 
 # hook_process INPUT [NAME=value]... CMD...; parent comm bash, so no agent.
+# The reaper defaults to 1 s unless the caller exports another, even empty.
 hook_process() {
   local input=$1
   shift
@@ -69,6 +73,7 @@ hook_process() {
     XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
     XDG_CACHE_HOME="$TEST_DIR/xdg-cache" \
     ZELLAUDE_DELIVERY_COALESCE_SECONDS=0 \
+    ZELLAUDE_DELIVERY_REAPER_SECONDS="${ZELLAUDE_DELIVERY_REAPER_SECONDS-1}" \
     ZELLAUDE_TEST_TIMELINE="$TIMELINE" \
     ZELLIJ_SESSION_NAME="test-session" \
     ZELLIJ_PANE_ID="7" \
@@ -1098,29 +1103,30 @@ run_tree_hook "$TREE_SESSION_START" 4242
 LINUX_TOOL_EVENT_EXECS=$(exec_profile "$TREE_TOOL_EVENT" \
   ZELLAUDE_TEST_GRANDPARENT_PID=4343)
 expect_agent_pid "memo hit, counted" 4242
-# A coalesced event: its deliverer claims the stream marker (one mv) and pipes.
+# A coalesced event: its deliverer claims the stream marker (one mv), pipes,
+# and releases the session pipe lock (one rm).
 expect_equal "Linux tool event execs" \
-  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rmdir=2 stat=2 tr=1 zellij=1" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rm=1 rmdir=2 stat=2 tr=1 zellij=1" \
   "$LINUX_TOOL_EVENT_EXECS"
 expect_equal "Linux climbing tool event execs" "$LINUX_TOOL_EVENT_EXECS" \
   "$(exec_profile '{"session_id":"tree-climb","hook_event_name":"PreToolUse"}' \
     ZELLAUDE_TEST_GRANDPARENT_PID=4343)"
-# An urgent event pipes at once, with no marker to claim.
+# An urgent event skips the window but otherwise costs the same.
 LINUX_URGENT_EVENT_EXECS=$(exec_profile "$TREE_SESSION_START" \
   ZELLAUDE_TEST_GRANDPARENT_PID=4242)
 expect_equal "Linux SessionStart execs" \
-  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=2 tr=1 zellij=1" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rm=1 rmdir=2 stat=2 tr=1 zellij=1" \
   "$LINUX_URGENT_EVENT_EXECS"
 # A subagent writes no state record, but its stream marker is in the cache.
 expect_equal "Linux subagent tool event execs" \
-  "hostname=1 jq=2 mv=1 stat=2 tr=1 zellij=1" \
+  "hostname=1 jq=2 mv=1 rm=1 stat=2 tr=1 zellij=1" \
   "$(exec_profile \
     '{"session_id":"tree-root","hook_event_name":"PreToolUse","agent_id":"child"}' \
     ZELLAUDE_TEST_GRANDPARENT_PID=4343)"
 # The common Linux path: the agent is found and its environ is readable.
 write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/'
 expect_equal "Linux tool event with launch env execs" \
-  "date=1 hostname=1 jq=4 mkdir=2 mktemp=1 mv=2 rmdir=2 stat=2 tr=1 zellij=1" \
+  "date=1 hostname=1 jq=4 mkdir=2 mktemp=1 mv=2 rm=1 rmdir=2 stat=2 tr=1 zellij=1" \
   "$(exec_profile '{"session_id":"tree-launch-env","hook_event_name":"PreToolUse"}' \
     ZELLAUDE_TEST_PARENT_COMM=claude \
     ZELLAUDE_TEST_ENVIRON="$LAUNCH_ENV_ENVIRON" \
@@ -1193,7 +1199,7 @@ chmod 700 "$TEST_DIR/runtime"
 jq -e '.session_id == "tree-root"' "$HOME_STATE_FILE" >/dev/null
 is_private_dir "$HOME/.cache/zellaude/runtime"
 expect_equal "home cache execs" \
-  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rmdir=2 stat=3 tr=1 zellij=1" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rm=1 rmdir=2 stat=3 tr=1 zellij=1" \
   "$(exec_profile "$TREE_TOOL_EVENT" XDG_RUNTIME_DIR=)"
 
 # A record jq cannot read, empty or malformed, is replaced, not kept forever.
@@ -1241,23 +1247,37 @@ chmod +x "$DELIVERY_BIN/sleep"
 DELIVERY_WINDOW=1.5
 
 # One event per input, sharing one window; wrap in await_descendants to wait.
+# "@<pane> <input>" runs in that pane; "pause:<seconds>" waits between events.
 run_delivery_burst() {
-  local input
+  local input pane
   for input in "$@"; do
+    pane=7
+    case "$input" in
+      pause:*) sleep "${input#pause:}"; continue ;;
+      @*) pane=${input%% *}; pane=${pane#@}; input=${input#* } ;;
+    esac
     hook_process "$input" \
       PATH="$DELIVERY_BIN:$TEST_DIR/bin:$PATH" \
+      ZELLIJ_PANE_ID="$pane" \
       ZELLAUDE_DELIVERY_COALESCE_SECONDS="$DELIVERY_WINDOW" \
       bash "$HOOK_PARENT" >/dev/null
   done
 }
 
-# Each piped payload as event[:tool][@subagent], sorted.
-delivered() {
+# Each piped payload as event[:tool][@subagent], in pipe order.
+piped_events() {
   sed -n 's/^zellij action pipe --name zellaude -- //p' "$TIMELINE" |
     jq -r '.hook_event
       + (if .tool_name then ":" + .tool_name else "" end)
-      + (if .is_subagent then "@subagent" else "" end)' |
-    sort | tr '\n' ' ' | sed 's/ $//'
+      + (if .is_subagent then "@subagent" else "" end)'
+}
+
+delivered() {
+  piped_events | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+piped_in_order() {
+  piped_events | tr '\n' ' ' | sed 's/ $//'
 }
 
 delivery_event() {
@@ -1286,7 +1306,7 @@ EXPECTED_DELIVERED="Stop"
 expect_delivered "urgent supersedes" \
   "$(delivery_event PreToolUse first)" "$(delivery_event Stop)"
 expect_equal "urgent pipes at once" "pipe window" \
-  "$(awk '/^zellij / { print "pipe" } $0 == "slept 1.5" { print "window" }' \
+  "$(awk '/^zellij action / { print "pipe" } $0 == "slept 1.5" { print "window" }' \
     "$TIMELINE" | tr '\n' ' ' | sed 's/ $//')"
 
 EXPECTED_DELIVERED="PreToolUse:first"
@@ -1328,7 +1348,8 @@ printf 'connected_clients zero\n' > "$SESSION_INFO_DIR/session-metadata.kdl"
 expect_delivered "unparseable metadata fails open" "$(delivery_event PreToolUse)"
 rm -rf "$ZELLIJ_CACHE"
 
-# The reaper dies with an answered client; a hung one is killed at 1 s.
+# The reaper dies with an answered client; a hung one is killed at the 1 s
+# test bound.
 EXPECTED_DELIVERED="Stop"
 expect_delivered "reaper, answered" "$(delivery_event Stop)"
 if grep -qx 'slept 1' "$TIMELINE"; then
@@ -1339,7 +1360,110 @@ ZELLAUDE_TEST_ZELLIJ_HANGS=1 expect_delivered "reaper, never answered" \
   "$(delivery_event Stop)"
 expect_equal "hung client" "hook returned|slept 1|zellij killed" \
   "$(grep -x -e 'hook returned' -e 'slept 1' -e 'zellij killed' \
-    -e 'zellij finished' "$TIMELINE" | tr '\n' '|' | sed 's/|$//')"
+    -e 'zellij done' "$TIMELINE" | tr '\n' '|' | sed 's/|$//')"
+
+# One pipe in flight per session. The session lock and urgent markers sit
+# beside the stream markers.
+SESSION_PREFIX="$CACHE_DIR/test-session.$(hostname)"
+PIPE_LOCK="$SESSION_PREFIX.pipe-lock"
+
+# The pipes of a burst, as s(tart) and d(one) in timeline order.
+pipe_spans() {
+  awk '/^zellij action / { print "s" } $0 == "zellij done" { print "d" }' \
+    "$TIMELINE" | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Coalesced events of separate streams have no urgent marker to order them, so
+# only the lock keeps their pipes apart.
+EXPECTED_DELIVERED="PreToolUse:p7 PreToolUse:p8 PreToolUse:p9 Stop:p10"
+DELIVERY_WINDOW=0.05 ZELLAUDE_TEST_ZELLIJ_SECONDS=0.3 expect_delivered \
+  "one pipe at a time" \
+  "@7 $(delivery_event PreToolUse p7)" "@8 $(delivery_event PreToolUse p8)" \
+  "@9 $(delivery_event PreToolUse p9)" "@10 $(delivery_event Stop p10)"
+expect_equal "one pipe at a time: spans" "s d s d s d s d" "$(pipe_spans)"
+if [ -e "$PIPE_LOCK" ] || compgen -G "$SESSION_PREFIX.urgent.*" >/dev/null; then
+  printf 'a finished burst left its lock or urgent markers\n' >&2
+  exit 1
+fi
+
+# Events that pile up behind a running pipe collapse to each stream's latest.
+EXPECTED_DELIVERED="PreToolUse:a3 PreToolUse:s2@subagent Stop:p7"
+# Tests with a slow holder raise the reaper, so its pipe outlasts the burst.
+DELIVERY_WINDOW=0.05 ZELLAUDE_DELIVERY_REAPER_SECONDS=5 \
+  ZELLAUDE_TEST_ZELLIJ_SECONDS=4 expect_delivered \
+  "piled-up events collapse" \
+  "@7 $(delivery_event Stop p7)" \
+  "@8 $(delivery_event PreToolUse a1)" \
+  "@8 $(delivery_event PreToolUse s1 child-1)" pause:0.3 \
+  "@8 $(delivery_event PreToolUse a2)" pause:0.3 \
+  "@8 $(delivery_event PreToolUse a3)" \
+  "@8 $(delivery_event PreToolUse s2 child-1)"
+
+# An urgent event takes the lock ahead of a coalesced waiter.
+EXPECTED_DELIVERED="PreToolUse:c Stop:p7 UserPromptSubmit:p9"
+DELIVERY_WINDOW=0.05 ZELLAUDE_DELIVERY_REAPER_SECONDS=5 \
+  ZELLAUDE_TEST_ZELLIJ_SECONDS=3 expect_delivered "urgent before coalesced" \
+  "@7 $(delivery_event Stop p7)" "@8 $(delivery_event PreToolUse c)" pause:0.3 \
+  "@9 $(delivery_event UserPromptSubmit p9)"
+expect_equal "urgent before coalesced: order" \
+  "Stop:p7 UserPromptSubmit:p9 PreToolUse:c" "$(piped_in_order)"
+
+# Priority, against a live urgent marker no deliverer will clear: a coalesced
+# event yields until it gives up, and an urgent one waits behind an older one.
+PHANTOM_MS=$(($(date +%s) * 1000))
+: > "$SESSION_PREFIX.urgent.$PHANTOM_MS.99999"
+EXPECTED_DELIVERED=""
+DELIVERY_WINDOW=0.05 expect_delivered "coalesced yields to urgent" \
+  "$(delivery_event PreToolUse)"
+EXPECTED_DELIVERED="Stop"
+expect_delivered "urgent waits behind an older urgent" "$(delivery_event Stop)"
+if ! grep -qx 'slept 0.1' "$TIMELINE"; then
+  printf 'an urgent event piped ahead of an older one\n' >&2
+  exit 1
+fi
+rm -f "$SESSION_PREFIX.urgent.$PHANTOM_MS.99999"
+
+# A newer event of its stream supersedes a waiting urgent event; SessionEnd is
+# never superseded, and urgent events go oldest first.
+EXPECTED_DELIVERED="PreToolUse:newer Stop:p7"
+DELIVERY_WINDOW=0.05 ZELLAUDE_DELIVERY_REAPER_SECONDS=5 \
+  ZELLAUDE_TEST_ZELLIJ_SECONDS=3 expect_delivered "waiting urgent superseded" \
+  "@7 $(delivery_event Stop p7)" "@8 $(delivery_event Stop p8)" \
+  "@8 $(delivery_event PreToolUse newer)"
+EXPECTED_DELIVERED="SessionEnd SessionStart Stop:p7"
+ZELLAUDE_DELIVERY_REAPER_SECONDS=5 ZELLAUDE_TEST_ZELLIJ_SECONDS=3 \
+  expect_delivered "SessionEnd always pipes" \
+  "@7 $(delivery_event Stop p7)" "@8 $(delivery_event SessionEnd)" \
+  "@8 $(delivery_event SessionStart)"
+expect_equal "SessionEnd always pipes: order" "Stop:p7 SessionEnd SessionStart" \
+  "$(piped_in_order)"
+
+# A lock older than the reaper plus 2 s is broken by its age, even one
+# unreadable since its writer died mid-write; a coalesced event then still
+# pipes rather than give up.
+printf '%s deadbeef\n' "$(($(date +%s) - 100))" > "$PIPE_LOCK"
+EXPECTED_DELIVERED="PreToolUse"
+DELIVERY_WINDOW=0.05 expect_delivered "stale lock broken" \
+  "$(delivery_event PreToolUse)"
+: > "$PIPE_LOCK"
+ZELLAUDE_DELIVERY_REAPER_SECONDS=2 DELIVERY_WINDOW=0.05 \
+  expect_delivered "unreadable lock broken" "$(delivery_event PreToolUse)"
+
+# A live holder that never lets go: after three reaper spans a coalesced event
+# is dropped and an urgent one pipes without the lock.
+printf '%s alive\n' "$(($(date +%s) + 1000))" > "$PIPE_LOCK"
+EXPECTED_DELIVERED="Stop:p8"
+DELIVERY_WINDOW=0.05 expect_delivered "give up" \
+  "@7 $(delivery_event PreToolUse dropped)" "@8 $(delivery_event Stop p8)"
+rm -f "$PIPE_LOCK"
+
+# The reaper's default bound is five seconds.
+EXPECTED_DELIVERED="Stop"
+ZELLAUDE_DELIVERY_REAPER_SECONDS= ZELLAUDE_TEST_ZELLIJ_HANGS=1 \
+  expect_delivered "default reaper" "$(delivery_event Stop)"
+expect_equal "default reaper: killed" "slept 5|zellij killed" \
+  "$(grep -x -e 'slept 5' -e 'zellij killed' -e 'zellij done' "$TIMELINE" |
+    tr '\n' '|' | sed 's/|$//')"
 
 # --inspect prints the payload back to zellaude-attach.sh and never pipes.
 : > "$TIMELINE"

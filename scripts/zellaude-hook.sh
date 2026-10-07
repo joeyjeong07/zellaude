@@ -1285,6 +1285,8 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
 fi
 
 DELIVERY_COALESCE_SECONDS=${ZELLAUDE_DELIVERY_COALESCE_SECONDS:-0.2}
+DELIVERY_REAPER_SECONDS=${ZELLAUDE_DELIVERY_REAPER_SECONDS:-5}
+DELIVERY_POLL_SECONDS=0.1
 
 # True only on connected_clients 0, so missing or odd metadata means deliver.
 session_is_clientless() {
@@ -1301,38 +1303,139 @@ session_is_clientless() {
   return 1
 }
 
-# Reaped at 1 s: a dying session never answers, and macOS has no timeout(1).
+# Reaped after DELIVERY_REAPER_SECONDS: a dying session never answers, and
+# macOS has no timeout(1).
 pipe_payload() {
   local client_pid reaper_pid
   zellij action pipe --name zellaude -- "$PAYLOAD" &
   client_pid=$!
   # Its own process group, so one kill also takes its sleep.
   set -m
-  ( sleep 1; kill "$client_pid" 2>/dev/null ) &
+  ( sleep "$DELIVERY_REAPER_SECONDS"; kill "$client_pid" 2>/dev/null ) &
   reaper_pid=$!
   set +m
   wait "$client_pid"
   kill -- "-$reaper_pid" 2>/dev/null
 }
 
-# True, claiming it, when token $1 is still its stream's newest.
-claim_stream_event() {
+# A token written just before another deliverer's claim is found in the
+# claimed marker.
+is_stream_newest() {
   local newest
-  read -r newest 2>/dev/null < "$STREAM_PENDING"
-  if [ "$newest" = "$1" ] &&
-     mv -f "$STREAM_PENDING" "$STREAM_CLAIMED" 2>/dev/null; then
-    return 0
+  if [ -e "$STREAM_PENDING" ]; then
+    read -r newest 2>/dev/null < "$STREAM_PENDING"
+  else
+    read -r newest 2>/dev/null < "$STREAM_CLAIMED"
   fi
-  # A token written just before a rename is found in the claimed marker.
-  [ ! -e "$STREAM_PENDING" ] &&
-    read -r newest 2>/dev/null < "$STREAM_CLAIMED" &&
-    [ "$newest" = "$1" ]
+  [ "$newest" = "$1" ]
 }
 
-deliver_if_newest() {
+claim_stream_event() {
+  is_stream_newest "$1" || return 1
+  [ ! -e "$STREAM_PENDING" ] || mv -f "$STREAM_PENDING" "$STREAM_CLAIMED" 2>/dev/null
+  is_stream_newest "$1"
+}
+
+# The session pipe lock holds "<epoch seconds> <token>". The clock is
+# TS_MS plus $SECONDS: fork-free, bash 3.2, 1 s resolution.
+take_pipe_lock() {
+  local taken
+  set -C
+  { printf '%s %s\n' "$((TS_MS / 1000 + SECONDS))" "$1" > "$PIPE_LOCK"; } 2>/dev/null
+  taken=$?
+  set +C
+  return "$taken"
+}
+
+# Stale once older than a pipe can run, judged by age: pids get reused.
+break_stale_pipe_lock() {
+  local taken_at="" holder max_age=$((DELIVERY_REAPER_SECONDS + 2))
+  [ -e "$PIPE_LOCK" ] || return 0
+  read -r taken_at holder 2>/dev/null < "$PIPE_LOCK"
+  case "$taken_at" in
+    ''|*[!0-9]*)
+      # Mid-write, or its writer died there: aged by how long it reads so.
+      UNREADABLE_LOCK_SINCE=${UNREADABLE_LOCK_SINCE:-$SECONDS}
+      [ $((SECONDS - UNREADABLE_LOCK_SINCE)) -gt "$max_age" ] || return 0
+      ;;
+    *)
+      [ $((TS_MS / 1000 + SECONDS - taken_at)) -gt "$max_age" ] || return 0
+      ;;
+  esac
+  rm -f "$PIPE_LOCK"
+  UNREADABLE_LOCK_SINCE=""
+}
+
+# False while an urgent event of the session waits ahead of token $1: any,
+# for a coalesced event; an older one, for an urgent event.
+is_my_turn() {
+  local marker other other_ms max_age=$((4 * DELIVERY_REAPER_SECONDS + 2))
+  for marker in "$URGENT_PREFIX"*; do
+    [ -e "$marker" ] || continue
+    other=${marker#"$URGENT_PREFIX"}
+    other_ms=${other%%.*}
+    case "$other_ms" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$other" != "$1" ] || continue
+    # Outlived any urgent deliverer: its owner is gone.
+    if [ $((TS_MS / 1000 + SECONDS - other_ms / 1000)) -gt "$max_age" ]; then
+      rm -f "$marker"
+      continue
+    fi
+    [ "$IS_URGENT_EVENT" = true ] || return 1
+    if [ "$other_ms" -lt "${1%%.*}" ] ||
+       { [ "$other_ms" -eq "${1%%.*}" ] && [ "${other#*.}" -lt "${1#*.}" ]; }; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+end_turn() {
+  local token=$1 holding=$2 taken_at holder done_files=()
+  [ "$IS_URGENT_EVENT" = false ] || done_files+=("$URGENT_PREFIX$token")
+  if [ "$holding" = true ] &&
+     read -r taken_at holder 2>/dev/null < "$PIPE_LOCK" &&
+     [ "$holder" = "$token" ]; then
+    done_files+=("$PIPE_LOCK")
+  fi
+  [ "${#done_files[@]}" -eq 0 ] || rm -f "${done_files[@]}"
+}
+
+# One pipe per session at a time: urgent events first, oldest first. A newer
+# event of the stream takes the turn, except from SessionEnd. After three
+# reaper spans of waiting, a coalesced event is dropped and an urgent one
+# pipes without the lock.
+pipe_in_turn() {
+  local token=$1 started=$SECONDS holding=false may_pipe=false
+  while [ "$HOOK_EVENT" = "SessionEnd" ] || is_stream_newest "$token"; do
+    if is_my_turn "$token" && take_pipe_lock "$token"; then
+      holding=true
+      may_pipe=true
+      break
+    fi
+    break_stale_pipe_lock
+    if [ $((SECONDS - started)) -ge $((3 * DELIVERY_REAPER_SECONDS)) ]; then
+      may_pipe=$IS_URGENT_EVENT
+      break
+    fi
+    sleep "$DELIVERY_POLL_SECONDS"
+  done
+  if [ "$may_pipe" = true ] &&
+     { [ "$HOOK_EVENT" = "SessionEnd" ] || claim_stream_event "$token"; }; then
+    pipe_payload
+  fi
+  end_turn "$token" "$holding"
+}
+
+deliver_after_window() {
   sleep "$DELIVERY_COALESCE_SECONDS"
-  claim_stream_event "$1" || return 0
-  session_is_clientless || pipe_payload
+  if session_is_clientless; then
+    claim_stream_event "$1"
+    return 0
+  fi
+  pipe_in_turn "$1"
 }
 
 # Runs "$@" detached: own process group, stdio closed, no agent pipe held.
@@ -1344,42 +1447,44 @@ start_deliverer() {
 
 # Hands the payload to a detached deliverer and returns at once.
 deliver_payload() {
-  local stream_prefix token
+  local host_key token="$TS_MS.$$"
   if [ -z "$PANE_CACHE_PREFIX" ]; then
     start_deliverer pipe_payload
     return
   fi
-  stream_prefix="$PANE_CACHE_PREFIX.${AGENT_HOST//\//_}"
+  host_key=${AGENT_HOST//\//_}
+  PIPE_LOCK="$STATE_CACHE_DIR/$STATE_CACHE_KEY.$host_key.pipe-lock"
+  URGENT_PREFIX="$STATE_CACHE_DIR/$STATE_CACHE_KEY.$host_key.urgent."
   if [ "$IS_SUBAGENT" = true ]; then
-    STREAM_PENDING="$stream_prefix.subagents.pending"
-    STREAM_CLAIMED="$stream_prefix.subagents.claimed"
+    STREAM_PENDING="$PANE_CACHE_PREFIX.$host_key.subagents.pending"
+    STREAM_CLAIMED="$PANE_CACHE_PREFIX.$host_key.subagents.claimed"
   else
-    STREAM_PENDING="$stream_prefix.root.pending"
-    STREAM_CLAIMED="$stream_prefix.root.claimed"
+    STREAM_PENDING="$PANE_CACHE_PREFIX.$host_key.root.pending"
+    STREAM_CLAIMED="$PANE_CACHE_PREFIX.$host_key.root.claimed"
+  fi
+  case "$HOOK_EVENT" in
+    SessionStart|SessionEnd|UserPromptSubmit|PermissionRequest|Stop)
+      IS_URGENT_EVENT=true ;;
+    *) IS_URGENT_EVENT=false ;;
+  esac
+
+  if [ "$HOOK_EVENT" = "SessionEnd" ]; then
+    rm -f "$PANE_CACHE_PREFIX.$host_key".root.* \
+      "$PANE_CACHE_PREFIX.$host_key".subagents.*
+  elif [ "$HOOK_EVENT" = "Notification" ] && [ -e "$STREAM_PENDING" ]; then
+    # Notification only refreshes a timestamp; it yields to a pending event.
+    return
+  elif ! printf '%s\n' "$token" 2>/dev/null > "$STREAM_PENDING"; then
+    start_deliverer pipe_payload
+    return
   fi
 
-  case "$HOOK_EVENT" in
-    SessionEnd)
-      rm -f "$stream_prefix".root.* "$stream_prefix".subagents.*
-      start_deliverer pipe_payload
-      ;;
-    SessionStart|UserPromptSubmit|PermissionRequest|Stop)
-      [ ! -e "$STREAM_PENDING" ] || rm -f "$STREAM_PENDING"
-      start_deliverer pipe_payload
-      ;;
-    *)
-      # Notification only refreshes a timestamp; it yields to a pending event.
-      if [ "$HOOK_EVENT" = "Notification" ] && [ -e "$STREAM_PENDING" ]; then
-        return
-      fi
-      token="$TS_MS.$$"
-      if printf '%s\n' "$token" 2>/dev/null > "$STREAM_PENDING"; then
-        start_deliverer deliver_if_newest "$token"
-      else
-        start_deliverer pipe_payload
-      fi
-      ;;
-  esac
+  if [ "$IS_URGENT_EVENT" = true ]; then
+    : 2>/dev/null > "$URGENT_PREFIX$token"
+    start_deliverer pipe_in_turn "$token"
+  else
+    start_deliverer deliver_after_window "$token"
+  fi
 }
 
 # Best-effort: a missing Zellij session or plugin never fails the agent's hook.
