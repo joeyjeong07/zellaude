@@ -81,3 +81,11 @@
 - Selected: 1. The missing-keys clause is my addition: it keeps today's self-repair after a user config reload, which option 1 alone would lose.
 - Pinned at checkpoint 4 (round 2): a received target message re-runs the check, so a quick A→B→A switch cannot leave tab A's keys on B.
 - Pinned at checkpoint 4 (round 3): the target is recorded per client (`PluginIds.client_id` in the payload), and a received message triggers at most one retarget per activation, so two attached clients cannot retarget each other forever. Verification adds a two-client idle check.
+
+### "Active" from the host for receipt-triggered retargets (rev 6)
+- impl2 found, from zellij 0.44.3 source, that `TabUpdate` reaches only plugins on each client's active tab. A just-hidden instance keeps believing it is active, so rev 5's receipt-triggered retarget could fire from up to k−1 hidden instances and leave the keys on a hidden tab.
+- Options, ranked (impl2's):
+  1. (rec) Ask the host (`get_focused_pane_info`) only for receipt- and snapshot-triggered checks; cache "not here" until the next `TabUpdate`; Err or timeout = not here, never retried — truthful, about one query per visit / a blocking host call on a hidden instance, bounded at 100 ms.
+  2. The sender's activation time in the payload — no host call / changes the pinned payload, and plugin-thread processing order can invert under load, recreating the A→B→A race.
+  3. Drop receipt- and snapshot-triggered retargets — simplest / A→B→A leaves the keys on B until A's next `TabUpdate`.
+- Selected: 1. "Never retried, never on a timer" is mine, from the August livelock: that was a retried host call with a 100 ms deadline.
