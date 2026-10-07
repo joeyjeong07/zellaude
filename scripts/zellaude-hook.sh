@@ -1350,7 +1350,10 @@ take_pipe_lock() {
 # Stale once older than a pipe can run, judged by age: pids get reused.
 break_stale_pipe_lock() {
   local taken_at="" holder max_age=$((DELIVERY_REAPER_SECONDS + 2))
-  [ -e "$PIPE_LOCK" ] || return 0
+  if [ ! -e "$PIPE_LOCK" ]; then
+    UNREADABLE_LOCK_SINCE=""
+    return 0
+  fi
   read -r taken_at holder 2>/dev/null < "$PIPE_LOCK"
   case "$taken_at" in
     ''|*[!0-9]*)
@@ -1359,6 +1362,7 @@ break_stale_pipe_lock() {
       [ $((SECONDS - UNREADABLE_LOCK_SINCE)) -gt "$max_age" ] || return 0
       ;;
     *)
+      UNREADABLE_LOCK_SINCE=""
       [ $((TS_MS / 1000 + SECONDS - taken_at)) -gt "$max_age" ] || return 0
       ;;
   esac

@@ -1449,6 +1449,31 @@ DELIVERY_WINDOW=0.05 expect_delivered "stale lock broken" \
 ZELLAUDE_DELIVERY_REAPER_SECONDS=2 DELIVERY_WINDOW=0.05 \
   expect_delivered "unreadable lock broken" "$(delivery_event PreToolUse)"
 
+# The unreadable-lock clock covers one unbroken run of unreadable reads: a
+# readable or absent lock in between restarts it, so a fresh lock caught
+# mid-write is never aged by an earlier run.
+STALE_LOCK_FN=$(sed -n '/^break_stale_pipe_lock() {/,/^}/p' \
+  "$PROJECT_DIR/scripts/zellaude-hook.sh")
+for interruption in readable absent; do
+  bash -c "$STALE_LOCK_FN"'
+    PIPE_LOCK=$1 DELIVERY_REAPER_SECONDS=1 TS_MS=$(($(date +%s) * 1000))
+    UNREADABLE_LOCK_SINCE=$((SECONDS - 100))
+    if [ "$2" = readable ]; then
+      printf "%s fresh\n" "$((TS_MS / 1000))" > "$PIPE_LOCK"
+    else
+      rm -f "$PIPE_LOCK"
+    fi
+    break_stale_pipe_lock
+    : > "$PIPE_LOCK"
+    break_stale_pipe_lock
+    [ -e "$PIPE_LOCK" ]' _ "$TEST_DIR/unit-pipe-lock" "$interruption" || {
+    printf 'a %s lock did not restart the unreadable-lock clock\n' \
+      "$interruption" >&2
+    exit 1
+  }
+done
+rm -f "$TEST_DIR/unit-pipe-lock"
+
 # A live holder that never lets go: after three reaper spans a coalesced event
 # is dropped and an urgent one pipes without the lock.
 printf '%s alive\n' "$(($(date +%s) + 1000))" > "$PIPE_LOCK"
