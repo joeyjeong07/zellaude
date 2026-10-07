@@ -97,3 +97,7 @@
   2. Also host-judge `TabUpdate` — closes the late-`TabUpdate` residual / a timed-out query is re-asked on the same visit's next `TabUpdate`.
   3. Leave rev 6 — fewer queries / the starting-tab failure and the detached storm remain.
 - Selected: 1. The residual is repaired by the focused instance's receipt, once per activation.
+
+### Keys were less reliable mid-run, before T16
+- impl3 measured first visits after a re-attach: the branch at 7585d2e (before T16) failed 7 of 24 split-three and 6 of 24 prompt visits, against `develop`'s 3 of 24. An earlier row made the keys less reliable for a while; which one is not traced. T16 replaces the whole binding mechanism, and rev 8's pass condition (0 failures over ≥3 repeats of 8 visits) tells the fix apart from both baselines: chance alone would pass it about 4 % of the time at `develop`'s rate.
+- Options: trace which earlier row worsened it / rely on T16's replacement plus the pass condition. Selected: rely on T16 — the mechanism that failed no longer exists once T16 lands. If T16's pass condition fails, the trace comes back.
