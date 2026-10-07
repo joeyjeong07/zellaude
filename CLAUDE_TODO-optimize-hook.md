@@ -28,7 +28,7 @@ Critics: plan=1 impl=1
 ### Finalize
 | ID | Agent | Task | Depends on | Status |
 |----|-------|------|------------|--------|
-| T10 | impl3 | Merge from the integration branch: the moment deps clear — no gate — merge `develop` into the feature branch, resolving conflicts with best judgment. An extra merge loop appends fresh rows — this one never re-runs. Protocol: `madev:impl` Finalization. | T1, T2, T3, T4, T5, T6, T7, T8, T9 | [ ] |
+| T10 | impl3 | Merge from the integration branch: the moment deps clear — no gate — merge `develop` into the feature branch, resolving conflicts with best judgment. An extra merge loop appends fresh rows — this one never re-runs. Protocol: `madev:impl` Finalization. | T1, T2, T3, T4, T5, T6, T7, T8, T9 | [x] |
 | T11 | impl3 | Compact-comments pass over the touched files per the session's coding standards: default none, one line each, no history or rationale; light touch-ups, no behavior change; remove resolved CLAUDE notes; commit. | T10 | [ ] |
 | T12 | impl3 | Run the PLAN's Verification on the merged + tidied state — tests and builds, load-independent cost, the E2E, the `dump-layout` arm, the throttling arm and the `action pipe` floor check — preflight first, then run unattended when it fits; artifacts to `/tmp/optimize-hook`. On failure or preflight no-go, report to the planner and wait for the routed fix — never self-fix, never free up resources; loop until clean. | T11 | [ ] |
 | T13 | impl3 | Archive on the planner's explicit go: clear leftover feature CLAUDE notes, append the History entry, delete/prune this feature's in-flight seeds, `git rm` the PLAN, TODO and review guide (`[archive]`), `macoord cleanup`. Protocol: `madev:impl` Finalization. | T12 | (Not possible to mark after deletion) |
