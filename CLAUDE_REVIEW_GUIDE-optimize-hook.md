@@ -89,3 +89,11 @@
   2. The sender's activation time in the payload — no host call / changes the pinned payload, and plugin-thread processing order can invert under load, recreating the A→B→A race.
   3. Drop receipt- and snapshot-triggered retargets — simplest / A→B→A leaves the keys on B until A's next `TabUpdate`.
 - Selected: 1. "Never retried, never on a timer" is mine, from the August livelock: that was a retried host call with a 100 ms deadline.
+
+### Host-judged "active" on every trigger but TabUpdate (rev 7)
+- impl3 measured that today the split-three key and the custom-state prompt key do nothing on a fresh 8-tab session's starting tab, fail on tabs 1 and 4 after a re-attach, and fail in both tabs with a second client. impl2 traced it from source: a fresh session makes every tab briefly active, the grant reaches all 8 instances, all install, and a hidden one wins. Rev 6 host-judged only receipts and snapshots, so it would not fix this, and in a detached session `PaneUpdate` (reaching every instance) would trigger a reconfigure storm.
+- Options, ranked:
+  1. (rec) Host-judge every trigger except `TabUpdate`, with rev 6's rules (cheap checks first, "not here"/Err/timeout cached until the next `TabUpdate`, never re-asked) — fixes all three cases and keeps detached sessions quiet / up to one query per instance per attach.
+  2. Also host-judge `TabUpdate` — closes the late-`TabUpdate` residual / a timed-out query is re-asked on the same visit's next `TabUpdate`.
+  3. Leave rev 6 — fewer queries / the starting-tab failure and the detached storm remain.
+- Selected: 1. The residual is repaired by the focused instance's receipt, once per activation.
