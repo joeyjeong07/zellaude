@@ -71,3 +71,13 @@
   2. Restate the bar to the attach phase and park both as seeds — the run closes sooner / leaves the largest per-visit cost and an unbounded leak in place.
   3. Fix only the timer leak — one small row / leaves two thirds of each visit's cost.
 - Selected: 1. The user is told and can push either one to a seed.
+
+### Binding target tracked by broadcast (rev 5)
+- impl2 confirmed T16's cause differs from the suspicion: zellij 0.44.3 erases `KeybindPipe`'s fields, `plugin_id` included, in the `InitialKeybinds` snapshot, so no check can read the target from it.
+- Options, ranked (impl2's, plus one addition):
+  1. (rec) Broadcast the target (`zellaude:bindings-target`), record it per instance, and reconfigure once, joined, only when the record is not this instance or zellaude's keys are missing — 0 reloads for repeated updates on one tab, 1 per visit / a new pipe name and field, and a multi-client ping-pong no worse than today.
+  2. Reset only when another tab is seen active — no new pipe / a quick away-and-back inside one `SessionUpdate` interval can silently misroute keys.
+  3. Keep the reset and only join the snippets — smallest change / halves the reloads but misses the ≤ 2 bound.
+- Selected: 1. The missing-keys clause is my addition: it keeps today's self-repair after a user config reload, which option 1 alone would lose.
+- Pinned at checkpoint 4 (round 2): a received target message re-runs the check, so a quick A→B→A switch cannot leave tab A's keys on B.
+- Pinned at checkpoint 4 (round 3): the target is recorded per client (`PluginIds.client_id` in the payload), and a received message triggers at most one retarget per activation, so two attached clients cannot retarget each other forever. Verification adds a two-client idle check.
