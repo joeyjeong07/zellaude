@@ -18,11 +18,60 @@ printf '%s' "${!#}" > "$ZELLAUDE_TEST_CAPTURE"
 FAKE_ZELLIJ
 chmod +x "$TEST_DIR/bin/zellij"
 
-cat > "$TEST_DIR/fake-claude" <<'FAKE_CLAUDE'
-#!/usr/bin/env bash
-printf '%s' "$ZELLAUDE_TEST_INPUT" | "$ZELLAUDE_TEST_HOOK"
-FAKE_CLAUDE
-chmod +x "$TEST_DIR/fake-claude"
+# The hook climbs its process tree for the agent and its launch flags, so every
+# run gets a fixture tree: otherwise the climb reaches whatever runs the suite,
+# such as a `claude --effort xhigh` session.
+TREE_ROOT="$TEST_DIR/tree"
+mkdir -p "$TREE_ROOT"
+HOOK_PARENT="$TEST_DIR/hook-parent.sh"
+cat > "$HOOK_PARENT" <<'HOOK_PARENT_SCRIPT'
+# Stands in for the process that runs the hook: publishes itself into the tree
+# fixture, when that root exists, and its environ, when given one; then runs the
+# hook as its direct child. Its entries go when it does, as in /proc, so a memo
+# naming it afterwards misses.
+published=()
+if [ -d "$ZELLAUDE_TREE_PROC_ROOT" ]; then
+  node="$ZELLAUDE_TREE_PROC_ROOT/$$"
+  mkdir -p "$node"
+  printf '%s\n' "$ZELLAUDE_TEST_PARENT_COMM" > "$node/comm"
+  printf '%s (%s) S %s 0 0\n' "$$" "$ZELLAUDE_TEST_PARENT_COMM" \
+    "${ZELLAUDE_TEST_GRANDPARENT_PID:-1}" > "$node/stat"
+  printf '%s\0' "$ZELLAUDE_TEST_PARENT_COMM" "$@" > "$node/cmdline"
+  published+=("$node")
+fi
+if [ -s "${ZELLAUDE_TEST_ENVIRON:-}" ]; then
+  mkdir -p "$ZELLAUDE_PROC_ROOT/$$"
+  cp "$ZELLAUDE_TEST_ENVIRON" "$ZELLAUDE_PROC_ROOT/$$/environ"
+  published+=("$ZELLAUDE_PROC_ROOT/$$")
+fi
+printf '%s' "$ZELLAUDE_TEST_INPUT" |
+  PATH=${ZELLAUDE_TEST_HOOK_PATH:-$PATH} ZELLAUDE_TEST_PARENT_PID=$$ \
+    "$BASH" "$ZELLAUDE_TEST_HOOK" ${ZELLAUDE_TEST_HOOK_ARGS:-}
+hook_status=$?
+rm -rf "${published[@]}"
+exit "$hook_status"
+HOOK_PARENT_SCRIPT
+
+# Runs one hook event under HOOK_PARENT, whose comm defaults to bash so no agent
+# is found. NAME=value arguments override the defaults; then comes the command,
+# ending in HOOK_PARENT and its argv.
+run_hook_process() {
+  local input=$1
+  shift
+  env -u CLAUDE_EFFORT \
+    -u CLAUDE_CODE_EFFORT_LEVEL \
+    -u ZELLAUDE_CLAUDE_MODE \
+    PATH="$TEST_DIR/bin:$PATH" \
+    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
+    ZELLIJ_SESSION_NAME="test-session" \
+    ZELLIJ_PANE_ID="7" \
+    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
+    ZELLAUDE_TREE_PROC_ROOT="$TREE_ROOT" \
+    ZELLAUDE_TEST_PARENT_COMM=bash \
+    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
+    ZELLAUDE_TEST_INPUT="$input" \
+    "$@"
+}
 
 run_hook() {
   local client=$1
@@ -36,27 +85,13 @@ run_hook() {
 
   : > "$CAPTURE_FILE"
   if [ "$client" = "codex" ]; then
-    printf '%s' "$input" |
-      env -u CLAUDE_EFFORT \
-        -u CLAUDE_CODE_EFFORT_LEVEL \
-        -u ZELLAUDE_CLAUDE_MODE \
-        PATH="$TEST_DIR/bin:$PATH" \
-        XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-        ZELLIJ_SESSION_NAME="test-session" \
-        ZELLIJ_PANE_ID="7" \
-        ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-        "$PROJECT_DIR/scripts/zellaude-hook.sh" --client codex >/dev/null
+    run_hook_process "$input" \
+      ZELLAUDE_TEST_HOOK_ARGS="--client codex" \
+      bash "$HOOK_PARENT" >/dev/null
   else
-    printf '%s' "$input" |
-      env -u CLAUDE_EFFORT \
-        -u CLAUDE_CODE_EFFORT_LEVEL \
-        ZELLAUDE_CLAUDE_MODE="$mode" \
-        PATH="$TEST_DIR/bin:$PATH" \
-        XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-        ZELLIJ_SESSION_NAME="test-session" \
-        ZELLIJ_PANE_ID="7" \
-        ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-        "$PROJECT_DIR/scripts/zellaude-hook.sh" >/dev/null
+    run_hook_process "$input" \
+      ZELLAUDE_CLAUDE_MODE="$mode" \
+      bash "$HOOK_PARENT" >/dev/null
   fi
 
   actual=$(jq -c '.rainbow_name' "$CAPTURE_FILE")
@@ -111,17 +146,9 @@ run_launch_flag() {
   local actual actual_marker
 
   : > "$CAPTURE_FILE"
-  env -u CLAUDE_EFFORT \
-    -u CLAUDE_CODE_EFFORT_LEVEL \
-    -u ZELLAUDE_CLAUDE_MODE \
-    PATH="$TEST_DIR/bin:$PATH" \
-    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-    ZELLIJ_SESSION_NAME="test-session" \
-    ZELLIJ_PANE_ID="7" \
-    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
-    ZELLAUDE_TEST_INPUT="$input" \
-    "$TEST_DIR/fake-claude" --effort "$effort" >/dev/null
+  run_hook_process "$input" \
+    ZELLAUDE_TEST_PARENT_COMM=claude \
+    bash "$HOOK_PARENT" --effort "$effort" >/dev/null
 
   actual=$(jq -c '.rainbow_name' "$CAPTURE_FILE")
   actual_marker=$(jq -c '.rainbow_mode_marker' "$CAPTURE_FILE")
@@ -139,17 +166,10 @@ run_inline_settings_flag() {
   local actual
 
   : > "$CAPTURE_FILE"
-  env -u CLAUDE_EFFORT \
-    -u CLAUDE_CODE_EFFORT_LEVEL \
-    -u ZELLAUDE_CLAUDE_MODE \
-    PATH="$TEST_DIR/bin:$PATH" \
-    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-    ZELLIJ_SESSION_NAME="test-session" \
-    ZELLIJ_PANE_ID="7" \
-    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
-    ZELLAUDE_TEST_INPUT='{"session_id":"claude-settings","hook_event_name":"SessionStart"}' \
-    "$TEST_DIR/fake-claude" --settings "$settings" >/dev/null
+  run_hook_process \
+    '{"session_id":"claude-settings","hook_event_name":"SessionStart"}' \
+    ZELLAUDE_TEST_PARENT_COMM=claude \
+    bash "$HOOK_PARENT" --settings "$settings" >/dev/null
 
   actual=$(jq -c '.rainbow_name' "$CAPTURE_FILE")
   if [ "$actual" != "$expected" ]; then
@@ -497,28 +517,13 @@ jq -e --argjson mode_ts "$LAUNCH_OVERRIDE_MODE_TS" '
 run_inline_settings_flag '{"ultracode":true}' true
 run_inline_settings_flag '{"ultracode":false,"other":true}' false
 
-# find_agent_pid matches on comm, and a shebang script reports comm=bash, so the
-# stand-in agent must be a copy of the bash binary named for the client. Kept
-# off PATH: these names would otherwise shadow a real client for other cases.
-LAUNCH_ENV_BIN="$TEST_DIR/launch-bin"
+# The agent is HOOK_PARENT under the client's comm, and publishes its own
+# environ because only it knows the pid find_agent_pid resolves to. An empty
+# fixture publishes nothing, which is how the not-captured path is reached.
 LAUNCH_ENV_PROC_ROOT="$TEST_DIR/launch-proc"
 LAUNCH_ENV_ENVIRON="$TEST_DIR/launch-environ"
 LAUNCH_ENV_STDOUT="$TEST_DIR/launch-stdout.json"
-mkdir -p "$LAUNCH_ENV_BIN" "$LAUNCH_ENV_PROC_ROOT"
-cp "$(command -v bash)" "$LAUNCH_ENV_BIN/claude"
-cp "$(command -v bash)" "$LAUNCH_ENV_BIN/codex"
-
-# The agent publishes its own environ, because only it knows the pid that
-# find_agent_pid will resolve to. An empty fixture publishes nothing, which is
-# how the not-captured path is reached.
-cat > "$TEST_DIR/launch-agent.sh" <<'LAUNCH_AGENT'
-if [ -s "$ZELLAUDE_TEST_ENVIRON" ]; then
-  mkdir -p "$ZELLAUDE_PROC_ROOT/$$"
-  cp "$ZELLAUDE_TEST_ENVIRON" "$ZELLAUDE_PROC_ROOT/$$/environ"
-fi
-printf '%s' "$ZELLAUDE_TEST_INPUT" |
-  "$ZELLAUDE_TEST_HOOK" ${ZELLAUDE_TEST_HOOK_ARGS:-}
-LAUNCH_AGENT
+mkdir -p "$LAUNCH_ENV_PROC_ROOT"
 
 write_environ() {
   local entry
@@ -534,21 +539,13 @@ run_launch_env_hook() {
   [ "$client" != "codex" ] || hook_args="--client codex"
 
   : > "$CAPTURE_FILE"
-  env -u CLAUDE_EFFORT \
-    -u CLAUDE_CODE_EFFORT_LEVEL \
-    -u ZELLAUDE_CLAUDE_MODE \
-    PATH="$TEST_DIR/bin:$PATH" \
-    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-    ZELLIJ_SESSION_NAME="test-session" \
-    ZELLIJ_PANE_ID="7" \
-    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
+  run_hook_process "$input" \
+    ZELLAUDE_TEST_PARENT_COMM="$client" \
     ZELLAUDE_TEST_HOOK_ARGS="$hook_args" \
-    ZELLAUDE_TEST_INPUT="$input" \
     ZELLAUDE_TEST_ENVIRON="$LAUNCH_ENV_ENVIRON" \
     ZELLAUDE_PROC_ROOT="$LAUNCH_ENV_PROC_ROOT" \
     "$@" \
-    "$LAUNCH_ENV_BIN/$client" "$TEST_DIR/launch-agent.sh" > "$LAUNCH_ENV_STDOUT"
+    bash "$HOOK_PARENT" > "$LAUNCH_ENV_STDOUT"
 }
 
 rm -f "$STATE_FILE"
@@ -943,35 +940,228 @@ VENDOR_PRETOOLUSE_JSON
 run_hook claude "$(cat "$VENDOR_PRETOOLUSE")" false
 jq -e '.current_effort_level == "high"' "$CAPTURE_FILE" >/dev/null
 
-# find_agent_pid under macOS's ps, measured 2026-09-03: `-o comm=` answers with
-# a full path while `-o ucomm=` answers with the rewritten process title. Real
-# coverage is impossible on Linux, where comm is already a basename and ucomm
-# merely aliases it, so the stub branches on the flag it is asked for — that is
-# what fails a ucomm implementation, which would otherwise pass here and match
-# nothing on macOS.
+# Exec counts pin the hook's cost per event. The hook's PATH holds only logging
+# shims, so a command missing from EXEC_SHIM_NAMES logs as MISSING instead of
+# running unseen.
+EXEC_SHIM_BIN="$TEST_DIR/exec-shim-bin"
+EXEC_LOG="$TEST_DIR/exec.log"
+EXEC_SHIM_NAMES="awk cat chmod date grep head hostname id jq mkdir mktemp mv od
+  ps rm rmdir sha256sum sleep stat tail tr uname zellij"
+mkdir -p "$EXEC_SHIM_BIN"
+cat > "$TEST_DIR/exec-shim" <<'EXEC_SHIM'
+#!/bin/sh
+printf '%s\n' "${0##*/}" >> "$ZELLAUDE_TEST_EXEC_LOG"
+PATH=$ZELLAUDE_TEST_REAL_PATH
+export PATH
+exec "${0##*/}" "$@"
+EXEC_SHIM
+chmod +x "$TEST_DIR/exec-shim"
+for name in $EXEC_SHIM_NAMES; do
+  if PATH="$TEST_DIR/bin:$PATH" command -v "$name" >/dev/null; then
+    ln -s "$TEST_DIR/exec-shim" "$EXEC_SHIM_BIN/$name"
+  fi
+done
+cat > "$TEST_DIR/exec-bash-env" <<'EXEC_BASH_ENV'
+command_not_found_handle() {
+  printf 'MISSING %s\n' "$1" >> "$ZELLAUDE_TEST_EXEC_LOG"
+  return 127
+}
+EXEC_BASH_ENV
+
+# Runs one event like run_hook_process and prints each exec'd command's count,
+# sorted by name. sleep is left out: it is the delivery watchdog's, exec'd or
+# not depending on how fast the fake zellij answers.
+exec_profile() {
+  local input=$1
+  shift
+  : > "$EXEC_LOG"
+  run_hook_process "$input" \
+    ZELLAUDE_TEST_HOOK_PATH="$EXEC_SHIM_BIN" \
+    ZELLAUDE_TEST_REAL_PATH="$TEST_DIR/bin:$PATH" \
+    ZELLAUDE_TEST_EXEC_LOG="$EXEC_LOG" \
+    BASH_ENV="$TEST_DIR/exec-bash-env" \
+    "$@" \
+    bash "$HOOK_PARENT" >/dev/null
+  if grep '^MISSING ' "$EXEC_LOG" >&2; then
+    exit 1
+  fi
+  { grep -vx sleep "$EXEC_LOG" || true; } |
+    sort | uniq -c | awk '{ printf "%s%s=%s", sep, $2, $1; sep = " " }'
+}
+
+exec_count() {
+  grep -cx "$1" "$EXEC_LOG" || true
+}
+
+expect_equal() {
+  local label=$1 expected=$2 actual=$3
+  if [ "$actual" != "$expected" ]; then
+    printf '%s\n  expected: %s\n  actual:   %s\n' \
+      "$label" "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
+# Process facts. Under the tree fixture HOOK_PARENT sits below
+# ZELLAUDE_TEST_GRANDPARENT_PID; 4242 and 4343 are fixture-only agents.
+plant_process() {
+  local pid=$1 comm=$2
+  mkdir -p "$TREE_ROOT/$pid"
+  printf '%s\n' "$comm" > "$TREE_ROOT/$pid/comm"
+  printf '%s (%s) S 1 0 0\n' "$pid" "$comm" > "$TREE_ROOT/$pid/stat"
+}
+plant_process 4242 claude
+plant_process 4343 claude
+
+TREE_TOOL_EVENT='{"session_id":"tree-root","hook_event_name":"PreToolUse"}'
+TREE_SESSION_START='{"session_id":"tree-root","hook_event_name":"SessionStart"}'
+
+# $1 the input, $2 the grandparent; the rest are run_hook_process overrides.
+run_tree_hook() {
+  local input=$1 grandparent=$2
+  shift 2
+  : > "$CAPTURE_FILE"
+  run_hook_process "$input" \
+    ZELLAUDE_TEST_GRANDPARENT_PID="$grandparent" \
+    "$@" \
+    bash "$HOOK_PARENT" >/dev/null
+}
+
+expect_agent_pid() {
+  expect_equal "$1: agent_pid" "$2" "$(jq -r '.agent_pid' "$CAPTURE_FILE")"
+}
+
+rm -f "$STATE_FILE"
+# The stat parse counts fields from the last ')', since comm may hold both.
+run_tree_hook "$TREE_SESSION_START" 4242 ZELLAUDE_TEST_PARENT_COMM='sh (x) y'
+expect_agent_pid "climb through a parent named with parens" 4242
+
+# The record names 4242, so a tool event trusts it over a tree that has moved
+# on; SessionStart never does, because a resume reuses the session id.
+run_tree_hook "$TREE_TOOL_EVENT" 4343
+expect_agent_pid "memo hit" 4242
+run_tree_hook "$TREE_SESSION_START" 4343
+expect_agent_pid "SessionStart climbs" 4343
+
+# A recycled pid fails the comm check, and the climb answers instead.
+plant_process 4343 vim
+run_tree_hook "$TREE_TOOL_EVENT" 4242
+expect_agent_pid "recycled memo pid" 4242
+plant_process 4343 claude
+
+# Another host's record, another session's and a subagent event all climb.
+OTHER_HOST_BIN="$TEST_DIR/other-host-bin"
+mkdir -p "$OTHER_HOST_BIN"
+cat > "$OTHER_HOST_BIN/hostname" <<'FAKE_HOSTNAME'
+#!/usr/bin/env bash
+printf 'other-host.invalid\n'
+FAKE_HOSTNAME
+chmod +x "$OTHER_HOST_BIN/hostname"
+run_tree_hook "$TREE_TOOL_EVENT" 4343 PATH="$OTHER_HOST_BIN:$TEST_DIR/bin:$PATH"
+expect_agent_pid "other host" 4343
+run_tree_hook "$TREE_TOOL_EVENT" 4242
+expect_agent_pid "record from another host" 4242
+run_tree_hook '{"session_id":"tree-other","hook_event_name":"PreToolUse"}' 4343
+expect_agent_pid "other session" 4343
+run_tree_hook "$TREE_SESSION_START" 4242
+run_tree_hook \
+  '{"session_id":"tree-root","hook_event_name":"PreToolUse","agent_id":"child"}' \
+  4343
+expect_agent_pid "subagent event" 4343
+
+# --inspect runs outside the agent's tree: it never reads the record, nor
+# writes it.
+cp "$STATE_FILE" "$TEST_DIR/record.before"
+run_hook_process '{"session_id":"tree-root","hook_event_name":"SessionRestore"}' \
+  ZELLAUDE_TEST_GRANDPARENT_PID=4343 \
+  ZELLAUDE_TEST_HOOK_ARGS=--inspect \
+  bash "$HOOK_PARENT" > "$TEST_DIR/inspect.json"
+jq -e '.agent_pid == 4343' "$TEST_DIR/inspect.json" >/dev/null
+cmp -s "$STATE_FILE" "$TEST_DIR/record.before"
+
+# Requested-mode detection reads argv from the same tree.
+plant_process 4444 claude
+printf 'claude\0--effort\0ultracode\0' > "$TREE_ROOT/4444/cmdline"
+run_tree_hook '{"session_id":"tree-mode","hook_event_name":"SessionStart"}' 4444
+jq -e '.rainbow_name == true and .agent_pid == 4444' "$CAPTURE_FILE" >/dev/null
+
+# The climb is builtins only, so a memo hit and a climb cost the same execs on
+# Linux, and neither runs ps.
+run_tree_hook "$TREE_SESSION_START" 4242
+LINUX_TOOL_EVENT_EXECS=$(exec_profile "$TREE_TOOL_EVENT" \
+  ZELLAUDE_TEST_GRANDPARENT_PID=4343)
+expect_agent_pid "memo hit, counted" 4242
+expect_equal "Linux tool event execs" \
+  "cat=1 chmod=1 date=1 hostname=1 jq=14 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=4 zellij=1" \
+  "$LINUX_TOOL_EVENT_EXECS"
+expect_equal "Linux climbing tool event execs" "$LINUX_TOOL_EVENT_EXECS" \
+  "$(exec_profile '{"session_id":"tree-climb","hook_event_name":"PreToolUse"}' \
+    ZELLAUDE_TEST_GRANDPARENT_PID=4343)"
+expect_equal "Linux SessionStart execs" \
+  "cat=1 chmod=1 date=1 hostname=1 jq=14 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=4 zellij=1" \
+  "$(exec_profile "$TREE_SESSION_START" ZELLAUDE_TEST_GRANDPARENT_PID=4242)"
+
+# macOS has no procfs, so one batched ps answers the climb. Its comm is a full
+# path, measured 2026-09-03, while `-o ucomm=` answers the rewritten process
+# title. The stub branches on the flags it is asked for, so a ucomm reader, or
+# an awk that forgets the basename, matches nothing here as on macOS. Linux
+# cannot cover this for real: its comm is already a basename.
 MACOS_PS_BIN="$TEST_DIR/macos-ps-bin"
 mkdir -p "$MACOS_PS_BIN"
 cat > "$MACOS_PS_BIN/ps" <<'FAKE_MACOS_PS'
 #!/usr/bin/env bash
+pid=${!#}
 case " $* " in
-  *" -o comm= "*)  printf '/Users/x/.local/bin/claude\n' ;;
+  *" -A "*)
+    [ "${ZELLAUDE_TEST_PS_TABLE:-}" != empty ] || exit 0
+    printf '    1     0 /sbin/launchd\n'
+    printf ' 4242     1 /Users/x/.local/bin/claude\n'
+    printf '%5s  4242 /Applications/My Term.app/Contents/MacOS/My Term\n' \
+      "$ZELLAUDE_TEST_PARENT_PID"
+    [ "${ZELLAUDE_TEST_PS_TABLE:-}" != failed ] || exit 1
+    ;;
+  *" -o comm= "*)
+    if [ "$pid" = 4242 ]; then
+      printf '/Users/x/.local/bin/claude\n'
+    else
+      printf '/bin/bash\n'
+    fi
+    ;;
   *" -o ucomm= "*) printf '2.1.191\n' ;;
-  *" -o ppid= "*)  printf '1\n' ;;
+  *" -o ppid= "*)
+    if [ "$pid" = 4242 ]; then printf '1\n'; else printf '4242\n'; fi
+    ;;
 esac
 FAKE_MACOS_PS
 chmod +x "$MACOS_PS_BIN/ps"
+MACOS_PATH="$MACOS_PS_BIN:$TEST_DIR/bin:$PATH"
 
-: > "$CAPTURE_FILE"
-printf '%s' '{"session_id":"macos-comm","hook_event_name":"PreToolUse"}' |
-  env -u CLAUDE_EFFORT \
-    -u CLAUDE_CODE_EFFORT_LEVEL \
-    -u ZELLAUDE_CLAUDE_MODE \
-    PATH="$MACOS_PS_BIN:$TEST_DIR/bin:$PATH" \
-    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-    ZELLIJ_SESSION_NAME="test-session" \
-    ZELLIJ_PANE_ID="7" \
-    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-    "$PROJECT_DIR/scripts/zellaude-hook.sh" >/dev/null
-jq -e '(.agent_pid | type) == "number"' "$CAPTURE_FILE" >/dev/null
+# $1 the input, $2 the stub's table mode: "", empty or failed.
+macos_exec_profile() {
+  exec_profile "$1" \
+    ZELLAUDE_TREE_PROC_ROOT="$TEST_DIR/no-procfs" \
+    ZELLAUDE_TEST_REAL_PATH="$MACOS_PATH" \
+    ZELLAUDE_TEST_PS_TABLE="$2" >/dev/null
+}
+
+rm -f "$STATE_FILE"
+macos_exec_profile '{"session_id":"macos-root","hook_event_name":"PreToolUse"}' ""
+expect_agent_pid "macOS batched ps" 4242
+expect_equal "macOS batched ps: ps, awk" "1 1" \
+  "$(exec_count ps) $(exec_count awk)"
+# An empty table would send the climb to the per-process fallback; the memo
+# answers first, unconfirmed, since macOS offers no fork-free check.
+macos_exec_profile '{"session_id":"macos-root","hook_event_name":"PreToolUse"}' empty
+expect_agent_pid "macOS memo hit" 4242
+expect_equal "macOS memo hit: ps, awk" "0 0" \
+  "$(exec_count ps) $(exec_count awk)"
+for table_mode in empty failed; do
+  macos_exec_profile \
+    "{\"session_id\":\"macos-$table_mode\",\"hook_event_name\":\"PreToolUse\"}" \
+    "$table_mode"
+  expect_agent_pid "macOS $table_mode table falls back" 4242
+  expect_equal "macOS $table_mode table: ps, awk" "4 0" \
+    "$(exec_count ps) $(exec_count awk)"
+done
 
 printf 'hook mode detection tests passed\n'

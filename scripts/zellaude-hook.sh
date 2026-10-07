@@ -47,7 +47,7 @@ ensure_private_cache_dir() {
 
 state_cache_dir() {
   local runtime_root cache_root cache_dir user_id home_cache
-  user_id=$(id -u 2>/dev/null) || return 1
+  user_id=$EUID
 
   runtime_root=${XDG_RUNTIME_DIR:-}
   case "$runtime_root" in
@@ -271,29 +271,132 @@ finish() {
 # that race through parallel hook subprocesses.
 TS_MS=$(jq -nc 'now * 1000 | floor')
 
+# Tree reads only: the launch-env harness plants just <pid>/environ under
+# ZELLAUDE_PROC_ROOT.
+TREE_PROC_ROOT=${ZELLAUDE_TREE_PROC_ROOT:-/proc}
+TREE_HAS_PROCFS=false
+[ -r "$TREE_PROC_ROOT/$PPID/stat" ] && TREE_HAS_PROCFS=true
+
+# macOS `ps -o comm=` returns a full path for claude but a bare name for fish,
+# so basename it — no uname-keyed strip covers both. Never `ucomm`: it returns
+# the rewritten process title (measured "2.1.191", 2026-09-03).
+is_agent_comm() {
+  case "${1##*/}" in
+    claude*|codex*) return 0 ;;
+  esac
+  return 1
+}
+
+# The read_process_* helpers set the variable named $2 to a fact about
+# process $1: from procfs with builtins alone, else from one ps per fact.
+read_process_comm() {
+  local process_comm=""
+  if [ "$TREE_HAS_PROCFS" = true ]; then
+    read -r process_comm 2>/dev/null < "$TREE_PROC_ROOT/$1/comm"
+  else
+    process_comm=$(ps -o comm= -p "$1" 2>/dev/null | tr -d '[:space:]')
+  fi
+  printf -v "$2" '%s' "$process_comm"
+}
+
+# Joined by spaces, as `ps -o args=` prints it.
+read_process_args() {
+  local joined="" arg
+  if [ "$TREE_HAS_PROCFS" = true ]; then
+    while IFS= read -r -d '' arg || [ -n "$arg" ]; do
+      joined="$joined${joined:+ }$arg"
+    done 2>/dev/null < "$TREE_PROC_ROOT/$1/cmdline"
+  else
+    joined=$(ps -o args= -p "$1" 2>/dev/null)
+  fi
+  printf -v "$2" '%s' "$joined"
+}
+
+read_process_ppid() {
+  local parent=""
+  if [ "$TREE_HAS_PROCFS" = true ]; then
+    read -r parent 2>/dev/null < "$TREE_PROC_ROOT/$1/stat"
+    # comm sits in parens and may itself hold spaces or parens.
+    parent=${parent##*) }
+    parent=${parent#* }
+    parent=${parent%% *}
+  else
+    parent=$(ps -o ppid= -p "$1" 2>/dev/null | tr -d '[:space:]')
+  fi
+  printf -v "$2" '%s' "$parent"
+}
+
+# This session's agent pid as the pane's state record holds it. SessionStart
+# never trusts it, because a resumed session reuses its id in a new process.
+memo_agent_pid() {
+  local record memo_pid memo_comm
+  local session_pattern='"session_id":"([^"\]*)"'
+  local host_pattern='"host":"([^"\]*)"'
+  local agent_pid_pattern='"agent_pid":([0-9]+)'
+  [ "$HOOK_EVENT" != "SessionStart" ] && [ -n "$PANE_STATE_PATH" ] || return 1
+  IFS= read -r record 2>/dev/null < "$PANE_STATE_PATH" || return 1
+  [[ $record =~ $session_pattern ]] &&
+    [ "${BASH_REMATCH[1]}" = "$SESSION_ID" ] || return 1
+  [[ $record =~ $host_pattern ]] &&
+    [ "${BASH_REMATCH[1]}" = "$AGENT_HOST" ] || return 1
+  [[ $record =~ $agent_pid_pattern ]] || return 1
+  memo_pid=${BASH_REMATCH[1]}
+  if [ "$TREE_HAS_PROCFS" = true ]; then
+    read_process_comm "$memo_pid" memo_comm
+    is_agent_comm "$memo_comm" || return 1
+  fi
+  printf '%s\n' "$memo_pid"
+}
+
+# Climbs a `ps -A` table by the same rule as is_agent_comm.
+find_agent_pid_in_ps_table() {
+  awk -v start="$PPID" '
+    {
+      comm = $0
+      sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", comm)
+      sub(/.*\//, "", comm)
+      parent[$1] = $2
+      name[$1] = comm
+    }
+    END {
+      for (pid = start; pid > 1 && (pid in parent); pid = parent[pid])
+        if (name[pid] ~ /^(claude|codex)/) { print pid; exit 0 }
+      exit 1
+    }
+  ' <<< "$1"
+}
+
+climb_to_agent_pid() {
+  local pid=$PPID comm
+  while [ "$pid" -gt 1 ] 2>/dev/null; do
+    read_process_comm "$pid" comm
+    if is_agent_comm "$comm"; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+    read_process_ppid "$pid" pid
+  done
+  return 1
+}
+
 # The agent process that fired this hook: the nearest claude/codex ancestor
 # (hooks run as descendants of the client). Recorded so tools reading the
 # state cache (zellmv) get exact kill/inspect targets instead of inferring
 # them from argv, which process-title rewrites make unreliable. The host
 # matters on shared homes, where every pod sees this cache.
 find_agent_pid() {
-  local pid comm
-  pid=$PPID
-  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
-    # macOS `ps -o comm=` returns a full path for claude but a bare name for
-    # fish, so basename it — no uname-keyed strip covers both. Never `ucomm`:
-    # it returns the rewritten process title (measured "2.1.191", 2026-09-03).
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')
-    comm=${comm##*/}
-    case "$comm" in
-      claude*|codex*) printf '%s\n' "$pid"; return 0 ;;
-    esac
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
-  done
-  return 1
+  local process_table
+  memo_agent_pid && return 0
+  # A working ps lists at least init, the agent and this hook, so empty
+  # output means it failed.
+  if [ "$TREE_HAS_PROCFS" = false ] &&
+     process_table=$(ps -A -o pid= -o ppid= -o comm= 2>/dev/null) &&
+     [ -n "$process_table" ]; then
+    find_agent_pid_in_ps_table "$process_table"
+    return
+  fi
+  climb_to_agent_pid
 }
-AGENT_PID=$(find_agent_pid) || AGENT_PID=""
-AGENT_HOST=$(hostname 2>/dev/null) || AGENT_HOST=""
 
 # Launch-time knobs a relaunch must reproduce: backend, auth, model, agent
 # behavior. Exact names, one list for both clients — no prefix matching and no
@@ -645,7 +748,7 @@ claude_process_requested_mode() {
   depth=0
 
   while [ "$process_id" -gt 1 ] 2>/dev/null && [ "$depth" -lt 8 ]; do
-    process_args=$(ps -o args= -p "$process_id" 2>/dev/null)
+    read_process_args "$process_id" process_args
     case "$process_args" in
       *"--effort ultracode"*|*"--effort=ultracode"*)
         printf 'ultracode'
@@ -672,7 +775,7 @@ claude_process_requested_mode() {
         ;;
     esac
 
-    parent_id=$(ps -o ppid= -p "$process_id" 2>/dev/null | tr -d ' ')
+    read_process_ppid "$process_id" parent_id
     case "$parent_id" in
       ''|*[!0-9]*)
         printf 'unknown'
@@ -898,6 +1001,18 @@ case "$RAINBOW_NAME" in
   *) RAINBOW_NAME="null" ;;
 esac
 
+# The pane's state record: the attach-time cache, and the agent-pid memo.
+PANE_STATE_PATH=""
+if [ "$INSPECT_ONLY" = false ] &&
+   [ "$IS_SUBAGENT" = false ] &&
+   [ -n "$SESSION_ID" ] &&
+   STATE_CACHE_DIR=$(state_cache_dir) &&
+   STATE_CACHE_KEY=$(state_cache_key "$ZELLIJ_SESSION_NAME"); then
+  PANE_STATE_PATH="$STATE_CACHE_DIR/$STATE_CACHE_KEY.$ZELLIJ_PANE_ID.json"
+fi
+AGENT_HOST=$(hostname 2>/dev/null) || AGENT_HOST=""
+AGENT_PID=$(find_agent_pid) || AGENT_PID=""
+
 if [ "$INSPECT_ONLY" = true ]; then
   # --inspect runs outside the agent's process tree: the environment here is
   # zellaude-attach.sh's, not the agent's, and substituting it would be a lie.
@@ -968,14 +1083,11 @@ PAYLOAD=$(jq -nc \
   }')
 
 persist_root_state() {
-  local cache_dir session_key cache_path lock_dir cache_tmp cache_payload
+  local cache_path lock_dir cache_tmp cache_payload
   local merged_payload cached_owner cached_ts
-  [ "$IS_SUBAGENT" = false ] || return 0
-  [ -n "$SESSION_ID" ] || return 0
+  [ -n "$PANE_STATE_PATH" ] || return 0
 
-  cache_dir=$(state_cache_dir) || return 0
-  session_key=$(state_cache_key "$ZELLIJ_SESSION_NAME") || return 0
-  cache_path="$cache_dir/$session_key.$ZELLIJ_PANE_ID.json"
+  cache_path=$PANE_STATE_PATH
   lock_dir="$cache_path.lock"
 
   umask 077
@@ -1085,7 +1197,7 @@ persist_root_state() {
     [ -z "$merged_payload" ] || cache_payload=$merged_payload
   fi
 
-  cache_tmp=$(mktemp "$cache_dir/.state.XXXXXX" 2>/dev/null) || {
+  cache_tmp=$(mktemp "$STATE_CACHE_DIR/.state.XXXXXX" 2>/dev/null) || {
     release_cache_lock "$lock_dir"
     return 0
   }
