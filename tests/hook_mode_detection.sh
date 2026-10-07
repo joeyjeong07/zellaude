@@ -1093,18 +1093,18 @@ LINUX_TOOL_EVENT_EXECS=$(exec_profile "$TREE_TOOL_EVENT" \
   ZELLAUDE_TEST_GRANDPARENT_PID=4343)
 expect_agent_pid "memo hit, counted" 4242
 expect_equal "Linux tool event execs" \
-  "chmod=1 date=1 hostname=1 jq=4 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=1 zellij=1" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=2 tr=1 zellij=1" \
   "$LINUX_TOOL_EVENT_EXECS"
 expect_equal "Linux climbing tool event execs" "$LINUX_TOOL_EVENT_EXECS" \
   "$(exec_profile '{"session_id":"tree-climb","hook_event_name":"PreToolUse"}' \
     ZELLAUDE_TEST_GRANDPARENT_PID=4343)"
 expect_equal "Linux SessionStart execs" \
-  "chmod=1 date=1 hostname=1 jq=4 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=1 zellij=1" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=2 tr=1 zellij=1" \
   "$(exec_profile "$TREE_SESSION_START" ZELLAUDE_TEST_GRANDPARENT_PID=4242)"
 # The common Linux path: the agent is found and its environ is readable.
 write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/'
 expect_equal "Linux tool event with launch env execs" \
-  "chmod=1 date=1 hostname=1 jq=5 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=1 zellij=1" \
+  "date=1 hostname=1 jq=4 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=2 tr=1 zellij=1" \
   "$(exec_profile '{"session_id":"tree-launch-env","hook_event_name":"PreToolUse"}' \
     ZELLAUDE_TEST_PARENT_COMM=claude \
     ZELLAUDE_TEST_ENVIRON="$LAUNCH_ENV_ENVIRON" \
@@ -1159,6 +1159,40 @@ for settings in '{"rainbow":true}' '{"rainbow":"no"}' '{"rainbow":' \
   run_hook claude "$(claude_ultra_event UserPromptSubmit rainbow-on)" true
 done
 write_settings
+
+# The cache write: one stat per directory for owner and mode, and chmod only
+# when a mode is not already 700.
+CACHE_DIR="$TEST_DIR/runtime/zellaude-$(id -u)"
+is_private_dir() {
+  [ "$(ls -ld "$1" | cut -c1-10)" = "drwx------" ]
+}
+chmod 750 "$CACHE_DIR"
+exec_profile "$TREE_TOOL_EVENT" >/dev/null
+expect_equal "loose cache dir: chmod" 1 "$(exec_count chmod)"
+is_private_dir "$CACHE_DIR"
+exec_profile "$TREE_TOOL_EVENT" >/dev/null
+expect_equal "private cache dir: chmod" 0 "$(exec_count chmod)"
+
+# A runtime dir others can write is no home for the cache, so it falls back to
+# ~/.cache, at one stat per level.
+HOME_STATE_FILE="$HOME/.cache/zellaude/runtime/test-session.7.json"
+chmod 770 "$TEST_DIR/runtime"
+run_tree_hook "$TREE_TOOL_EVENT" 1
+chmod 700 "$TEST_DIR/runtime"
+jq -e '.session_id == "tree-root"' "$HOME_STATE_FILE" >/dev/null
+is_private_dir "$HOME/.cache/zellaude/runtime"
+expect_equal "home cache execs" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=3 tr=1 zellij=1" \
+  "$(exec_profile "$TREE_TOOL_EVENT" XDG_RUNTIME_DIR=)"
+
+# One jq reads the record and merges into it. A record it cannot read, empty
+# or malformed, is replaced rather than kept forever.
+for record in '' '{"session_id":'; do
+  printf '%s' "$record" > "$STATE_FILE"
+  run_tree_hook "$TREE_TOOL_EVENT" 4242
+  jq -e '.session_id == "tree-root" and .hook_event == "PreToolUse"' \
+    "$STATE_FILE" >/dev/null
+done
 
 # macOS has no procfs, so one batched ps answers the climb. Its comm is a full
 # path, measured 2026-09-03, while `-o ucomm=` answers the rewritten process

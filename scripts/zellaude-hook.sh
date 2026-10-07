@@ -6,22 +6,18 @@
 #   Claude Code: "/path/to/zellaude-hook.sh"
 #   Codex:       "/path/to/zellaude-hook.sh --client codex"
 
-path_owner_id() {
-  stat -c '%u' "$1" 2>/dev/null ||
-    stat -f '%u' "$1" 2>/dev/null
-}
-
-path_mode() {
-  stat -c '%a' "$1" 2>/dev/null ||
-    stat -f '%Lp' "$1" 2>/dev/null
+# Prints "<owner uid> <octal permission bits>" from one stat.
+path_owner_and_mode() {
+  stat -c '%u %a' "$1" 2>/dev/null ||
+    stat -f '%u %Lp' "$1" 2>/dev/null
 }
 
 is_owned_private_parent() {
-  local path=$1 expected_owner=$2 owner mode
+  local path=$1 expected_owner=$2 owner_and_mode mode
   [ -d "$path" ] && [ ! -L "$path" ] || return 1
-  owner=$(path_owner_id "$path") || return 1
-  [ "$owner" = "$expected_owner" ] || return 1
-  mode=$(path_mode "$path") || return 1
+  owner_and_mode=$(path_owner_and_mode "$path") || return 1
+  [ "${owner_and_mode%% *}" = "$expected_owner" ] || return 1
+  mode=${owner_and_mode#* }
   case "$mode" in
     ''|*[!0-7]*) return 1 ;;
   esac
@@ -32,15 +28,16 @@ is_owned_private_parent() {
 }
 
 ensure_private_cache_dir() {
-  local path=$1 expected_owner=$2 owner
+  local path=$1 expected_owner=$2 owner_and_mode
   if [ -e "$path" ] || [ -L "$path" ]; then
     [ -d "$path" ] && [ ! -L "$path" ] || return 1
   else
     (umask 077 && mkdir "$path") 2>/dev/null || return 1
   fi
 
-  owner=$(path_owner_id "$path") || return 1
-  [ "$owner" = "$expected_owner" ] || return 1
+  owner_and_mode=$(path_owner_and_mode "$path") || return 1
+  [ "$owner_and_mode" = "$expected_owner 700" ] && return 0
+  [ "${owner_and_mode%% *}" = "$expected_owner" ] || return 1
   chmod 700 "$path" 2>/dev/null || return 1
   is_owned_private_parent "$path" "$expected_owner"
 }
@@ -1113,8 +1110,11 @@ persist_root_state() {
 
   if [ "$HOOK_EVENT" = "SessionEnd" ]; then
     if [ -f "$cache_path" ]; then
-      cached_owner=$(jq -r '.session_id // empty' "$cache_path" 2>/dev/null)
-      cached_ts=$(jq -r '.ts_ms // 0' "$cache_path" 2>/dev/null)
+      # ts first: tab is IFS whitespace, so an empty owner ahead of it would
+      # collapse and shift the ts into cached_owner.
+      IFS=$'\t' read -r cached_ts cached_owner <<< "$(
+        jq -r '[.ts_ms // 0, .session_id // ""] | @tsv' "$cache_path" 2>/dev/null
+      )"
       case "$cached_ts" in
         ''|*[!0-9]*) cached_ts=0 ;;
       esac
@@ -1129,20 +1129,17 @@ persist_root_state() {
 
   cache_payload=$PAYLOAD
 
-  if [ -f "$cache_path" ]; then
-    cached_ts=$(jq -r '.ts_ms // 0' "$cache_path" 2>/dev/null)
-    case "$cached_ts" in
-      ''|*[!0-9]*) cached_ts=0 ;;
-    esac
-    if [ "$cached_ts" -gt "$TS_MS" ]; then
-      release_cache_lock "$lock_dir"
-      return 0
-    fi
-
-    merged_payload=$(
-      jq -c --argjson current "$PAYLOAD" '
-        . as $previous
-        | if (
+  # Empty output means the cached state is newer than this event. A record
+  # jq cannot read fails the call, and the current payload replaces it.
+  if [ -f "$cache_path" ] &&
+     merged_payload=$(
+      jq -nc --argjson current "$PAYLOAD" '
+        input as $previous
+        | ($previous.ts_ms // 0 | tostring) as $cached_ts
+        | if ($cached_ts | test("^[0-9]+$"))
+            and ($cached_ts | tonumber) > $current.ts_ms
+          then empty
+          elif (
             $previous.session_id == $current.session_id
             and $current.hook_event != "SessionStart"
           ) then
@@ -1204,8 +1201,12 @@ persist_root_state() {
             .
           end
       ' "$cache_path" 2>/dev/null
-    ) || merged_payload=""
-    [ -z "$merged_payload" ] || cache_payload=$merged_payload
+    ); then
+    if [ -z "$merged_payload" ]; then
+      release_cache_lock "$lock_dir"
+      return 0
+    fi
+    cache_payload=$merged_payload
   fi
 
   cache_tmp=$(mktemp "$STATE_CACHE_DIR/.state.XXXXXX" 2>/dev/null) || {
