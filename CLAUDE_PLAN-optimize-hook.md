@@ -75,7 +75,7 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
     - Off: the hook skips rainbow detection and sends `rainbow_name: null` ("not looked"), not `false`, so the state cache that `zellaude-attach.sh` reads never records a false fact.
     - Cost of `null`, accepted: if the user leaves ultracode while rainbow is off, then turns rainbow back on, the old rainbow shows until the next `SessionStart` or `UserPromptSubmit` scan. A `null` keeps the cached `true` through the merge.
     - Off renders a name exactly as a non-rainbow session: no rainbow colors and no rainbow-driven bold. Active and flash bold stay.
-  - **Q3 scan rule:** Claude's transcript scan runs on `SessionStart` and `UserPromptSubmit` only: `/effort` is a local command, so it can't change mid-turn.
+  - **Q3 scan rule:** Claude's transcript scan runs on `SessionStart` and `UserPromptSubmit` only: `/effort` is a local command, so it can't change mid-turn. `SessionRestore`, the `--inspect` event `zellaude-attach.sh` sends for attach recovery, also scans: it is not a Claude hook event and has no earlier scan to lean on.
     - Other events still resolve from `.effort.level`, else send `null`, which keeps the previous value. Codex detection is untouched.
     - Measured −42 ms per event (15 %) with the suite green.
   - **Hook micro-cuts:**
