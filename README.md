@@ -575,7 +575,7 @@ Three things it does not touch:
 Three components:
 
 1. **WASM plugin** — runs inside Zellij, receives events, maintains state in memory, renders the status bar, and sends desktop notifications. On first load, it writes the hook script to `~/.config/zellij/plugins/zellaude-hook.sh` and registers it in `~/.claude/settings.json` and `~/.codex/hooks.json`.
-2. **Hook script** — a thin bash bridge that forwards Claude Code and Codex hook events to the plugin via `zellij action pipe`, from a detached process so the agent never waits on Zellij. Session start, prompt, permission, stop and session end events go out at once. Tool, subagent and notification events wait 0.2 s, so a burst delivers only its newest state, and skip sessions with no client attached.
+2. **Hook script** — a thin bash bridge that forwards Claude Code and Codex hook events to the plugin via `zellij action pipe`, from a detached process so the agent never waits on Zellij. Each session runs one pipe at a time, so a backlog delivers only each agent's newest state, though a session end always goes out. Session start, prompt, permission, stop and session end events go ahead of the rest; tool, subagent and notification events first wait 0.2 s, and skip sessions with no client attached.
 3. **Attach probe** — runs once when the plugin attaches, maps live agent processes to their real Zellij pane IDs, and restores their current effort modes without waiting for another prompt
 
 ```
