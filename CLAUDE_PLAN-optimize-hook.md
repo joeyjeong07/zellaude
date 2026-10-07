@@ -10,6 +10,13 @@ zellaude spends CPU in four places it controls: the hook's forks per event, zell
     - Delivery: one hook event costs zellij 0.6–1.7 server CPU-s at 8 tabs, across blocks and both pipe commands: ~0.74 CPU-s per 100 ms, about 45 % of one period's 1.6 CPU-s quota (interpolated).
     - Attach: ~10 pod CPU-s within ~1.3 s at 8 tabs.
   - Persist flash: a pane that ends while flashing in Persist mode keeps a 0.25 s re-render ticker alive in every instance, forever.
+- **A symptom that breaks a tool:**
+  - Reported from my-terminal-setup on 2026-10-07: `zellij action dump-layout` passes through the plugin stage, so it waits behind zellaude's per-event work. Past zellij's 1 s action timeout (`ACTION_COMPLETION_TIMEOUT`, route.rs, 0.44.3) it returns EMPTY output with exit 0, which crashed `zellmv restart`.
+  - On km-kim-0-0's my-terminal-setup-0 (6 bars, 34 panes, a few active claudes): plugin-exec threads at 280–470 % CPU in every 1 s window of a 20 s run; `dump-layout` 0.31–0.47 s, up to 1.03 s. A fresh session takes 0.06–0.09 s, and `query-tab-names`, which skips the plugin stage, 24 ms.
+  - Reproduced on km-kim-4 (8 tabs, 2 tool pairs/s, 40 calls per block, 2 blocks): today's delivery gave p95 1.04 s and 0.56 s, with 5 empty outputs in one block. Simulated branch delivery (each pair's trailing Post piped 0.2 s later via `action pipe`, no branch hook involved) gave p95 0.24 s and 0.14 s, with none empty.
+  - Scope: the branch removes zellaude's share of the queue `dump-layout` waits behind, not all of it. Plugin-exec and wasm threads also burn CPU with no plugin loaded, driven by terminal redraw (A/B, 1 tab). So much of the 280–470 % on a 34-pane session is likely zellij's own terminal work; the km-kim-4 repro had little redraw and isolates zellaude's share.
+  - Under throttling plus terminal load, `dump-layout` can still pass 1 s and return empty with exit 0. zellmv must keep treating empty output as an error (its retry guard in my-terminal-setup); that fix lives outside this branch.
+  - The user's `zellaude.json` has `flash: Persist`, so the flash leak below applies to them.
 - **Biggest lever, outside this branch:** the pod's CPU limit; the user has been told.
 - **Branch:** `feature/optimize-hook`, from the parked seed of that name; the finalize chain merges `develop`.
 
@@ -42,6 +49,10 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
     - Lag: the count updates within ≤1 s. Urgent events skip the check, so the attach lag can only leave a mid-turn tool glyph stale until that pane's next event.
     - Paths: Linux `${XDG_CACHE_HOME:-$HOME/.cache}/zellij`; macOS `~/Library/Caches/org.Zellij-Contributors.Zellij`, unverified (fail-open means a wrong guess only loses the skip).
     - No staleness guard. zellij rewrites the file on change, so an idle session's mtime just ages and an age check would deliver into every idle detached session. `rename-session` moves the directory and the socket together. A dead server's socket is gone, so its pipe would fail anyway.
+  - **No explicit pipe release:**
+    - Proposed: call `unblock_cli_pipe_input` to stop each `zellij pipe` waiting until the 1 s limit.
+    - Measured: a build that calls it in `pipe()` gave a median of 0.905 s per pipe, against 0.925 s shipped (8 tabs, km-kim-0-0, same block). On idle km-kim-4 both commands release in 0.17–0.19 s without it.
+    - Inferred from the queue behaviour, not measured directly: a pipe completes when every instance has processed it, so the wait, and the "CliPipe did not complete within 1s timeout" log lines, are queue time. Fewer and cheaper deliveries shorten that queue. The hand-off below means the hook never waits on it.
   - **Detached hand-off:**
     - The hook returns once it hands off. Today it waits up to 1 s for zellij: Codex's synchronous hook stalls the agent that long, and once the entry is async, each such hook would hold one of Codex's 8 background slots.
     - A detached deliverer does the rest (own process group, stdio closed per commit bfda51f's lesson, a 1 s reaper for a session that never answers) and must leave no orphans: today's watchdog kills its subshell but leaves the `sleep` reparented to init (measured).
@@ -164,6 +175,14 @@ const ATTACH_DONE_PIPE: &str = "zellaude:attach-done"; // one-shot, sent only af
     - bar-click→settings-menu render latency.
   - Pass: the branch's p50 and p95 are no worse than `develop`'s. Report both distributions; the expected effect is small, since a click almost never finds a plugin queue and the quota stall hits at any depth.
   - Preflight for this arm only: no other user process on km-kim-4 besides the probe, and the burner bounded by `timeout`. The guard stays on.
+- **`dump-layout` under hook load**, on km-kim-4, `develop` vs branch, ≥2 blocks of 40 calls each:
+  - Setup: an attached 8-tab session; the E2E's fake agents replay 2 tool pairs per second; `dump-layout` every 0.5 s.
+  - Load validity: run `develop` and the branch as paired blocks. Keep a pair only if `develop` in it shows the symptom (at least one call ≥ 1 s or one empty output); discard the rest. Run pairs until 2 are kept, at most 8; if fewer than 2 qualify, raise the rate and say so. Report the kept-pair count.
+  - Pass, over kept pairs: the branch's p95 < 0.5 s, max < 1 s, and no empty output.
+  - Log each send's client wall time, `zellij pipe` in `develop` and `zellij action pipe` in the branch, in the attached session. That answers directly whether `action pipe` waits the way `zellij pipe` does.
+  - The E2E preflight applies: isolation, the guard, and flat `nr_throttled`.
+  - Report `develop`'s numbers, and both arms' count of "CliPipe did not complete within 1s timeout" lines in the zellij log during the load window.
+  - The throttling arm also records `dump-layout`: no empty output, and no worse than `develop`.
 - **Not measurable before merge:** the after-number on km-kim-0-0. Installing the branch hook there writes the user's shared GPFS home, which reaches every pod. Supporting evidence before the change: km-kim-0-0's throttled fraction per hook event, read-only. After deploy, the user re-reads the same number; the PR text gives the command.
 - **`action pipe` floor:** run one delivery against a zellij 0.44.0 release binary unpacked under `/tmp/optimize-hook`. If no binary can be fetched, say the floor is unverified.
 
