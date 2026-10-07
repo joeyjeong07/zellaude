@@ -67,6 +67,7 @@ run_hook_process() {
     ZELLIJ_PANE_ID="7" \
     ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
     ZELLAUDE_TREE_PROC_ROOT="$TREE_ROOT" \
+    ZELLAUDE_PROC_ROOT="$TEST_DIR/no-environ" \
     ZELLAUDE_TEST_PARENT_COMM=bash \
     ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
     ZELLAUDE_TEST_INPUT="$input" \
@@ -1092,14 +1093,72 @@ LINUX_TOOL_EVENT_EXECS=$(exec_profile "$TREE_TOOL_EVENT" \
   ZELLAUDE_TEST_GRANDPARENT_PID=4343)
 expect_agent_pid "memo hit, counted" 4242
 expect_equal "Linux tool event execs" \
-  "cat=1 chmod=1 date=1 hostname=1 jq=14 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=4 zellij=1" \
+  "chmod=1 date=1 hostname=1 jq=4 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=1 zellij=1" \
   "$LINUX_TOOL_EVENT_EXECS"
 expect_equal "Linux climbing tool event execs" "$LINUX_TOOL_EVENT_EXECS" \
   "$(exec_profile '{"session_id":"tree-climb","hook_event_name":"PreToolUse"}' \
     ZELLAUDE_TEST_GRANDPARENT_PID=4343)"
 expect_equal "Linux SessionStart execs" \
-  "cat=1 chmod=1 date=1 hostname=1 jq=14 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=4 zellij=1" \
+  "chmod=1 date=1 hostname=1 jq=4 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=1 zellij=1" \
   "$(exec_profile "$TREE_SESSION_START" ZELLAUDE_TEST_GRANDPARENT_PID=4242)"
+# The common Linux path: the agent is found and its environ is readable.
+write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/'
+expect_equal "Linux tool event with launch env execs" \
+  "chmod=1 date=1 hostname=1 jq=5 mkdir=2 mktemp=1 mv=1 rmdir=2 stat=5 tr=1 zellij=1" \
+  "$(exec_profile '{"session_id":"tree-launch-env","hook_event_name":"PreToolUse"}' \
+    ZELLAUDE_TEST_PARENT_COMM=claude \
+    ZELLAUDE_TEST_ENVIRON="$LAUNCH_ENV_ENVIRON" \
+    ZELLAUDE_PROC_ROOT="$LAUNCH_ENV_PROC_ROOT")"
+jq -e '.launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"' \
+  "$CAPTURE_FILE" >/dev/null
+# The plugin orders racing events by ts_ms, so it stays in milliseconds.
+jq -e '(.ts_ms - now * 1000 | fabs) < 60000' "$CAPTURE_FILE" >/dev/null
+
+# /effort is a local command, so the transcript scan runs only at a turn
+# boundary or in attach recovery; mid-turn events resolve from .effort alone.
+claude_ultra_event() {
+  jq -nc --arg event "$1" --arg session_id "$2" \
+    --arg transcript "$CLAUDE_ULTRA_TRANSCRIPT" '{
+      session_id: $session_id,
+      hook_event_name: $event,
+      transcript_path: $transcript,
+      effort: {level: "xhigh"}
+    }'
+}
+for event in PreToolUse PostToolUse PostToolUseFailure Notification Stop; do
+  exec_profile "$(claude_ultra_event "$event" scan-rule)" >/dev/null
+  expect_equal "$event: rainbow_name" null "$(jq -c '.rainbow_name' "$CAPTURE_FILE")"
+  expect_equal "$event: tail, grep" "0 0" "$(exec_count tail) $(exec_count grep)"
+done
+for event in SessionStart UserPromptSubmit SessionRestore; do
+  exec_profile "$(claude_ultra_event "$event" scan-rule)" >/dev/null
+  expect_equal "$event: rainbow_name" true "$(jq -c '.rainbow_name' "$CAPTURE_FILE")"
+  expect_equal "$event: tail" 2 "$(exec_count tail)"
+done
+
+# Rainbow off sends null, never false, so the cache keeps what it last saw; and
+# it skips detection outright.
+rm -f "$STATE_FILE"
+run_hook claude "$(claude_ultra_event UserPromptSubmit rainbow-off)" true
+write_settings '{"rainbow":false}'
+expect_equal "rainbow off execs" "$LINUX_TOOL_EVENT_EXECS" \
+  "$(exec_profile "$(claude_ultra_event UserPromptSubmit rainbow-off)" \
+    ZELLAUDE_TEST_GRANDPARENT_PID=4242)"
+jq -e '.rainbow_name == null and .rainbow_mode_ts_ms == null' \
+  "$CAPTURE_FILE" >/dev/null
+jq -e '.session_id == "rainbow-off" and .rainbow_name == true' \
+  "$STATE_FILE" >/dev/null
+run_hook codex \
+  '{"session_id":"rainbow-off-codex","hook_event_name":"PreToolUse","reasoning_effort":"ultra"}' \
+  null
+# Only a literal false turns it off: absent, true and an unparseable or array
+# settings file all leave detection on.
+for settings in '{"rainbow":true}' '{"rainbow":"no"}' '{"rainbow":' \
+  '[{"id":"claude6","width":3,"height":2,"commands":["claude"]}]'; do
+  write_settings "$settings"
+  run_hook claude "$(claude_ultra_event UserPromptSubmit rainbow-on)" true
+done
+write_settings
 
 # macOS has no procfs, so one batched ps answers the climb. Its comm is a full
 # path, measured 2026-09-03, while `-o ucomm=` answers the rewritten process

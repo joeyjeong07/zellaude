@@ -247,10 +247,106 @@ case "$CLIENT" in
   *) CLIENT="claude"; CLIENT_LABEL="Claude Code" ;;
 esac
 
+SETTINGS_FILE="${HOME:-}/.config/zellij/plugins/zellaude.json"
+SETTINGS_PRESENT=false
+SETTINGS_JSON=""
+if [ -f "$SETTINGS_FILE" ]; then
+  SETTINGS_PRESENT=true
+  IFS= read -r -d '' SETTINGS_JSON 2>/dev/null < "$SETTINGS_FILE"
+fi
+
+# One jq pass over the hook input on stdin, emitting shell assignments: its
+# fields, the send time, and the settings this hook reads.
+parse_hook_input() {
+  jq -r \
+    --arg claude_effort "${CLAUDE_EFFORT:-}" \
+    --arg configured_effort "${CLAUDE_CODE_EFFORT_LEVEL:-}" \
+    --arg settings_json "$SETTINGS_JSON" \
+    --arg settings_present "$SETTINGS_PRESENT" '
+      def assign($name; value):
+        "\($name)=\(value // "" | if type == "string" then . else tojson end | @sh)";
+      def lowercase_text: if type == "string" then ascii_downcase else "" end;
+      def as_state:
+        if . == true
+          or ((type == "string") and ((ascii_downcase == "true") or (ascii_downcase == "ultracode")))
+        then "true"
+        else "false"
+        end;
+
+      assign("HOOK_EVENT"; .hook_event_name),
+      # The send time, so the plugin can order events that race through
+      # parallel hook subprocesses.
+      assign("TS_MS"; now * 1000 | floor),
+      assign("SESSION_ID"; .session_id),
+      assign("TOOL_NAME"; .tool_name),
+      assign("CWD"; .cwd),
+      assign("TRANSCRIPT_PATH"; .transcript_path),
+      assign("TURN_ID"; .turn_id),
+      assign("AGENT_ID"; .agent_id),
+      # .effort does not ride every event type, so the inherited launch value
+      # is what keeps SessionStart from answering empty.
+      assign("EFFORT_LEVEL";
+        (.effort.level? // "" | lowercase_text) as $level
+        | if $level != "" then $level else $claude_effort | ascii_downcase end),
+      assign("CONFIGURED_EFFORT_LEVEL"; $configured_effort | ascii_downcase),
+      # Accept an explicit field if Claude exposes one in a future hook version
+      # (or an SDK host supplies it today).
+      assign("EXPLICIT_RAINBOW_STATE";
+        if has("ultracode") and .ultracode != null then
+          .ultracode | as_state
+        elif ((.effort? | type) == "object")
+          and (.effort | has("ultracode"))
+          and .effort.ultracode != null then
+          .effort.ultracode | as_state
+        elif (.effort.level? // "" | lowercase_text) == "ultracode" then
+          "true"
+        else
+          ""
+        end),
+      # Prefer a direct field if a future Codex hook schema adds one.
+      assign("CODEX_DIRECT_EFFORT";
+        [
+          .reasoning_effort?,
+          .model_reasoning_effort?,
+          (if (.effort? | type) == "object" then .effort.level? else .effort? end)
+        ]
+        | map(select((type == "string") and length > 0))
+        | first // ""
+        | ascii_downcase),
+      # Attach recovery (SessionRestore) supplies the target process launch
+      # state and start time.
+      assign("RESTORE_LAUNCH_STATE";
+        if has("launch_ultracode") and .launch_ultracode != null then
+          .launch_ultracode | as_state
+        else
+          (.launch_effort_level? // "" | lowercase_text) as $effort
+          | if $effort == "ultracode" then
+              "true"
+            elif ($effort | IN("low", "medium", "high", "xhigh", "max", "auto", "unset")) then
+              "false"
+            else
+              ""
+            end
+        end),
+      assign("RESTORE_STARTED_AT_MS";
+        .session_started_at_ms?
+        | select(type == "number" and . > 0 and floor == .)),
+      assign("RAINBOW_ENABLED";
+        if (try ($settings_json | fromjson | .rainbow) catch null) == false
+        then "false"
+        else "true"
+        end),
+      assign("NOTIFY_MODE";
+        if $settings_present == "true"
+        then try ($settings_json | fromjson | .notifications // "Always") catch ""
+        else "Always"
+        end)
+    ' 2>/dev/null
+}
+
 # Read hook JSON from stdin before checking Zellij. Codex Stop hooks require
 # a JSON response even when there is no pane event to forward.
-INPUT=$(cat)
-HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty')
+eval "$(parse_hook_input)"
 
 finish() {
   # Codex requires JSON stdout from these two hooks. An empty object leaves
@@ -266,10 +362,6 @@ finish() {
 [ -z "${ZELLIJ_SESSION_NAME:-}" ] && finish 0
 [ -z "${ZELLIJ_PANE_ID:-}" ] && finish 0
 [ -z "$HOOK_EVENT" ] && finish 0
-
-# Capture send-time immediately so the plugin can order events
-# that race through parallel hook subprocesses.
-TS_MS=$(jq -nc 'now * 1000 | floor')
 
 # Tree reads only: the launch-env harness plants just <pid>/environ under
 # ZELLAUDE_PROC_ROOT.
@@ -449,67 +541,60 @@ LAUNCH_ENV_SAFE_SECRET_VALUE="local"
 LAUNCH_ENV_REDACTED_MARKER="<set>"
 
 PROC_ROOT=${ZELLAUDE_PROC_ROOT:-/proc}
-# Read here for the allowlist and below for the notification mode.
-SETTINGS_FILE="${HOME:-}/.config/zellij/plugins/zellaude.json"
-
-# Built-in names plus the user's, as {config: [...], secret: [...]}. A settings
-# file may only ADD: re-tiering a predefined name is dropped, and the escape set
-# is not readable from here at all, which is the cheaper door to the same
-# boundary. Missing, unreadable or malformed yields the built-ins — a bad file
-# must never capture more, and never capture nothing.
-merged_launch_env_names() {
-  local settings_json
-  settings_json=$(cat "$SETTINGS_FILE" 2>/dev/null) || settings_json=""
-
-  jq -nc \
-    --arg config_names "$LAUNCH_ENV_CONFIG_NAMES" \
-    --arg secret_names "$LAUNCH_ENV_SECRET_NAMES" \
-    --arg settings_json "$settings_json" '
-      # No apostrophe in a comment inside a single-quoted jq program: it closes
-      # the shell string, and bash -n then reports a syntax error lines below.
-      ($settings_json | fromjson? // {}) as $user
-      | ($config_names | split(" ")) as $config
-      | ($secret_names | split(" ")) as $secret
-      | ($config + $secret) as $predefined
-      # The config tier is spelled "verbatim" to the user: the frozen-tier rule
-      # protects predefined names only, so a name they add there is captured
-      # WITH ITS VALUE, and the key should say so.
-      | def added($tier):
-          (try ($user.launch_env_names[$tier]) catch null)
-          | if type == "array"
-            then map(select(type == "string" and . != ""))
-            else []
-            end;
-        ((added("secret") - $predefined) | unique) as $user_secret
-      # A name the user lists under both tiers is a secret: fail closed. Both
-      # subtractions on this line are belt-and-braces — read_launch_env redacts
-      # on the secret list independently — and keep each name in one tier only.
-      # The subtraction on the secret line above is not: dropping it would
-      # redact a predefined verbatim name.
-      | ((added("verbatim") - $predefined - $user_secret) | unique) as $user_config
-      | {
-          config: ($config + $user_config),
-          secret: ($secret + $user_secret)
-        }
-    '
-}
 
 # Emits the launch_env object, or nothing when the environ cannot be read
 # (no /proc, refused read, no agent pid). Never falls back to this hook's own
 # environment: under --inspect that belongs to zellaude-attach.sh, not the agent.
 # jq splits the raw NUL-separated blob so a value containing a newline survives.
 read_launch_env() {
-  local agent_pid=$1 environ_path names
+  local agent_pid=$1 environ_path
   [ -n "$agent_pid" ] || return 1
   environ_path="$PROC_ROOT/$agent_pid/environ"
   [ -r "$environ_path" ] || return 1
-  names=$(merged_launch_env_names) || return 1
 
   jq -Rsc \
-    --argjson names "$names" \
+    --arg config_names "$LAUNCH_ENV_CONFIG_NAMES" \
+    --arg secret_names "$LAUNCH_ENV_SECRET_NAMES" \
+    --arg settings_json "$SETTINGS_JSON" \
     --arg safe_secret_value "$LAUNCH_ENV_SAFE_SECRET_VALUE" \
     --arg redacted_marker "$LAUNCH_ENV_REDACTED_MARKER" '
-      $names.config as $config
+      # No apostrophe in a comment inside a single-quoted jq program: it closes
+      # the shell string, and bash -n then reports a syntax error lines below.
+
+      # Built-in names plus user-added ones, as {config: [...], secret: [...]}.
+      # A settings file may only ADD: re-tiering a predefined name is dropped,
+      # and the escape set is not readable from here at all, which is the
+      # cheaper door to the same boundary. Missing, unreadable or malformed
+      # yields the built-ins — a bad file must never capture more, and never
+      # capture nothing.
+      def launch_env_names:
+        ($settings_json | fromjson? // {}) as $user
+        | ($config_names | split(" ")) as $config
+        | ($secret_names | split(" ")) as $secret
+        | ($config + $secret) as $predefined
+        # The config tier is spelled "verbatim" to the user: the frozen-tier
+        # rule protects predefined names only, so a name they add there is
+        # captured WITH ITS VALUE, and the key should say so.
+        | def added($tier):
+            (try ($user.launch_env_names[$tier]) catch null)
+            | if type == "array"
+              then map(select(type == "string" and . != ""))
+              else []
+              end;
+          ((added("secret") - $predefined) | unique) as $user_secret
+        # A name the user lists under both tiers is a secret: fail closed. Both
+        # subtractions on this line are belt-and-braces — the redaction below
+        # keys on the secret list independently — and keep each name in one
+        # tier only. The subtraction on the secret line above is not: dropping
+        # it would redact a predefined verbatim name.
+        | ((added("verbatim") - $predefined - $user_secret) | unique) as $user_config
+        | {
+            config: ($config + $user_config),
+            secret: ($secret + $user_secret)
+          };
+
+      launch_env_names as $names
+      | $names.config as $config
       | $names.secret as $secret
       | [ split("\u0000")[]
           | (index("=")) as $eq
@@ -530,13 +615,6 @@ read_launch_env() {
     ' "$environ_path" 2>/dev/null
 }
 
-# Extract fields with jq (required dependency)
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
-TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
-TURN_ID=$(echo "$INPUT" | jq -r '.turn_id // empty')
-AGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // empty')
 IS_SUBAGENT=false
 case "$HOOK_EVENT" in
   SubagentStart|SubagentStop) IS_SUBAGENT=true ;;
@@ -599,21 +677,10 @@ parse_codex_transcript_effort() {
 }
 
 detect_codex_rainbow() {
-  local direct_effort transcript_effort
+  local transcript_effort
 
-  # Prefer a direct field if a future Codex hook schema adds one.
-  direct_effort=$(echo "$INPUT" | jq -r '
-    [
-      .reasoning_effort?,
-      .model_reasoning_effort?,
-      (if (.effort? | type) == "object" then .effort.level? else .effort? end)
-    ]
-    | map(select((type == "string") and length > 0))
-    | first // empty
-    | ascii_downcase
-  ')
-  if [ -n "$direct_effort" ]; then
-    [ "$direct_effort" = "ultra" ] && printf 'true' || printf 'false'
+  if [ -n "$CODEX_DIRECT_EFFORT" ]; then
+    [ "$CODEX_DIRECT_EFFORT" = "ultra" ] && printf 'true' || printf 'false'
     return
   fi
 
@@ -789,59 +856,27 @@ claude_process_requested_mode() {
   printf 'unknown'
 }
 
-# The agent's effort as of this event, lowercase whichever source answers.
-# `.effort` does not ride every event type, so the inherited launch value is
-# what keeps SessionStart from answering empty.
-resolve_effort_level() {
-  local effort_level
-  effort_level=$(echo "$INPUT" | jq -r '.effort.level? // empty | ascii_downcase')
-  [ -n "$effort_level" ] ||
-    effort_level=$(printf '%s' "${CLAUDE_EFFORT:-}" |
-      tr '[:upper:]' '[:lower:]')
-  printf '%s\n' "$effort_level"
-}
-
 detect_claude_rainbow() {
-  local explicit_state transcript_result transcript_state transcript_marker
-  local transcript_timestamp transcript_timestamp_ms session_started_at_ms
-  local launch_state launch_effort effort_level configured_effort launch_mode tail_lines
+  local transcript_result transcript_state transcript_marker
+  local transcript_timestamp transcript_timestamp_ms launch_mode tail_lines
 
-  # Accept an explicit field if Claude exposes one in a future hook version
-  # (or an SDK host supplies it today).
-  explicit_state=$(echo "$INPUT" | jq -r '
-    def as_state:
-      if . == true
-        or ((type == "string") and ((ascii_downcase == "true") or (ascii_downcase == "ultracode")))
-      then "true"
-      else "false"
-      end;
-
-    if has("ultracode") and .ultracode != null then
-      .ultracode | as_state
-    elif ((.effort? | type) == "object")
-      and (.effort | has("ultracode"))
-      and .effort.ultracode != null then
-      .effort.ultracode | as_state
-    elif ((.effort.level? // "") | ascii_downcase) == "ultracode" then
-      "true"
-    else
-      empty
-    end
-  ')
-  if [ -n "$explicit_state" ]; then
-    printf '%s\t' "$explicit_state"
+  if [ -n "$EXPLICIT_RAINBOW_STATE" ]; then
+    printf '%s\t' "$EXPLICIT_RAINBOW_STATE"
     return
   fi
 
   # Claude reports ultracode's model effort as xhigh, so recover the separate
   # session setting from the latest successful /effort command when available.
+  # /effort is a local command and cannot change mid-turn, so only a turn
+  # boundary or attach recovery scans.
+  case "$HOOK_EVENT" in
+    SessionStart) tail_lines=4096 ;;
+    UserPromptSubmit) tail_lines=1024 ;;
+    SessionRestore) tail_lines=512 ;;
+    *) tail_lines="" ;;
+  esac
   transcript_result=$'null\t\t'
-  if [ -r "$TRANSCRIPT_PATH" ]; then
-    case "$HOOK_EVENT" in
-      SessionStart) tail_lines=4096 ;;
-      UserPromptSubmit) tail_lines=1024 ;;
-      *) tail_lines=512 ;;
-    esac
+  if [ -n "$tail_lines" ] && [ -r "$TRANSCRIPT_PATH" ]; then
     transcript_result=$(
       tail -n "$tail_lines" "$TRANSCRIPT_PATH" 2>/dev/null |
         tail -c "$MAX_TRANSCRIPT_BYTES" |
@@ -865,53 +900,25 @@ detect_claude_rainbow() {
   # than treating it as a current hook field. A successful /effort command
   # issued after that process started is newer and therefore wins.
   if [ "$HOOK_EVENT" = "SessionRestore" ]; then
-    launch_state=$(echo "$INPUT" | jq -r '
-      def as_state:
-        if . == true
-          or ((type == "string") and ((ascii_downcase == "true") or (ascii_downcase == "ultracode")))
-        then "true"
-        else "false"
-        end;
-
-      if has("launch_ultracode") and .launch_ultracode != null then
-        .launch_ultracode | as_state
-      else
-        (.launch_effort_level? // "" | ascii_downcase) as $effort
-        | if $effort == "ultracode" then
-            "true"
-          elif ($effort | IN("low", "medium", "high", "xhigh", "max", "auto", "unset")) then
-            "false"
-          else
-            empty
-          end
-      end
-    ')
-    session_started_at_ms=$(echo "$INPUT" | jq -r '
-      .session_started_at_ms?
-      | select(type == "number" and . > 0 and floor == .)
-      // empty
-    ')
     transcript_timestamp_ms=""
     if [ -n "$transcript_timestamp" ]; then
       transcript_timestamp_ms=$(iso_timestamp_ms "$transcript_timestamp")
     fi
 
-    if [ -n "$launch_state" ]; then
+    if [ -n "$RESTORE_LAUNCH_STATE" ]; then
       if [ "$transcript_state" != "null" ] &&
-         [ -n "$session_started_at_ms" ] &&
+         [ -n "$RESTORE_STARTED_AT_MS" ] &&
          [ -n "$transcript_timestamp_ms" ] &&
-         [ "$transcript_timestamp_ms" -ge "$session_started_at_ms" ]; then
+         [ "$transcript_timestamp_ms" -ge "$RESTORE_STARTED_AT_MS" ]; then
         printf '%s\t%s' "$transcript_state" "$transcript_marker"
       else
-        printf '%s\t%s' "$launch_state" "$transcript_marker"
+        printf '%s\t%s' "$RESTORE_LAUNCH_STATE" "$transcript_marker"
       fi
       return
     fi
   fi
 
-  configured_effort=$(printf '%s' "${CLAUDE_CODE_EFFORT_LEVEL:-}" |
-    tr '[:upper:]' '[:lower:]')
-  case "$configured_effort" in
+  case "$CONFIGURED_EFFORT_LEVEL" in
     low|medium|high|max|auto|unset)
       printf 'false\t'
       return
@@ -938,8 +945,7 @@ detect_claude_rainbow() {
     esac
   fi
 
-  effort_level=$(resolve_effort_level)
-  case "$effort_level" in
+  case "$EFFORT_LEVEL" in
     low|medium|high|max)
       printf 'false\t'
       return
@@ -965,7 +971,7 @@ detect_claude_rainbow() {
     esac
   fi
 
-  case "$effort_level" in
+  case "$EFFORT_LEVEL" in
     "")
       printf 'null\t'
       ;;
@@ -985,6 +991,11 @@ if [ "$IS_SUBAGENT" = true ]; then
   # session ID and may use a different effort. Keep their activity updates
   # without letting them replace the root session's tab mode.
   SESSION_ID=""
+  RAINBOW_NAME=null
+  RAINBOW_MODE_MARKER=""
+elif [ "$RAINBOW_ENABLED" = false ]; then
+  # null is "not looked", so the cache keeps what it last saw rather than
+  # recording a false fact.
   RAINBOW_NAME=null
   RAINBOW_MODE_MARKER=""
 elif [ "$CLIENT" = "codex" ]; then
@@ -1021,12 +1032,12 @@ else
   LAUNCH_ENV=$(read_launch_env "$AGENT_PID") || LAUNCH_ENV=null
 fi
 if [ "$CLIENT" = "codex" ]; then
-  # resolve_effort_level reads Claude's instruments — .effort.level and
+  # EFFORT_LEVEL reads Claude's instruments — .effort.level and
   # CLAUDE_EFFORT. On a codex agent an inherited CLAUDE_EFFORT is a Claude
   # session's effort leaking in, so recording it would name the wrong agent.
   CURRENT_EFFORT_LEVEL=""
 else
-  CURRENT_EFFORT_LEVEL=$(resolve_effort_level)
+  CURRENT_EFFORT_LEVEL=$EFFORT_LEVEL
 fi
 
 # Build compact JSON payload
@@ -1219,12 +1230,6 @@ persist_root_state
 # Permission request: bell + desktop notification
 if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
   printf '\a' > /dev/tty 2>/dev/null || true
-
-  # Read notification setting (default: Always)
-  NOTIFY_MODE="Always"
-  if [ -f "$SETTINGS_FILE" ]; then
-    NOTIFY_MODE=$(jq -r '.notifications // "Always"' "$SETTINGS_FILE" 2>/dev/null)
-  fi
 
   # For "Unfocused" mode, check if the terminal app is frontmost
   SHOULD_NOTIFY=false
