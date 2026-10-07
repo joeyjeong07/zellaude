@@ -29,3 +29,14 @@
   1. (rec) Keep scanning on `SessionRestore` and name it in the PLAN and T2 — attach recovery stays correct; one scan per pane per attach / none worth noting.
   2. Skip the scan there too — matches the PLAN's literal text / a recovered pane would lose its ultracode state until the next prompt, and five pinned cases break.
 - Selected: 1. The rule's reason ("`/effort` cannot change mid-turn") is about hook events; recovery starts from nothing.
+
+### Coalescing stays a debounce, no max-wait cap
+- Raised by impl1-crit1 at T4 (d8b857e). As specced, the window restarts on every event in a stream, so a stream whose gaps stay under 0.2 s pipes nothing until a gap appears. Parallel subagents share one stream per pane, so a heavy fan-out can hold that pane's in-turn glyph stale: the critic's rough Poisson estimate is ~1 s at 8 subagents each firing once a second, ~3 s at 20.
+- Options, ranked:
+  1. (rec) Keep the debounce — the most pipes saved exactly during a fan-out storm, when CPU matters most; urgent events (`Stop`, `PermissionRequest`, …) still deliver at once / an in-turn glyph can trail by seconds in a storm.
+  2. Cap the wait at the window (throttle) — glyph never trails by more than ~0.2 s / up to 5 pipes a second per stream during the storm.
+  3. Cap at ~1 s — bounds the trail / a constant the user never chose, between the two.
+- Selected: 1. The user put interactions first and accepted a lagging in-turn glyph; done and waiting are never late. The user has been told and can override.
+
+### Hook header comment goes to T11
+- `scripts/zellaude-hook.sh:2` still calls the hook a "zellij pipe bridge" after T4. Options: fix it in T5 (T5 never touches the hook) / route it to T11's comment pass. Selected: T11, sent to impl3.
