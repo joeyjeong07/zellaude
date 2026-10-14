@@ -1231,7 +1231,7 @@ Add it alongside the other `maybe_*` helpers in `impl State`:
 - [ ] **Step 4: Call it, and report what the host says**
 
 Call it where the pane manifest is refreshed. In the `Event::PaneUpdate` arm of
-`update`, after `self.maybe_install_runtime_bindings();`:
+`update`, after `self.maybe_retarget_runtime_bindings(BindingsCheck::HostFocus);`:
 
 ```rust
                 self.maybe_compile_session_templates();

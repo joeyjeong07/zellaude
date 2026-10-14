@@ -233,18 +233,21 @@ pub fn available_bindings(existing: &KeybindsVec, plugin_id: u32) -> Vec<PaneBin
         .collect()
 }
 
-pub fn install(existing: &KeybindsVec, plugin_id: u32) {
-    let available = available_bindings(existing, plugin_id);
-    if !available.is_empty() {
-        // zellij 0.44's RebindKeys protobuf drops every KeybindPipe field.
-        // Runtime reconfiguration parses MessagePluginId losslessly and still
-        // belongs only to this client. Never write the user's config.kdl.
-        reconfigure(reconfigure_snippet(&available, plugin_id), false);
-    }
+/// Whether the snapshot holds any of Zellaude's Pane-mode bindings, whichever instance they target.
+pub fn has_zellaude_bindings(existing: &KeybindsVec) -> bool {
+    existing
+        .iter()
+        .filter(|(mode, _)| *mode == InputMode::Pane)
+        .flat_map(|(_, bindings)| bindings)
+        .any(|(key, actions)| is_zellaude_binding(key, actions))
 }
 
-pub fn reconfigure_snippet(bindings: &[PaneBinding], plugin_id: u32) -> String {
-    let mut config = String::from("keybinds {\n    pane {\n");
+/// The `pane { … }` block of a runtime `keybinds` reconfigure; empty without bindings.
+pub fn keybinds_section(bindings: &[PaneBinding], plugin_id: u32) -> String {
+    if bindings.is_empty() {
+        return String::new();
+    }
+    let mut config = String::from("    pane {\n");
     for (_, key, _) in bindings {
         let (key_name, payload) = match key.bare_key {
             BareKey::Char(SPLIT_THREE_RIGHT_KEY) => ("R", "right"),
@@ -255,7 +258,7 @@ pub fn reconfigure_snippet(bindings: &[PaneBinding], plugin_id: u32) -> String {
             "        bind \"{key_name}\" {{\n            MessagePluginId {plugin_id} {{\n                name \"{PIPE_NAME}\"\n                payload \"{payload}\"\n            }}\n            SwitchToMode \"Normal\"\n            SwitchToMode \"Normal\"\n            SwitchToMode \"Normal\"\n        }}\n"
         ));
     }
-    config.push_str("    }\n}\n");
+    config.push_str("    }\n");
     config
 }
 

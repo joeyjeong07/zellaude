@@ -228,8 +228,12 @@ pub struct State {
     /// the plugin is left permanently inert and indistinguishable from a working
     /// one — no hooks installed, no config, no explanation.
     pub permissions_denied: bool,
-    pub split_three_bindings_installed: bool,
-    pub custom_layout_bindings_installed: bool,
+    /// The instance this client's runtime bindings target, as last heard: the snapshot erases it.
+    pub bindings_target_plugin_id: Option<u32>,
+    /// The host put this client's focus on another tab: kept to the next TabUpdate, never re-asked.
+    pub client_focus_elsewhere: bool,
+    /// A host-judged retarget already ran since the last TabUpdate.
+    pub host_judged_retarget_spent: bool,
     pub split_three_uses_legacy_keybinds: bool,
     pub initial_keybinds: Option<KeybindsVec>,
     pub split_three_operation: Option<split_three::Operation>,
@@ -257,5 +261,6 @@ pub struct State {
     /// Install, attach scan and template compile, done here or by a peer; never repeated.
     pub attach_work_done: bool,
     pub plugin_id: Option<u32>,
+    pub client_id: Option<ClientId>,
     pub plugin_configuration: BTreeMap<String, String>,
 }

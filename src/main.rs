@@ -26,6 +26,7 @@ const MANIFEST_DEBOUNCE_MS: u64 = 1000;
 const FLASH_TICK: f64 = 0.25;
 const SPLIT_THREE_ACTION_TIMEOUT_MS: u64 = 5000;
 const ATTACH_DONE_PIPE: &str = "zellaude:attach-done";
+const BINDINGS_TARGET_PIPE: &str = "zellaude:bindings-target";
 const SAVE_CONFIG_SCRIPT: &str = r#"
 set -eu
 if [ "$#" -ge 2 ]; then
@@ -104,6 +105,20 @@ done
 jq -s "$@" '{settings_json: $settings, generator_files: .}' < "$stream"
 "#;
 
+/// One `keybinds` block of the keys Zellaude may bind; `None` when the user owns them all.
+fn runtime_bindings_snippet(keybinds: &KeybindsVec, plugin_id: u32) -> Option<String> {
+    let split_three_bindings = split_three::available_bindings(keybinds, plugin_id);
+    let custom_layout_bindings = custom_layouts::available_bindings(keybinds, plugin_id);
+    if split_three_bindings.is_empty() && custom_layout_bindings.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "keybinds {{\n{}{}}}\n",
+        split_three::keybinds_section(&split_three_bindings, plugin_id),
+        custom_layouts::keybinds_section(&custom_layout_bindings, plugin_id)
+    ))
+}
+
 fn split_three_focus_matches(tab_id: usize, pane_id: u32) -> bool {
     matches!(
         get_focused_pane_info(),
@@ -124,6 +139,15 @@ const REQUIRED_PERMISSIONS: [PermissionType; 7] = [
     PermissionType::Reconfigure,
     PermissionType::RunActionsAsUser,
 ];
+
+/// How a runtime-binding check judges whether this instance is on its client's active tab.
+#[derive(Clone, Copy, PartialEq)]
+enum BindingsCheck {
+    /// Tab updates reach only the active tab's instances.
+    CachedTabs,
+    /// Every other trigger can reach hidden instances, whose cached tabs still show them active.
+    HostFocus,
+}
 
 register_plugin!(State);
 
@@ -162,11 +186,8 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::TabUpdate(tabs) => {
-                // Inactive-tab plugins do not receive tab updates. Reset on
-                // every update delivered to the newly active instance so a
-                // returning tab always retargets the client-scoped binding.
-                self.split_three_bindings_installed = false;
-                self.custom_layout_bindings_installed = false;
+                self.client_focus_elsewhere = false;
+                self.host_judged_retarget_spent = false;
                 let new_active = tabs.iter().find(|t| t.active).map(|t| t.position);
                 if new_active != self.active_tab_index {
                     // Tab focus changed — clear persist flashes on the newly focused tab
@@ -178,7 +199,7 @@ impl ZellijPlugin for State {
                 self.tabs = tabs;
                 self.rebuild_pane_map();
                 self.maybe_cancel_custom_layout_prompt_on_focus_loss();
-                self.maybe_install_runtime_bindings();
+                self.maybe_retarget_runtime_bindings(BindingsCheck::CachedTabs);
                 self.maybe_run_installer();
                 self.maybe_start_attach_scan();
                 self.maybe_compile_session_templates();
@@ -191,7 +212,7 @@ impl ZellijPlugin for State {
                 self.maybe_cancel_custom_layout_prompt_on_focus_loss();
                 self.maybe_recover_pending_split_three_spawn();
                 self.maybe_finish_split_three_validation();
-                self.maybe_install_runtime_bindings();
+                self.maybe_retarget_runtime_bindings(BindingsCheck::HostFocus);
                 self.maybe_run_installer();
                 self.maybe_start_attach_scan();
                 self.maybe_compile_session_templates();
@@ -582,7 +603,7 @@ impl ZellijPlugin for State {
             }
             Event::InitialKeybinds(keybinds) => {
                 self.initial_keybinds = Some(keybinds);
-                self.maybe_install_runtime_bindings();
+                self.maybe_retarget_runtime_bindings(BindingsCheck::HostFocus);
                 false
             }
             Event::ActionComplete(_action, affected_pane_id, context) => {
@@ -625,6 +646,12 @@ impl ZellijPlugin for State {
             }
             ATTACH_DONE_PIPE => {
                 self.attach_work_done = true;
+                false
+            }
+            BINDINGS_TARGET_PIPE => {
+                if self.record_bindings_target(pipe_message.payload.as_deref()) {
+                    self.maybe_retarget_runtime_bindings(BindingsCheck::HostFocus);
+                }
                 false
             }
             "zellaude:settings" => {
@@ -1665,7 +1692,7 @@ impl State {
         // Keep the plugin visible during fullscreen once application-state
         // changes are allowed.
         set_selectable(false);
-        self.maybe_install_runtime_bindings();
+        self.maybe_retarget_runtime_bindings(BindingsCheck::HostFocus);
 
         if newly_granted {
             self.request_sync();
@@ -1676,55 +1703,126 @@ impl State {
         }
     }
 
-    fn maybe_install_runtime_bindings(&mut self) {
-        self.maybe_install_split_three_bindings();
-        self.maybe_install_custom_layout_bindings();
+    fn maybe_retarget_runtime_bindings(&mut self, check: BindingsCheck) {
+        self.retarget_runtime_bindings_with(check, Self::client_focus_is_on_this_tab);
     }
 
-    fn maybe_install_split_three_bindings(&mut self) {
+    /// Returns whether it reconfigured; `client_focus_is_here` is the host query, a seam for tests.
+    fn retarget_runtime_bindings_with(
+        &mut self,
+        check: BindingsCheck,
+        client_focus_is_here: fn(&mut Self) -> bool,
+    ) -> bool {
         if !self.command_permissions_granted {
-            return;
+            return false;
         }
-        if !self.split_three_instance_is_active() {
-            // Each tab owns a plugin instance. Reset while inactive so this
-            // instance retargets the client binding when its tab is revisited.
-            self.split_three_bindings_installed = false;
-            return;
-        }
-        if self.split_three_bindings_installed {
-            return;
-        }
-        let plugin_id = self.plugin_id.unwrap_or_else(|| get_plugin_ids().plugin_id);
+        let plugin_id = *self
+            .plugin_id
+            .get_or_insert_with(|| get_plugin_ids().plugin_id);
         let Some(keybinds) = self.initial_keybinds.as_ref() else {
-            return;
+            return false;
         };
+        let already_targets_here = self.bindings_target_plugin_id == Some(plugin_id)
+            && (split_three::has_zellaude_bindings(keybinds)
+                || custom_layouts::has_zellaude_binding(keybinds));
+        if already_targets_here {
+            return false;
+        }
+        let Some(snippet) = runtime_bindings_snippet(keybinds, plugin_id) else {
+            return false;
+        };
+        let client_is_here = match check {
+            BindingsCheck::CachedTabs => self.split_three_instance_is_active(),
+            BindingsCheck::HostFocus => self.host_puts_client_here(client_focus_is_here),
+        };
+        if !client_is_here {
+            return false;
+        }
 
-        // Mark first: reconfiguration emits another InitialKeybinds event.
-        // Becoming inactive resets this flag so tab switches retarget it.
-        self.split_three_bindings_installed = true;
-        split_three::install(keybinds, plugin_id);
+        // Runtime reconfigure is client-scoped and keeps MessagePluginId; never write config.kdl.
+        reconfigure(snippet, false);
+        // This reconfigure outdates the snapshot; zellij sends a fresh one.
+        self.initial_keybinds = None;
+        self.bindings_target_plugin_id = Some(plugin_id);
+        self.broadcast_bindings_target(plugin_id);
+        true
     }
 
-    fn maybe_install_custom_layout_bindings(&mut self) {
-        if !self.command_permissions_granted {
-            return;
+    /// At most one query per activation, and none without a pane manifest to judge it by.
+    fn host_puts_client_here(&mut self, client_focus_is_here: fn(&mut Self) -> bool) -> bool {
+        if self.client_focus_elsewhere
+            || self.host_judged_retarget_spent
+            || self.pane_manifest.is_none()
+        {
+            return false;
         }
-        if !self.split_three_instance_is_active() {
-            self.custom_layout_bindings_installed = false;
-            return;
+        if !client_focus_is_here(self) {
+            // Kept to the next TabUpdate: a retried 100 ms host call can livelock zellij.
+            self.client_focus_elsewhere = true;
+            return false;
         }
-        if self.custom_layout_bindings_installed {
-            return;
-        }
-        let plugin_id = self.plugin_id.unwrap_or_else(|| get_plugin_ids().plugin_id);
-        let Some(keybinds) = self.initial_keybinds.as_ref() else {
-            return;
-        };
+        self.host_judged_retarget_spent = true;
+        true
+    }
 
-        // Reconfiguration emits another InitialKeybinds snapshot. Mark first
-        // and let a later tab activation reset this client-scoped target.
-        self.custom_layout_bindings_installed = true;
-        custom_layouts::install(keybinds, plugin_id);
+    /// Natively the host reply is read from stdin, which blocks a test instead of failing it.
+    #[cfg(test)]
+    fn client_focus_is_on_this_tab(&mut self) -> bool {
+        panic!("tests answer for the host through retarget_runtime_bindings_with")
+    }
+
+    /// Err or a timeout reads as elsewhere.
+    #[cfg(not(test))]
+    fn client_focus_is_on_this_tab(&mut self) -> bool {
+        let Ok((_, focused_pane)) = get_focused_pane_info() else {
+            return false;
+        };
+        let plugin_id = *self
+            .plugin_id
+            .get_or_insert_with(|| get_plugin_ids().plugin_id);
+        let is_focused = |pane: &PaneInfo| match focused_pane {
+            PaneId::Terminal(id) => !pane.is_plugin && pane.id == id,
+            PaneId::Plugin(id) => pane.is_plugin && pane.id == id,
+        };
+        self.pane_manifest.as_ref().is_some_and(|manifest| {
+            manifest.panes.values().any(|panes| {
+                panes
+                    .iter()
+                    .any(|pane| pane.is_plugin && pane.id == plugin_id)
+                    && panes.iter().any(is_focused)
+            })
+        })
+    }
+
+    fn broadcast_bindings_target(&mut self, plugin_id: u32) {
+        let client_id = self.own_client_id();
+        let mut message = MessageToPlugin::new(BINDINGS_TARGET_PIPE);
+        message.message_payload = Some(format!("{client_id} {plugin_id}"));
+        pipe_message_to_plugin(message);
+    }
+
+    /// Records a peer's "<client_id> <plugin_id>" target; false when it is not for this client.
+    fn record_bindings_target(&mut self, payload: Option<&str>) -> bool {
+        let Some((client_id, plugin_id)) = payload.and_then(|payload| {
+            let (client_id, plugin_id) = payload.split_once(' ')?;
+            Some((
+                client_id.parse::<ClientId>().ok()?,
+                plugin_id.parse::<u32>().ok()?,
+            ))
+        }) else {
+            return false;
+        };
+        if client_id != self.own_client_id() {
+            return false;
+        }
+        self.bindings_target_plugin_id = Some(plugin_id);
+        true
+    }
+
+    fn own_client_id(&mut self) -> ClientId {
+        *self
+            .client_id
+            .get_or_insert_with(|| get_plugin_ids().client_id)
     }
 
     fn maybe_capture_legacy_keybinds(&mut self, keybinds: KeybindsVec) {
@@ -1735,7 +1833,7 @@ impl State {
         // Zellij 0.44.0 includes the full snapshot in every ModeUpdate. Keep
         // refreshing it until permission arrives so late user rebinds win.
         self.initial_keybinds = Some(keybinds);
-        self.maybe_install_runtime_bindings();
+        self.maybe_retarget_runtime_bindings(BindingsCheck::HostFocus);
     }
 
     fn maybe_run_installer(&mut self) {
@@ -2706,28 +2804,47 @@ mod tests {
     }
 
     #[test]
-    fn split_three_install_waits_for_permission_and_keybind_snapshot() {
+    fn runtime_bindings_wait_for_permission_and_keybind_snapshot() {
         let mut state = active_split_three_state();
         state.initial_keybinds = Some(vec![]);
-
-        state.maybe_install_split_three_bindings();
-        assert!(!state.split_three_bindings_installed);
+        assert!(!state
+            .retarget_runtime_bindings_with(BindingsCheck::CachedTabs, host_must_not_be_asked));
 
         state.command_permissions_granted = true;
-        state.maybe_install_split_three_bindings();
-        assert!(state.split_three_bindings_installed);
+        state.initial_keybinds = None;
+        assert!(!state
+            .retarget_runtime_bindings_with(BindingsCheck::CachedTabs, host_must_not_be_asked));
+
+        state.initial_keybinds = Some(vec![]);
+        assert!(
+            state.retarget_runtime_bindings_with(BindingsCheck::CachedTabs, host_must_not_be_asked)
+        );
     }
 
     #[test]
-    fn split_three_accepts_an_empty_legacy_mode_update_snapshot() {
+    fn runtime_bindings_accept_an_empty_legacy_mode_update_snapshot() {
         let mut state = active_split_three_state();
-        state.command_permissions_granted = true;
         state.split_three_uses_legacy_keybinds = true;
 
         state.maybe_capture_legacy_keybinds(vec![]);
-
         assert_eq!(state.initial_keybinds, Some(vec![]));
-        assert!(state.split_three_bindings_installed);
+
+        state.command_permissions_granted = true;
+        assert!(state.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_here));
+    }
+
+    #[test]
+    fn a_legacy_mode_update_asks_the_host_like_every_non_tab_update() {
+        // Its cached tabs show it active; the host already put the client elsewhere.
+        let mut state = active_split_three_state();
+        state.command_permissions_granted = true;
+        state.split_three_uses_legacy_keybinds = true;
+        state.client_focus_elsewhere = true;
+
+        state.maybe_capture_legacy_keybinds(vec![]);
+
+        assert_eq!(state.bindings_target_plugin_id, None);
+        assert_eq!(state.initial_keybinds, Some(vec![]));
     }
 
     #[test]
@@ -2747,15 +2864,14 @@ mod tests {
         state.maybe_capture_legacy_keybinds(custom_right.clone());
 
         assert_eq!(state.initial_keybinds, Some(custom_right));
-        assert!(!state.split_three_bindings_installed);
+        assert_eq!(state.bindings_target_plugin_id, None);
         assert_eq!(
             split_three::available_bindings(state.initial_keybinds.as_ref().unwrap(), 42).len(),
             1
         );
 
         state.command_permissions_granted = true;
-        state.maybe_install_split_three_bindings();
-        assert!(state.split_three_bindings_installed);
+        assert!(state.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_here));
     }
 
     fn active_split_three_state() -> State {
@@ -2770,6 +2886,7 @@ mod tests {
         );
         State {
             plugin_id: Some(42),
+            client_id: Some(1),
             pane_manifest: Some(manifest),
             tabs: vec![TabInfo {
                 position: 0,
@@ -2778,6 +2895,310 @@ mod tests {
             }],
             ..State::default()
         }
+    }
+
+    #[test]
+    fn repeated_tab_updates_on_one_tab_reconfigure_only_once() {
+        let mut a = bindings_instance(0, 0);
+
+        assert!(tab_update_reconfigures(&mut a, 0));
+        a.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        for _ in 0..3 {
+            assert!(!tab_update_reconfigures(&mut a, 0));
+        }
+    }
+
+    #[test]
+    fn a_visit_to_another_tab_reconfigures_once() {
+        let mut b = bindings_instance(1, 0);
+        b.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(b.record_bindings_target(Some("1 40")));
+
+        assert!(tab_update_reconfigures(&mut b, 1));
+        assert_eq!(b.bindings_target_plugin_id, Some(41));
+        b.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(!tab_update_reconfigures(&mut b, 1));
+    }
+
+    #[test]
+    fn a_rebuilt_instance_with_no_record_retargets_once() {
+        let mut a = bindings_instance(0, 0);
+        // Keys left by the instance this one replaced, which kept the same plugin id.
+        a.initial_keybinds = Some(snapshot_with_zellaude_keys());
+
+        assert!(tab_update_reconfigures(&mut a, 0));
+        a.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(!tab_update_reconfigures(&mut a, 0));
+    }
+
+    #[test]
+    fn a_snapshot_missing_zellaude_keys_reinstalls() {
+        let mut a = bindings_instance(0, 0);
+        a.bindings_target_plugin_id = Some(40);
+        a.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(!a.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_must_not_be_asked));
+
+        // A config reload drops every runtime binding.
+        a.initial_keybinds = Some(Vec::new());
+        assert!(a.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_here));
+    }
+
+    #[test]
+    fn a_quick_a_b_a_switch_leaves_the_keys_in_a() {
+        let mut a = bindings_instance(0, 0);
+        let mut b = bindings_instance(1, 0);
+        assert!(tab_update_reconfigures(&mut a, 0));
+        assert!(b.record_bindings_target(Some("1 40")));
+        b.initial_keybinds = Some(snapshot_with_zellaude_keys());
+
+        // The client visits B, whose target message is held back, then returns to A.
+        assert!(tab_update_reconfigures(&mut b, 1));
+        a.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(!tab_update_reconfigures(&mut a, 0));
+
+        assert!(a.record_bindings_target(Some("1 41")));
+        assert!(a.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_here));
+        assert_eq!(a.bindings_target_plugin_id, Some(40));
+
+        // B's cached tabs still show B active; only the host knows better.
+        b.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(b.record_bindings_target(Some("1 40")));
+        assert!(!b.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_elsewhere));
+    }
+
+    #[test]
+    fn a_target_from_another_clients_instance_triggers_nothing() {
+        let mut a = bindings_instance(0, 0);
+        a.bindings_target_plugin_id = Some(40);
+
+        // Through the real pipe arm: reaching the host query here would panic natively.
+        for payload in ["2 41", "1", "1 x", "x 41"] {
+            a.pipe(PipeMessage::new(
+                PipeSource::Plugin(41),
+                BINDINGS_TARGET_PIPE,
+                &Some(payload.to_string()),
+                &None,
+                false,
+            ));
+        }
+
+        assert_eq!(a.bindings_target_plugin_id, Some(40));
+        assert!(a.initial_keybinds.is_some());
+    }
+
+    #[test]
+    fn two_target_messages_in_one_activation_retarget_once() {
+        let mut a = bindings_instance(0, 0);
+        a.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(a.record_bindings_target(Some("1 41")));
+        assert!(a.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_here));
+
+        a.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(a.record_bindings_target(Some("1 42")));
+        assert!(!a.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_must_not_be_asked));
+
+        // A TabUpdate starts the next activation.
+        assert!(tab_update_reconfigures(&mut a, 0));
+        a.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(a.record_bindings_target(Some("1 43")));
+        assert!(a.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_here));
+    }
+
+    #[test]
+    fn a_hidden_instance_the_host_puts_elsewhere_does_not_retarget() {
+        // Its last TabUpdate showed it active, as every hidden instance's does.
+        let mut b = bindings_instance(1, 1);
+        b.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(b.record_bindings_target(Some("1 40")));
+
+        assert!(!b.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_elsewhere));
+        assert_eq!(b.bindings_target_plugin_id, Some(40));
+        assert!(b.initial_keybinds.is_some());
+    }
+
+    #[test]
+    fn a_failed_host_query_is_not_asked_again_before_the_next_tab_update() {
+        let mut b = bindings_instance(1, 1);
+        b.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(b.record_bindings_target(Some("1 40")));
+        // An Err or a timeout reads as elsewhere.
+        assert!(!b.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_elsewhere));
+
+        // Through the real pipe arm: asking the host again would panic natively.
+        for target in ["1 42", "1 43"] {
+            b.pipe(PipeMessage::new(
+                PipeSource::Plugin(42),
+                BINDINGS_TARGET_PIPE,
+                &Some(target.to_string()),
+                &None,
+                false,
+            ));
+        }
+        assert_eq!(b.bindings_target_plugin_id, Some(43));
+        assert!(b.initial_keybinds.is_some());
+
+        b.update(Event::TabUpdate(session_tabs(1)));
+        assert!(!b.client_focus_elsewhere);
+    }
+
+    #[test]
+    fn a_fresh_sessions_starting_tab_alone_gets_the_keys() {
+        // Creating the session made every tab briefly active, so each instance's
+        // cached tabs show itself active when the grant reaches all of them.
+        let grant_reaches_all = |check: BindingsCheck| -> Vec<usize> {
+            (0..BINDINGS_TABS)
+                .filter(|&tab| {
+                    let mut instance = bindings_instance(tab, tab);
+                    let host = if tab == 0 {
+                        host_says_here
+                    } else {
+                        host_says_elsewhere
+                    };
+                    instance.retarget_runtime_bindings_with(check, host)
+                })
+                .collect()
+        };
+
+        assert_eq!(grant_reaches_all(BindingsCheck::HostFocus), vec![0]);
+        assert_eq!(
+            grant_reaches_all(BindingsCheck::CachedTabs).len(),
+            BINDINGS_TABS
+        );
+    }
+
+    #[test]
+    fn a_detached_pane_update_whose_query_errs_retargets_nothing_and_is_not_re_asked() {
+        let mut b = bindings_instance(3, 3);
+        b.initial_keybinds = Some(snapshot_with_zellaude_keys());
+        assert!(b.record_bindings_target(Some("1 40")));
+        // With no client attached the query errs.
+        assert!(!b.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_says_elsewhere));
+
+        // Through the real PaneUpdate arm: asking the host again would panic natively.
+        let manifest = b.pane_manifest.clone().unwrap();
+        for _ in 0..3 {
+            b.update(Event::PaneUpdate(manifest.clone()));
+        }
+        assert_eq!(b.bindings_target_plugin_id, Some(40));
+        assert!(b.initial_keybinds.is_some());
+    }
+
+    #[test]
+    fn without_a_pane_manifest_the_host_is_not_asked() {
+        let mut a = bindings_instance(0, 0);
+        a.pane_manifest = None;
+        assert!(a.record_bindings_target(Some("1 41")));
+
+        assert!(!a.retarget_runtime_bindings_with(BindingsCheck::HostFocus, host_must_not_be_asked));
+        assert!(!a.client_focus_elsewhere);
+    }
+
+    #[test]
+    fn the_installed_keys_route_to_the_installing_instance() {
+        let snippet = runtime_bindings_snippet(&Vec::new(), 40).unwrap();
+        let parsed = zellij_utils::input::config::Config::from_kdl(&snippet, None)
+            .unwrap()
+            .keybinds
+            .to_keybinds_vec();
+        let bound = |mode: InputMode| -> Vec<(KeyWithModifier, Vec<Action>)> {
+            parsed
+                .iter()
+                .find(|(parsed_mode, _)| *parsed_mode == mode)
+                .map(|(_, bindings)| bindings.clone())
+                .unwrap()
+        };
+
+        for (_, key, actions) in split_three::bindings(40) {
+            assert!(bound(InputMode::Pane).contains(&(key, actions)));
+        }
+        for (_, key, actions) in custom_layouts::bindings(40) {
+            assert!(bound(InputMode::Tab).contains(&(key, actions)));
+        }
+    }
+
+    const BINDINGS_TABS: usize = 8;
+
+    /// Plugin `40 + tab` sits in `tab` of an 8-tab session beside terminal `100 + tab`;
+    /// its cached tabs show `active_tab` active.
+    fn bindings_instance(tab: usize, active_tab: usize) -> State {
+        let mut manifest = PaneManifest::default();
+        for position in 0..BINDINGS_TABS {
+            manifest.panes.insert(
+                position,
+                vec![
+                    PaneInfo {
+                        id: 40 + position as u32,
+                        is_plugin: true,
+                        ..PaneInfo::default()
+                    },
+                    PaneInfo {
+                        id: 100 + position as u32,
+                        ..PaneInfo::default()
+                    },
+                ],
+            );
+        }
+        State {
+            plugin_id: Some(40 + tab as u32),
+            client_id: Some(1),
+            command_permissions_granted: true,
+            pane_manifest: Some(manifest),
+            tabs: session_tabs(active_tab),
+            initial_keybinds: Some(Vec::new()),
+            ..State::default()
+        }
+    }
+
+    fn session_tabs(active_tab: usize) -> Vec<TabInfo> {
+        (0..BINDINGS_TABS)
+            .map(|position| TabInfo {
+                position,
+                active: position == active_tab,
+                ..TabInfo::default()
+            })
+            .collect()
+    }
+
+    /// A reconfigure consumes the snapshot, so that is how a test sees one happen.
+    fn tab_update_reconfigures(state: &mut State, active_tab: usize) -> bool {
+        assert!(state.initial_keybinds.is_some());
+        state.update(Event::TabUpdate(session_tabs(active_tab)));
+        state.initial_keybinds.is_none()
+    }
+
+    /// What zellij reports after Zellaude's reconfigure: its keys, every pipe field erased.
+    fn snapshot_with_zellaude_keys() -> KeybindsVec {
+        let erase = |actions: Vec<Action>| -> Vec<Action> {
+            actions
+                .into_iter()
+                .map(|action| {
+                    let encoded =
+                        zellij_utils::plugin_api::action::ProtobufAction::try_from(action).unwrap();
+                    Action::try_from(encoded).unwrap()
+                })
+                .collect()
+        };
+        let pane = split_three::bindings(0)
+            .into_iter()
+            .map(|(_, key, actions)| (key, erase(actions)))
+            .collect();
+        let tab = custom_layouts::bindings(0)
+            .into_iter()
+            .map(|(_, key, actions)| (key, erase(actions)))
+            .collect();
+        vec![(InputMode::Pane, pane), (InputMode::Tab, tab)]
+    }
+
+    fn host_says_here(_: &mut State) -> bool {
+        true
+    }
+
+    fn host_says_elsewhere(_: &mut State) -> bool {
+        false
+    }
+
+    fn host_must_not_be_asked(_: &mut State) -> bool {
+        panic!("the host was asked")
     }
 
     #[test]
