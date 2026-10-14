@@ -112,3 +112,10 @@
 ### Split-three key failures were the test harness's load
 - T12's first keys run showed 5 of 24 first-visit failures, and the fresh starting tab failed 2 of 3. It polled `zellij action list-panes --all` ten times a second, and the split-three state machine needs that same server. With a lighter harness (5 polls/s, 20 s window): the branch passed 0 failures over 3 repeats, fresh tab included; `develop` had 1 slow visit. Under the heavy harness the branch failed 1 of 16 against `develop`'s 7 of 16.
 - Options: suspect T17 and trace the state machine / re-measure with a lighter harness first. Selected: re-measure — no stuck case on the branch, so T17's timer change is cleared. Split-three's sensitivity to server load is pre-existing, and the branch improves it.
+
+### Two-client keys become a stated residual (rev 10)
+- T12 under the lighter harness: with a second client attached, the first client's split-three and prompt keys never acted — branch stuck 3 of 3, `develop` 2 of 2. The second client's acted sometimes on both builds. The branch's own target, no reload storm with two clients, passed: 0 `InitialKeybinds` in all 8 instances, 3 of 3 runs.
+- Options, ranked:
+  1. (rec) Keep the reload check as the pass and state two-client keys as a residual — the branch matches `develop` there, and multi-client key routing is a feature bug, not this branch's CPU goal / the keys stay broken with two clients.
+  2. Trace and fix multi-client routing here — fixes it / depends on how zellij scopes focus and actions per client, unknown, and outside the user's stated goal.
+- Selected: 1, with the fix proposed to the user as a seed.
