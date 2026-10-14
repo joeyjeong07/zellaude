@@ -108,3 +108,7 @@
 ### Keys were less reliable mid-run, before T16
 - impl3 measured first visits after a re-attach: the branch at 7585d2e (before T16) failed 7 of 24 split-three and 6 of 24 prompt visits, against `develop`'s 3 of 24. An earlier row made the keys less reliable for a while; which one is not traced. T16 replaces the whole binding mechanism, and rev 8's pass condition (0 failures over ≥3 repeats of 8 visits) tells the fix apart from both baselines: chance alone would pass it about 4 % of the time at `develop`'s rate.
 - Options: trace which earlier row worsened it / rely on T16's replacement plus the pass condition. Selected: rely on T16 — the mechanism that failed no longer exists once T16 lands. If T16's pass condition fails, the trace comes back.
+
+### Split-three key failures were the test harness's load
+- T12's first keys run showed 5 of 24 first-visit failures, and the fresh starting tab failed 2 of 3. It polled `zellij action list-panes --all` ten times a second, and the split-three state machine needs that same server. With a lighter harness (5 polls/s, 20 s window): the branch passed 0 failures over 3 repeats, fresh tab included; `develop` had 1 slow visit. Under the heavy harness the branch failed 1 of 16 against `develop`'s 7 of 16.
+- Options: suspect T17 and trace the state machine / re-measure with a lighter harness first. Selected: re-measure — no stuck case on the branch, so T17's timer change is cleared. Split-three's sensitivity to server load is pre-existing, and the branch improves it.
