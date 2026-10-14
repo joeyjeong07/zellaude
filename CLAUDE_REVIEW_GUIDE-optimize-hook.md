@@ -28,6 +28,7 @@
   1. (rec) Fix both sentences inside T8 — the docs stay true, and nobody else owns `docs/` / two files outside the board's T8 list.
   2. Leave them — no scope change / the docs then describe behavior that no longer exists.
 - Selected: 1, with impl2's sentence-only wording.
+- Again at T16: the same plan doc's step at :1234 anchored on `maybe_install_runtime_bindings`, which T16 removes. Edited inside T16, sentence-only, to name `maybe_retarget_runtime_bindings(BindingsCheck::HostFocus)`.
 
 ### Q3 scan rule keeps SessionRestore
 - Reported by impl1 after T2 (cbae1dd), accepted by impl1-crit1. `SessionRestore` is the event `zellaude-attach.sh` sends through `--inspect` to rebuild a pane after attach. It is not a Claude hook event, so the PLAN's "SessionStart and UserPromptSubmit only" did not name it. Recovery needs the `/effort` scan, and five suite cases pin it.
