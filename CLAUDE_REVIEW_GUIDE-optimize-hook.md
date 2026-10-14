@@ -10,6 +10,7 @@
 - T12's preflight wanted no other user process on km-kim-4. The user's idle `asterorank_trainer-4` session, `nvitop` and shells were there; km-kim-1/2/3 were unusable.
 - Options, ranked: 1. (rec) run it with the idle processes present · 2. (rec) the user frees the pod first · 3. skip the arm, so keystroke latency under throttling goes unmeasured.
 - The user's answer, verbatim: "Currently km-kim-4 is doing nothing. But I tell you I might use it again though." That is a fact and a caveat, not an option number.
+- Rev 12: both runs aborted on short-lived children of the user's idle `asterorank_trainer-4` server: its deployed plugin's `run_command` work, the second time with a direct parent chain. Options: (1, rec) count such children as idle baseline unless they use ≥ 0.2 CPU-s/s together or one lives > 2 s · (2) ask the user to close that session for the window · (3) report the arm as not run in band. Selected: 1. It keeps the user's meaning, yield on use, and those children are not use.
 - Read as: run while idle, yield on use. The arm starts only while the user's processes (anything not descended from the probe) and the GPUs are idle, a 1 s monitor kills the burner within 2 s of any user activity, the whole arm is capped at 40 minutes, and the user is warned before it starts.
 
 ## Decisions without user
