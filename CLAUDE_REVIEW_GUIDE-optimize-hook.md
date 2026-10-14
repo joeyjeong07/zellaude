@@ -119,3 +119,7 @@
   1. (rec) Keep the reload check as the pass and state two-client keys as a residual — the branch matches `develop` there, and multi-client key routing is a feature bug, not this branch's CPU goal / the keys stay broken with two clients.
   2. Trace and fix multi-client routing here — fixes it / depends on how zellij scopes focus and actions per client, unknown, and outside the user's stated goal.
 - Selected: 1, with the fix proposed to the user as a seed.
+
+### Keys on zellij 0.44.0, and the two-client prompt
+- On the 0.44.0 release (T16 changed its legacy `ModeUpdate` path): the branch's prompt key was on time 27 of 27, and split-three was on time 15, slow 11, stuck once. On `develop`, 3 of 4 runs ended early on a stuck prompt. Selected: old behaviour, not a regression — split-three is slow on 0.44.0 for both, and the branch's prompt is better there.
+- Two clients: the prompt opened visibly in client A's bar every time (4 runs). A's next keystrokes went into that visible prompt, as an open prompt should; no hidden prompt swallowed keys. The earlier "stuck" prompt followed A's own split attempt, likely the split still running (unverified).
