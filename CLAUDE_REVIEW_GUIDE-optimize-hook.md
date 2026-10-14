@@ -123,3 +123,12 @@
 ### Keys on zellij 0.44.0, and the two-client prompt
 - On the 0.44.0 release (T16 changed its legacy `ModeUpdate` path): the branch's prompt key was on time 27 of 27, and split-three was on time 15, slow 11, stuck once. On `develop`, 3 of 4 runs ended early on a stuck prompt. Selected: old behaviour, not a regression — split-three is slow on 0.44.0 for both, and the branch's prompt is better there.
 - Two clients: the prompt opened visibly in client A's bar every time (4 runs). A's next keystrokes went into that visible prompt, as an open prompt should; no hidden prompt swallowed keys. The earlier "stuck" prompt followed A's own split attempt, likely the split still running (unverified).
+
+### E2E pass 1 settles, pass 6 pools (rev 11)
+- T12's rev-2 E2E (two runs, final HEAD 28bbe2b): every stream invariant and passes 2–5 held. Pass 6 per block: 7 of 8 under 0.5 s, one at 0.518 s (n = 16). Run 2 pooled: n = 69, p95 0.498 s. Pass 1: one read caught a bar's first-visit blank frame, which predates the branch and is shorter on it (numbers in the PLAN).
+- Options, ranked:
+  1. (rec) Pool pass 6 per run, and read pass 1 at least 1 s after the switch — sound statistics and a fair read / pass 6 still sits at its bar, not inside it.
+  2. Keep per-block p95 and re-run until a set passes — no rule change / tests the noise in a 16-sample p95, not the branch.
+  3. Raise pass 6's bar — passes easily / moves the goalpost.
+- Pooling alone did not rescue run 1 (p95 0.518 s). The tail is one event: the `SessionStart` that `/clear` fires 20 ms after its `SessionEnd`, waiting behind a running tool pipe and then behind its own `SessionEnd`, as the design orders on purpose. Without the `/clear` pairs, p95 is 0.430 s. An urgent lane (urgent events never wait behind a coalesced pipe) would cut only the tool-pipe part (estimate p95 0.457 s), at the price of two pipes in flight per session.
+- Selected: pool per run; give the `/clear` `SessionStart` its own bound, p95 ≤ 1.0 s (two pipe-times), so that path stays gated (checkpoint 4 round 2: ungated would let a lock-ordering regression pass); no urgent lane. `develop`'s baseline under the same burst (p50 18.2 s, p95 26.8 s) shows the bar is about the branch's own tail, not the user's experience. The user is told.
