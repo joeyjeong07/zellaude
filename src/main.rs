@@ -105,6 +105,15 @@ done
 jq -s "$@" '{settings_json: $settings, generator_files: .}' < "$stream"
 "#;
 
+/// Milliseconds since this instance's first call, on a clock wall-clock steps cannot move.
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
 /// One `keybinds` block of the keys Zellaude may bind; `None` when the user owns them all.
 fn runtime_bindings_snippet(keybinds: &KeybindsVec, plugin_id: u32) -> Option<String> {
     let split_three_bindings = split_three::available_bindings(keybinds, plugin_id);
@@ -180,7 +189,7 @@ impl ZellijPlugin for State {
             EventType::InitialKeybinds,
             EventType::ActionComplete,
         ]);
-        set_timeout(TIMER_INTERVAL);
+        self.arm_tick(TIMER_INTERVAL);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -555,6 +564,9 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_) => {
+                if self.is_early_tick(monotonic_ms()) {
+                    return false;
+                }
                 if let Some(pending_body) = self.manifest_pending_body.take() {
                     self.dispatch_manifest(pending_body);
                 }
@@ -569,11 +581,11 @@ impl ZellijPlugin for State {
                 let has_flashes = self.has_active_flashes();
                 let animates_rainbow = self.should_animate_rainbow();
                 if animates_rainbow {
-                    set_timeout(rainbow::ANIMATION_TICK_SECONDS);
+                    self.arm_tick(rainbow::ANIMATION_TICK_SECONDS);
                 } else if has_flashes {
-                    set_timeout(FLASH_TICK);
+                    self.arm_tick(FLASH_TICK);
                 } else {
-                    set_timeout(TIMER_INTERVAL);
+                    self.arm_tick(TIMER_INTERVAL);
                 }
                 animates_rainbow
                     || has_flashes
@@ -2057,6 +2069,17 @@ impl State {
             .retain(|pane_id, _| self.pane_to_tab.contains_key(pane_id));
     }
 
+    fn arm_tick(&mut self, seconds: f64) {
+        set_timeout(seconds);
+        self.tick_interval_ms = (seconds * 1000.0) as u64;
+        self.next_tick_due_ms = monotonic_ms() + self.tick_interval_ms;
+    }
+
+    /// Rebuilt instances inherit their predecessor's timer; re-arming both ticks doubles the chain.
+    fn is_early_tick(&self, now_ms: u64) -> bool {
+        now_ms + self.tick_interval_ms / 2 < self.next_tick_due_ms
+    }
+
     fn cleanup_stale_sessions(&mut self) -> bool {
         let now = unix_now();
         let mut changed = false;
@@ -2337,6 +2360,73 @@ mod tests {
         state.merge_sessions(BTreeMap::from([(7, session("ended", 40, false))]));
         assert_eq!(state.sessions.get(&7).unwrap().last_ts_ms, 40);
         assert!(state.session_end_tombstones.is_empty());
+    }
+
+    #[test]
+    fn stray_early_timer_events_add_no_chain() {
+        let armed = State {
+            next_tick_due_ms: 10_000,
+            tick_interval_ms: 1_000,
+            ..State::default()
+        };
+        assert!(armed.is_early_tick(9_400));
+        assert!(!armed.is_early_tick(9_600));
+
+        // A predecessor's timer fires into this instance 900 ms before its own tick.
+        let mut state = State::default();
+        state.arm_tick(TIMER_INTERVAL);
+        let due = monotonic_ms() + 900;
+        state.next_tick_due_ms = due;
+        for _ in 0..3 {
+            assert!(!state.update(Event::Timer(TIMER_INTERVAL)));
+        }
+        assert_eq!(state.next_tick_due_ms, due);
+    }
+
+    #[test]
+    fn a_tick_two_intervals_late_still_re_arms() {
+        let armed = State {
+            next_tick_due_ms: 10_000,
+            tick_interval_ms: 1_000,
+            ..State::default()
+        };
+        assert!(!armed.is_early_tick(12_000));
+
+        let mut state = State::default();
+        state.arm_tick(TIMER_INTERVAL);
+        let before = monotonic_ms();
+        state.next_tick_due_ms = before.saturating_sub(2_000);
+
+        state.update(Event::Timer(TIMER_INTERVAL));
+
+        assert!(state.next_tick_due_ms >= before + 1_000);
+    }
+
+    #[test]
+    fn the_due_tick_re_arms_at_1_s_or_a_quarter_second_with_a_flash_or_rainbow() {
+        let due_tick_interval_ms = |mut state: State| {
+            state.arm_tick(TIMER_INTERVAL);
+            state.next_tick_due_ms = monotonic_ms();
+            state.update(Event::Timer(TIMER_INTERVAL));
+            state.tick_interval_ms
+        };
+        let with_session = |rainbow_name: bool| {
+            let mut state = State::default();
+            state.sessions.insert(
+                7,
+                SessionInfo {
+                    rainbow_name,
+                    ..session("s", 1_000, false)
+                },
+            );
+            state
+        };
+
+        assert_eq!(due_tick_interval_ms(with_session(false)), 1_000);
+        let mut flashing = with_session(false);
+        flashing.flash_deadlines.insert(7, u64::MAX);
+        assert_eq!(due_tick_interval_ms(flashing), 250);
+        assert_eq!(due_tick_interval_ms(with_session(true)), 250);
     }
 
     #[test]

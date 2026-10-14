@@ -215,6 +215,9 @@ pub struct State {
     /// The body itself is held — not a dirty flag — because the holder may be
     /// a hidden instance whose own tabs/panes are stale by flush time.
     pub manifest_pending_body: Option<manifest::ManifestBody>,
+    /// When the armed Timer is due, on the `monotonic_ms` clock.
+    pub next_tick_due_ms: u64,
+    pub tick_interval_ms: u64,
     pub term_program: Option<String>,
     pub input_mode: InputMode,
     pub settings: Settings,
