@@ -13,7 +13,7 @@ zellaude spends CPU in four places it controls: the hook's forks per event, zell
 - **A symptom that breaks a tool:**
   - Reported from my-terminal-setup on 2026-10-07: `zellij action dump-layout` passes through the plugin stage, so it waits behind zellaude's per-event work. Past zellij's 1 s action timeout (`ACTION_COMPLETION_TIMEOUT`, route.rs, 0.44.3) it returns EMPTY output with exit 0, which crashed `zellmv restart`.
   - On km-kim-0-0's my-terminal-setup-0 (6 bars, 34 panes, a few active claudes): plugin-exec threads at 280–470 % CPU in every 1 s window of a 20 s run; `dump-layout` 0.31–0.47 s, up to 1.03 s. A fresh session takes 0.06–0.09 s, and `query-tab-names`, which skips the plugin stage, 24 ms.
-  - Reproduced on km-kim-4 (8 tabs, 2 tool pairs/s, 40 calls per block, 2 blocks): today's delivery gave p95 1.04 s and 0.56 s, with 5 empty outputs in one block. Simulated branch delivery (each pair's trailing Post piped 0.2 s later via `action pipe`, no branch hook involved) gave p95 0.24 s and 0.14 s, with none empty.
+  - Reproduced on km-kim-4 (8 tabs, 2 tool pairs/s, 40 calls per block, 2 blocks): today's delivery gave p95 1.04 s and 0.56 s, with 5 empty outputs in one block. Simulated branch delivery (each pair's trailing Post piped 0.2 s later via `action pipe`, no branch hook involved) gave p95 0.24 s and 0.14 s, with none empty. Measured on the branch itself: see *Decisions › With user › `dump-layout` result accepted*.
   - Scope: the branch removes zellaude's share of the queue `dump-layout` waits behind, not all of it. Plugin-exec and wasm threads also burn CPU with no plugin loaded, driven by terminal redraw (A/B, 1 tab). So much of the 280–470 % on a 34-pane session is likely zellij's own terminal work; the km-kim-4 repro had little redraw and isolates zellaude's share.
   - Under throttling plus terminal load, `dump-layout` can still pass 1 s and return empty with exit 0. zellmv must keep treating empty output as an error (its retry guard in my-terminal-setup); that fix lives outside this branch.
   - The user's `zellaude.json` has `flash: Persist`, so the flash leak below applies to them.
@@ -25,6 +25,10 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
 **Decisions**
 - *With user:*
   - **Goal:** interactive latency under throttling comes first: the bar drawing and answering clicks, moves, drags and keystrokes. Asked whether "the top bar must be very fast" also covers how quickly a tool glyph updates, the user answered only drawing and clicks, so the in-turn tool glyph may lag a little.
+  - **`dump-layout` result accepted (2026-10-16):** the user accepted the branch's measured `dump-layout` and parked further work as `feature/optimize-speed`. That is a standing optimization line for the whole system, starting with the per-event update fan-out. Measured on km-kim-4 at 2 tool pairs/s, 8 tabs:
+    - empty output: `develop` 9–37 of every 40 calls; the branch 0 of 280 diagnostic calls, with 2 fast empties in one earlier run, unexplained;
+    - slowest call: `develop` ~1.05 s; the branch 0.97 s;
+    - p95: the branch 0.25–0.38 s in most blocks, but 0.62–0.80 s in 3 of 7, where plugin-exec ran near its ceiling. So the PLAN's p95 < 0.5 s pass condition is missed in those blocks, and the user accepted that.
   - **Coalescing window:** 0.2 s, the user's pick from the measured curve: 0.05 s cuts 8 % of deliveries, 0.1 s 12 %, 0.2 s 18 %, 0.3 s 20 %, 0.6 s 31 %, 0.9 s 41 % (49 live events, quiet window, indicative only).
   - **Hook scope (Q1):** optimize the hook script and add `async: true` to the Codex hook entry; event lists stay untrimmed (trimming was the rejected option).
   - **Agent-pid lookup (Q2):** memoize the agent pid. On a miss, Linux climbs `/proc` with shell builtins and macOS uses one batched `ps` + `awk` (the user: "I want the macOS to get optimized hook too").
@@ -34,7 +38,7 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
 - *Without user:*
   - **`zellij action pipe` replaces `zellij pipe`:**
     - Delivery: 40/40 events in all three flushed arms, where `zellij pipe` delivered 33, 36 and 38 of 40 in the same block: it loses events intermittently on an idle box.
-    - Cost: ~40 % less server CPU per event.
+    - Cost: measured ~40 % less server CPU per event in early 2-pair blocks. T12's gated 5-block re-measure at 8 tabs found about the same per pipe (median 1.53 vs 1.65 CPU-s, overlapping ranges). The branch saves CPU through fewer pipes, not cheaper ones.
     - Reach: every tab's instance with a client attached; into a client-less session it delivers the same as `zellij pipe`. Every re-attach rebuilds plugin instances anyway, so no per-session command choice is needed.
     - Availability: documented in zellij's CLI-actions reference and measured on 0.44.3. Pipes date from 0.40.0, but `action pipe` at the README's 0.44 floor is unverified; Verification checks it.
   - **Urgent vs coalesced delivery:**
@@ -205,7 +209,7 @@ const ATTACH_DONE_PIPE: &str = "zellaude:attach-done"; // one-shot, sent only af
 - **`dump-layout` under hook load**, on km-kim-4, `develop` vs branch, ≥2 blocks of 40 calls each:
   - Setup: an attached 8-tab session; the E2E's fake agents replay 2 tool pairs per second; `dump-layout` every 0.5 s.
   - Load validity: run `develop` and the branch as paired blocks. Keep a pair only if `develop` in it shows the symptom (at least one call ≥ 1 s or one empty output); discard the rest. Run pairs until 2 are kept, at most 8; if fewer than 2 qualify, raise the rate and say so. Report the kept-pair count.
-  - Pass, over kept pairs: the branch's p95 < 0.5 s, max < 1 s, and no empty output.
+  - Pass, over kept pairs: the branch's p95 < 0.5 s, max < 1 s, and no empty output. Outcome: max < 1 s held; p95 missed in 3 of 7 blocks; no empty output in the final 280 calls, but 2 unexplained fast empties earlier. The user accepted the result (*Decisions › With user*).
   - Log each send's client wall time, `zellij pipe` in `develop` and `zellij action pipe` in the branch, in the attached session. That answers directly whether `action pipe` waits the way `zellij pipe` does.
   - The E2E preflight applies: isolation, the guard, and flat `nr_throttled`.
   - Report `develop`'s numbers, and both arms' count of "CliPipe did not complete within 1s timeout" lines in the zellij log during the load window.

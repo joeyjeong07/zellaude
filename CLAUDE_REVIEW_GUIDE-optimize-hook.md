@@ -6,6 +6,11 @@
 
 ## Decisions with user
 
+### `dump-layout` result accepted, further work parked as optimize-speed
+- `dump-layout` on a busy 8-tab session: the branch never returned empty in 280 diagnostic calls (`develop`: 9–37 of every 40), and its slowest call was 0.97 s (`develop` ~1.05 s). It missed the PLAN's p95 < 0.5 s in 3 of 7 blocks (0.62–0.80 s, with plugin-exec near its ceiling), and an earlier run had 2 unexplained fast empties.
+- Options, ranked: 1. (rec) accept, and park the per-event update fan-out as a seed · 2. investigate the fan-out in this branch first.
+- Selected: 1. The user, verbatim: "1. And I want further optimizations from this seed to be feature/optimize-speed instead, to have not only the that thing but to continuously optimize the whole system, because I think there's still more to optimize." Parked as `feature/optimize-speed`, a standing line holding the fan-out, slow blocks, fast empties, the `SessionUpdate` rate, pull delivery and the 8 × 8 deadlock.
+
 ### Throttling arm with the user's idle processes on km-kim-4
 - T12's preflight wanted no other user process on km-kim-4. The user's idle `asterorank_trainer-4` session, `nvitop` and shells were there; km-kim-1/2/3 were unusable.
 - Options, ranked: 1. (rec) run it with the idle processes present · 2. (rec) the user frees the pod first · 3. skip the arm, so keystroke latency under throttling goes unmeasured.
