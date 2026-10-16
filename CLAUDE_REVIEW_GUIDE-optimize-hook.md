@@ -6,6 +6,11 @@
 
 ## Decisions with user
 
+### Throttling arm: a fourth run, closed loop
+- Three runs never held `develop` in the 6–14 % band: two guard trips on the user's idle plugin, then one on the harness itself, and a fixed burner count gave 0–57 % throttled from `develop`'s own load. The out-of-band data already favoured the branch (same burners: `develop` 55–57 % throttled, branch 0 %; `develop`'s shell echo stalled 8–12 s at each block's end, the branch missed 0 of 113 keys).
+- Options, ranked: 1. (rec) one more run, with a controller holding `develop` in band and the branch replaying its load trace · 2. (rec) close the arm with the out-of-band data.
+- Selected: 1, the user's answer "1."
+
 ### `dump-layout` result accepted, further work parked as optimize-speed
 - `dump-layout` on a busy 8-tab session: the branch never returned empty in 280 diagnostic calls (`develop`: 9–37 of every 40), and its slowest call was 0.97 s (`develop` ~1.05 s). It missed the PLAN's p95 < 0.5 s in 3 of 7 blocks (0.62–0.80 s, with plugin-exec near its ceiling), and an earlier run had 2 unexplained fast empties.
 - Options, ranked: 1. (rec) accept, and park the per-event update fan-out as a seed · 2. investigate the fan-out in this branch first.
