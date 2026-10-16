@@ -2,22 +2,23 @@
 Diff: `git diff develop...HEAD` · as of `ea587cc`
 
 ## Read in this order
-Paths under the repo root. `←` marks a call from outside the file.
+Paths under the repo root. `←` marks a call from outside the file; `›` walks through unchanged symbols on the way. The three `CLAUDE_*` plan files are left out, since archival removes them, so 19 files here against the 22 in the diff.
 
 ```
 1. scripts/zellaude-hook.sh — changed
    └── main (top level) ← agent hook, zellaude-attach.sh:--inspect, zellaude-attach.sh:--restore
+       ├── parse_hook_input
+       ├── detect_codex_rainbow
+       ├── detect_claude_rainbow
+       │   └── claude_process_requested_mode
+       │       ├── read_process_args
+       │       └── read_process_ppid
        ├── state_cache_dir
        │   ├── is_owned_private_parent
        │   │   └── path_owner_and_mode
        │   └── ensure_private_cache_dir
        │       ├── path_owner_and_mode ↑
        │       └── is_owned_private_parent ↑
-       ├── parse_hook_input
-       ├── detect_claude_rainbow
-       │   └── claude_process_requested_mode
-       │       ├── read_process_args
-       │       └── read_process_ppid
        ├── find_agent_pid
        │   ├── memo_agent_pid
        │   │   ├── read_process_comm
@@ -111,10 +112,10 @@ Paths under the repo root. `←` marks a call from outside the file.
    ├── has_zellaude_binding ← main.rs:retarget_runtime_bindings_with
    └── keybinds_section ← main.rs:runtime_bindings_snippet
 7. src/installer.rs — changed
-   └── INSTALL_TEMPLATE ← main.rs:maybe_run_installer
+   └── INSTALL_TEMPLATE ← main.rs:maybe_run_installer › run_install › install_command
 8. src/render.rs — changed
-   ├── render_tabs ← main.rs:render
-   └── render_settings_menu ← main.rs:render
+   ├── render_tabs ← main.rs:render › render_status_bar › build_status_bar
+   └── render_settings_menu ← main.rs:render › render_status_bar › build_status_bar
 9. scripts/install-hooks.sh — changed
    └── install ← CLI
 10. tests/hook_mode_detection.sh — changed
@@ -163,7 +164,7 @@ Paths under the repo root. `←` marks a call from outside the file.
 - Three runs never held `develop` in the 6–14 % band: two guard trips on the user's idle plugin, then one on the harness itself, and a fixed burner count gave 0–57 % throttled from `develop`'s own load. The out-of-band data already favoured the branch (same burners: `develop` 55–57 % throttled, branch 0 %; `develop`'s shell echo stalled 8–12 s at each block's end, the branch missed 0 of 113 keys).
 - Options, ranked: 1. (rec) one more run, with a controller holding `develop` in band and the branch replaying its load trace · 2. (rec) close the arm with the out-of-band data.
 - Selected: 1, the user's answer "1."
-- Run 4 stopped 70 s in on real user activity (an ssh login running `curl` against Hugging Face), and its per-second controller swung the pod 0–80 %. Options, ranked: 1. (rec) close the arm with runs 1–4's data · 2. relaunch on km-kim-4 once the user frees it. The user answered "Use km-kim-2 instead": rev 17 moves the arm to km-kim-2, which has the fleet's 16-CPU quota, and smooths the controller (5 s average, at most one step every 2 s).
+- Run 4 stopped 70 s in on real user activity (an ssh login running `curl` against Hugging Face). Options, ranked: 1. (rec) close the arm with runs 1–4's data · 2. relaunch on km-kim-4 once the user frees it. The user answered "Use km-kim-2 instead": rev 17 moves the arm to km-kim-2, which has the fleet's 16-CPU quota.
 
 ### `dump-layout` result accepted, further work parked as optimize-speed
 - `dump-layout` on a busy 8-tab session: the branch never returned empty in 280 diagnostic calls (`develop`: 9–37 of every 40), and its slowest call was 0.97 s (`develop` ~1.05 s). It missed the PLAN's p95 < 0.5 s in 2 of 6 kept pairs, 5 of all 13 branch blocks (0.62–0.80 s, with plugin-exec near its ceiling), and an earlier run had 2 unexplained fast empties.
@@ -174,10 +175,18 @@ Paths under the repo root. `←` marks a call from outside the file.
 - T12's preflight wanted no other user process on km-kim-4. The user's idle `asterorank_trainer-4` session, `nvitop` and shells were there; km-kim-1/2/3 were unusable.
 - Options, ranked: 1. (rec) run it with the idle processes present · 2. (rec) the user frees the pod first · 3. skip the arm, so keystroke latency under throttling goes unmeasured.
 - The user's answer, verbatim: "Currently km-kim-4 is doing nothing. But I tell you I might use it again though." That is a fact and a caveat, not an option number.
-- Rev 12: both runs aborted on short-lived children of the user's idle `asterorank_trainer-4` server: its deployed plugin's `run_command` work, the second time with a direct parent chain. Options: (1, rec) count such children as idle baseline unless they use ≥ 0.2 CPU-s/s together or one lives > 2 s · (2) ask the user to close that session for the window · (3) report the arm as not run in band. Selected: 1. It keeps the user's meaning, yield on use, and those children are not use.
 - Read as: run while idle, yield on use. The arm starts only while the user's processes (anything not descended from the probe) and the GPUs are idle, a 1 s monitor kills the burner within 2 s of any user activity, the whole arm is capped at 40 minutes, and the user is warned before it starts.
 
 ## Decisions without user
+
+### Throttling guard: the user's idle zellij children are baseline (rev 12)
+- Two km-kim-4 runs aborted on short-lived children of the user's idle `asterorank_trainer-4` server: its deployed plugin's `run_command` work, the second time with a direct parent chain.
+- Options, ranked: 1. (rec) count such children as idle baseline unless together they use ≥ 0.2 CPU-s/s or one lives > 2 s · 2. ask the user to close that session for the window · 3. report the arm as not run in band.
+- Selected: 1. It keeps the user's meaning, yield on use, and those children are not use.
+
+### Throttling controller smoothed (rev 17)
+- Run 4's per-second controller swung the pod 0–80 % throttled while averaging 17.65 %.
+- Options: judge on a 5 s moving average and step at most once every 2 s / keep per-second steps. Selected: smooth, since per-second steps chase noise. Run 5 then held `develop` in band in 3 of 3 pairs.
 
 ### Settings menu width with the Rainbow row
 - Reported by impl2 during T7. The menu never clipped to the bar's width; that predates the branch. The new Rainbow row widens it from 116 to 131 visible columns, so on bars narrower than ~131 columns the close × falls off the right edge (before: below 116). Clicking the Zellaude prefix still closes the menu.
@@ -208,7 +217,7 @@ Paths under the repo root. `←` marks a call from outside the file.
   1. (rec) Keep the debounce — the most pipes saved exactly during a fan-out storm, when CPU matters most; urgent events (`Stop`, `PermissionRequest`, …) still deliver at once / an in-turn glyph can trail by seconds in a storm.
   2. Cap the wait at the window (throttle) — glyph never trails by more than ~0.2 s / up to 5 pipes a second per stream during the storm.
   3. Cap at ~1 s — bounds the trail / a constant the user never chose, between the two.
-- Selected: 1. The user put interactions first and accepted a lagging in-turn glyph; done and waiting are never late. The user has been told and can override.
+- Selected: 1. The user put interactions first and accepted a lagging in-turn glyph; done and waiting were never late at T4. Since rev 2 an urgent event waits behind the session's running pipe and any urgent events ahead (pass 6 bounds it at p95 ≤ 0.5 s). The user has been told and can override.
 
 ### Hook header comment goes to T11
 - `scripts/zellaude-hook.sh:2` still calls the hook a "zellij pipe bridge" after T4. Options: fix it in T5 (T5 never touches the hook) / route it to T11's comment pass. Selected: T11, sent to impl3.
@@ -243,6 +252,7 @@ Paths under the repo root. `←` marks a call from outside the file.
   2. Restate the bar to the attach phase and park both as seeds — the run closes sooner / leaves the largest per-visit cost and an unbounded leak in place.
   3. Fix only the timer leak — one small row / leaves two thirds of each visit's cost.
 - Selected: 1. The user is told and can push either one to a seed.
+- Pinned at checkpoint 4 (round 2): a tick is rejected only when EARLY (now < due − interval/2). A tick at or past its due time re-arms from now however late it is, because a symmetric window would end an instance's only chain on the throttled pod, where late ticks are ordinary.
 
 ### Binding target tracked by broadcast (rev 5)
 - impl2 confirmed T16's cause differs from the suspicion: zellij 0.44.3 erases `KeybindPipe`'s fields, `plugin_id` included, in the `InitialKeybinds` snapshot, so no check can read the target from it.
@@ -299,7 +309,7 @@ Paths under the repo root. `←` marks a call from outside the file.
 - Selected: pool per run; give the `/clear` `SessionStart` its own bound, p95 ≤ 1.0 s (two pipe-times), so that path stays gated (checkpoint 4 round 2: ungated would let a lock-ordering regression pass); no urgent lane. `develop`'s baseline under the same burst (p50 18.2 s, p95 26.8 s) shows the bar is about the branch's own tail, not the user's experience. The user is told.
 
 ### Checkpoint 5 fixes (rev 18)
-- plan-crit1's full-diff review found two regressions in the hook. (1) `parse_hook_input` passed all of `zellaude.json` through argv. Past 128 KiB `jq` never runs, `HOOK_EVENT` stays empty, and every event is dropped. impl1-crit1's parity check later showed `develop` also pipes nothing for such a file, so the failure predates the branch; the branch fixes it rather than restoring it. (2) A Notification landing between an urgent event's claim steps could make it give up unpiped, and Claude fires `PermissionRequest` with a Notification on every prompt.
+- plan-crit1's full-diff review found two defects in the hook. (1) `parse_hook_input` passed all of `zellaude.json` through argv. Past 128 KiB `jq` never runs, `HOOK_EVENT` stays empty, and every event is dropped. impl1-crit1's parity check later showed `develop` also pipes nothing for such a file, so the failure predates the branch; the branch fixes it rather than restoring it. (2) A Notification landing between an urgent event's claim steps could make it give up unpiped, and Claude fires `PermissionRequest` with a Notification on every prompt.
 - Options: fix now as T18 (impl1) with a focused re-verify T19 (impl3) / accept / defer. Selected: fix now — the first silences zellaude on legitimate settings files, and the second can hide the ⚠ the user waits on. The critic's waiter-poll suggestion (0.25 s instead of 0.1 s) rides in T18.
 - Rev 19, from impl1 at T18: "being claimed" cannot be seen per stream without new state, because the claimed marker outlives its delivery. Options, ranked: 1. (rec) drop a Notification only while its stream has an event pending — no new state; it still pipes after its urgent event, at most one extra pipe per prompt · 2. a per-stream in-delivery marker — saves that pipe / new state and a stale path · 3. drop while any urgent marker of the session exists — saves the pipe / drops one pane's Notification on another pane's urgent event. Selected: 1. Not writing the marker is what fixes the bug.
 - T18 landed (c438277, flip 9bbc81d), approved by impl1-crit1 with no findings. Its critic also checked payload parity between `develop` and the branch over 7 settings variants: identical except the 140,000-character file, where `develop` pipes nothing and the branch pipes. So a huge settings file was already fatal on `develop`, and the branch now handles it. It also ran 80 real-timing Stop/Notification pairs in both orders: 0 Stops lost.
