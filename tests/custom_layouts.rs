@@ -765,7 +765,10 @@ fn bar_rows_counts_every_bar_the_generated_tab_will_carry() {
 fn runtime_reconfigure_preserves_the_targeted_tab_binding() {
     let desired = custom_layouts::bindings(TEST_PLUGIN_ID);
     let parsed = Config::from_kdl(
-        &custom_layouts::reconfigure_snippet(&desired, TEST_PLUGIN_ID),
+        &format!(
+            "keybinds {{\n{}}}\n",
+            custom_layouts::keybinds_section(&desired, TEST_PLUGIN_ID)
+        ),
         None,
     )
     .unwrap()

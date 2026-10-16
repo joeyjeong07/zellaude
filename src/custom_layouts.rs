@@ -702,19 +702,23 @@ pub fn available_bindings(existing: &KeybindsVec, plugin_id: u32) -> Vec<TabBind
     }
 }
 
-pub fn install(existing: &KeybindsVec, plugin_id: u32) {
-    let available = available_bindings(existing, plugin_id);
-    if !available.is_empty() {
-        reconfigure(reconfigure_snippet(&available, plugin_id), false);
-    }
+/// Whether the snapshot holds Zellaude's Tab-mode binding, whichever instance it targets.
+pub fn has_zellaude_binding(existing: &KeybindsVec) -> bool {
+    let key = KeyWithModifier::new(BareKey::Char(CUSTOM_LAYOUT_KEY)).with_shift_modifier();
+    existing
+        .iter()
+        .filter(|(mode, _)| *mode == InputMode::Tab)
+        .flat_map(|(_, bindings)| bindings)
+        .any(|(existing_key, actions)| *existing_key == key && is_zellaude_binding(actions))
 }
 
-pub fn reconfigure_snippet(bindings: &[TabBinding], plugin_id: u32) -> String {
+/// The `tab { … }` block of a runtime `keybinds` reconfigure; empty without bindings.
+pub fn keybinds_section(bindings: &[TabBinding], plugin_id: u32) -> String {
     if bindings.is_empty() {
         return String::new();
     }
     format!(
-        "keybinds {{\n    tab {{\n        bind \"N\" {{\n            MessagePluginId {plugin_id} {{\n                name \"{PIPE_NAME}\"\n                payload \"prompt\"\n            }}\n            SwitchToMode \"Normal\"\n            SwitchToMode \"Normal\"\n            SwitchToMode \"Normal\"\n        }}\n    }}\n}}\n"
+        "    tab {{\n        bind \"N\" {{\n            MessagePluginId {plugin_id} {{\n                name \"{PIPE_NAME}\"\n                payload \"prompt\"\n            }}\n            SwitchToMode \"Normal\"\n            SwitchToMode \"Normal\"\n            SwitchToMode \"Normal\"\n        }}\n    }}\n"
     )
 }
 

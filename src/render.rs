@@ -610,11 +610,12 @@ fn render_tabs(
             });
 
         let is_active = tab.active;
-        let has_rainbow_name = state
-            .sessions
-            .values()
-            .filter(|s| s.tab_index == Some(tab.position))
-            .any(|s| s.rainbow_name);
+        let has_rainbow_name = state.settings.rainbow
+            && state
+                .sessions
+                .values()
+                .filter(|s| s.tab_index == Some(tab.position))
+                .any(|s| s.rainbow_name);
 
         // Pick the complete theme declaration for this tab state so its
         // foreground and background remain a deliberate pair.
@@ -964,6 +965,37 @@ fn render_settings_menu(state: &mut State, buf: &mut String, col: &mut usize, th
             col,
             &mut state.menu_click_regions,
             SettingKey::SmartFocus,
+            appearance,
+        );
+    }
+
+    // --- Rainbow (bool) ---
+    {
+        let _ = write!(buf, "  ");
+        *col += 2;
+        let enabled = state.settings.rainbow;
+        let appearance = if enabled {
+            SettingLabel {
+                symbol: "●",
+                label: "Rainbow: on",
+                symbol_color: theme.surface.emphasis(1),
+                label_color: theme.surface.base,
+                dimmed: false,
+            }
+        } else {
+            SettingLabel {
+                symbol: "○",
+                label: "Rainbow: off",
+                symbol_color: theme.surface.base,
+                label_color: theme.surface.base,
+                dimmed: true,
+            }
+        };
+        render_tristate(
+            buf,
+            col,
+            &mut state.menu_click_regions,
+            SettingKey::Rainbow,
             appearance,
         );
     }
