@@ -1,8 +1,161 @@
 # Review guide — optimize-hook
+Diff: `git diff develop...HEAD` · as of `ea587cc`
 
 ## Read in this order
+Paths under the repo root. `←` marks a call from outside the file.
+
+```
+1. scripts/zellaude-hook.sh — changed
+   └── main (top level) ← agent hook, zellaude-attach.sh:--inspect, zellaude-attach.sh:--restore
+       ├── state_cache_dir
+       │   ├── is_owned_private_parent
+       │   │   └── path_owner_and_mode
+       │   └── ensure_private_cache_dir
+       │       ├── path_owner_and_mode ↑
+       │       └── is_owned_private_parent ↑
+       ├── parse_hook_input
+       ├── detect_claude_rainbow
+       │   └── claude_process_requested_mode
+       │       ├── read_process_args
+       │       └── read_process_ppid
+       ├── find_agent_pid
+       │   ├── memo_agent_pid
+       │   │   ├── read_process_comm
+       │   │   └── is_agent_comm
+       │   ├── find_agent_pid_in_ps_table
+       │   └── climb_to_agent_pid
+       │       ├── read_process_comm ↑
+       │       ├── is_agent_comm ↑
+       │       └── read_process_ppid ↑
+       ├── read_launch_env
+       ├── persist_root_state
+       └── deliver_payload
+           ├── is_event_live
+           │   └── is_stream_newest
+           └── start_deliverer
+               ├── pipe_payload
+               ├── pipe_in_turn
+               │   ├── is_event_live ↑
+               │   ├── is_my_turn
+               │   ├── take_pipe_lock
+               │   ├── break_stale_pipe_lock
+               │   ├── claim_stream_event
+               │   │   └── is_stream_newest ↑
+               │   ├── pipe_payload ↑
+               │   └── end_turn
+               └── deliver_after_window
+                   ├── session_is_clientless
+                   ├── claim_stream_event ↑
+                   └── pipe_in_turn ↑
+2. src/main.rs — changed
+   ├── load ← zellij
+   │   └── arm_tick
+   │       └── monotonic_ms
+   ├── update ← zellij
+   │   ├── TabUpdate
+   │   │   ├── maybe_retarget_runtime_bindings
+   │   │   │   └── retarget_runtime_bindings_with
+   │   │   │       ├── runtime_bindings_snippet
+   │   │   │       ├── host_puts_client_here
+   │   │   │       │   └── client_focus_is_on_this_tab
+   │   │   │       └── broadcast_bindings_target
+   │   │   │           └── own_client_id
+   │   │   ├── maybe_run_installer
+   │   │   │   └── is_on_active_tab
+   │   │   ├── maybe_start_attach_scan
+   │   │   │   └── is_on_active_tab ↑
+   │   │   └── maybe_compile_session_templates
+   │   │       └── is_on_active_tab ↑
+   │   ├── PaneUpdate
+   │   │   ├── maybe_retarget_runtime_bindings ↑
+   │   │   ├── maybe_run_installer ↑
+   │   │   ├── maybe_start_attach_scan ↑
+   │   │   └── maybe_compile_session_templates ↑
+   │   ├── ModeUpdate
+   │   │   └── maybe_capture_legacy_keybinds
+   │   │       └── maybe_retarget_runtime_bindings ↑
+   │   ├── Mouse › SettingKey::Rainbow
+   │   ├── RunCommandResult
+   │   │   ├── record_session_template_command
+   │   │   │   └── maybe_broadcast_attach_done
+   │   │   └── maybe_broadcast_attach_done ↑
+   │   ├── Timer
+   │   │   ├── is_early_tick
+   │   │   ├── prune_orphan_flashes
+   │   │   ├── should_animate_rainbow
+   │   │   └── arm_tick ↑
+   │   ├── PermissionRequestResult
+   │   │   └── on_command_permissions_granted
+   │   │       ├── maybe_retarget_runtime_bindings ↑
+   │   │       └── maybe_run_installer ↑
+   │   └── InitialKeybinds
+   │       └── maybe_retarget_runtime_bindings ↑
+   └── pipe ← zellaude-hook.sh:pipe_payload, main.rs instances in other tabs
+       ├── "zellaude:request"
+       │   └── holds_shareable_sessions
+       ├── ATTACH_DONE_PIPE
+       └── BINDINGS_TARGET_PIPE
+           ├── record_bindings_target
+           │   └── own_client_id ↑
+           └── maybe_retarget_runtime_bindings ↑
+3. src/event_handler.rs — changed
+   └── handle_hook_event ← main.rs:pipe
+4. src/state.rs — changed
+   ├── Settings ← main.rs:should_animate_rainbow, render.rs:render_tabs, render.rs:render_settings_menu
+   ├── SettingKey ← main.rs:update, render.rs:render_settings_menu
+   └── State ← main.rs:arm_tick, main.rs:retarget_runtime_bindings_with, main.rs:maybe_broadcast_attach_done
+5. src/split_three.rs — changed
+   ├── has_zellaude_bindings ← main.rs:retarget_runtime_bindings_with
+   └── keybinds_section ← main.rs:runtime_bindings_snippet
+6. src/custom_layouts.rs — changed
+   ├── has_zellaude_binding ← main.rs:retarget_runtime_bindings_with
+   └── keybinds_section ← main.rs:runtime_bindings_snippet
+7. src/installer.rs — changed
+   └── INSTALL_TEMPLATE ← main.rs:maybe_run_installer
+8. src/render.rs — changed
+   ├── render_tabs ← main.rs:render
+   └── render_settings_menu ← main.rs:render
+9. scripts/install-hooks.sh — changed
+   └── install ← CLI
+10. tests/hook_mode_detection.sh — changed
+11. tests/install_end_to_end.sh — changed
+12. tests/install_hooks_idempotency.sh — changed
+13. tests/event_handler.rs — changed
+14. tests/split_three.rs — changed
+15. tests/custom_layouts.rs — changed
+16. tests/render_theme.rs — changed
+17. README.md — not on a call path
+18. docs/superpowers/plans/2026-08-07-session-templates.md — not on a call path
+19. docs/superpowers/specs/2026-08-07-session-templates-design.md — not on a call path
+```
 
 ## Already checked
+- T1–T19 row by row: impl1-crit1, impl2-crit1, impl3-crit1 (board flips)
+- Full diff vs PLAN (plan-crit1, checkpoint 5):
+  - Every added and changed line of `git diff develop...HEAD` (22 files) against PLAN rev 17, then the T18 delta (bad945c..HEAD) against rev 19.
+  - Hook parse: one jq pass with `@sh` assignments, eval'd; no `$INPUT` left; settings reach jq by path in both jq calls, with a missing or unreadable file falling back.
+  - Hook embedding constraints: `state_cache_key()` unchanged and self-contained; the trailing newline present.
+  - Agent pid: the memo is read only for root events whose session id and host match, confirmed by `/proc/<pid>/comm` on Linux, never on SessionStart, never under `--inspect`; the climb is builtins on Linux and one `ps -A` table with basename on macOS, falling back to the per-process climb on empty or failed output.
+  - `--inspect` exits before persist and delivery.
+  - Delivery: urgent set; 0.2 s last-writer coalescing; Notification kept off the stream marker; the presence skip covers coalesced events only and fails open; the per-session lock is judged stale by age; urgent events take priority; SessionEnd is never superseded; the give-up path is bounded; the reaper runs in its own process group, so no orphan sleep; deliverers are detached with stdio closed.
+  - Cache write: one stat per path, no chmod at 700, one jq read-and-merge, and a record jq cannot read is replaced.
+  - Plugin: the Persist flash is dropped at SessionEnd and orphan deadlines are pruned; the rainbow setting defaults on and gates the ticker, rainbow colour and rainbow bold; a sync request is answered only by an instance holding real sessions; attach-done goes out only after install, scan and compile all succeed, with the first-visit fallback otherwise; the template compile is gated to the active tab.
+  - Key bindings: the target is tracked by a per-client broadcast; "active" is host-judged on every trigger but TabUpdate; at most one host-judged retarget per activation; "not here" is cached until the next TabUpdate.
+  - Timer: arm_tick rejects only early ticks; tests cover early, two-intervals-late and due ticks.
+  - Codex hook entry: `async: true` with timeout 3, in both install paths, asserted by tests.
+  - README's rainbow row and delivery paragraph, and the docs edits, match the code.
+  - The tests encode contracts: the erased keybind snapshot goes through the real protobuf round-trip, the mid-claim Notification runs through an mv shim, and the 140,000-char settings file is asserted to apply.
+  - No CLAUDE notes, TODOs or debug output added.
+  - The 128 KiB argv cap, verified on this box: jq exits 126 with a 140 KB `--arg`.
+  - T19's pass-6 figures against the PLAN's bounds.
+- Verification (T12, then T19 on c438277, impl3):
+  - `cargo test --target x86_64-unknown-linux-gnu --features zellij-utils/vendored_curl` → 11 binaries, 267 passed, 0 failed; the 5 shell suites pass; `bash -n` clean; the hook suite passes under bash 3.2.0.
+  - Hook cost per event: tool 32 forks / 0.109 CPU-s, `Stop` 36 / 0.116, `SessionStart` 46 / 0.158; `develop` 100 / 100 / 131 forks.
+  - E2E (rev 11 rules): passes 1–5 and the stream invariants hold. Pass 6: main p95 0.418 s (run 1) and 0.326 s (run 3), with run 2 at n 59 not counted; `/clear` class 0.514–0.834 s against 1.0 s.
+  - Re-attach plus first visits: 0.37–0.39× `develop`; idle timer and late tick at the configured rate; keys on the fresh starting tab and on every first visit after re-attach, 0 failures over 3 repeats; `action pipe` works on zellij 0.44.0.
+  - `dump-layout` under hook load: 0 empty in the final 280 calls, max 0.97 s; p95 missed in 2 of 6 kept pairs, and the user accepted that (Decisions with user).
+  - Throttling arm run 5 (km-kim-2, 3 of 3 pairs in band): keystroke echo and click → menu pass. `develop` lost 5 keys and delayed 18 of 47, the branch none of 398.
+- Not checked: I ran no build, test or suite, and every pass or fail is from T12's and T19's reports; macOS behaviour and bash 3.2 execution, judged by reading only; no CPU, latency or throttle number re-measured; the throttling arm's raw run data; zellij-internal behaviour (TabUpdate scope, focus-query semantics), taken from impl2's source reading.
 
 ## Decisions with user
 
@@ -146,7 +299,7 @@
 - Selected: pool per run; give the `/clear` `SessionStart` its own bound, p95 ≤ 1.0 s (two pipe-times), so that path stays gated (checkpoint 4 round 2: ungated would let a lock-ordering regression pass); no urgent lane. `develop`'s baseline under the same burst (p50 18.2 s, p95 26.8 s) shows the bar is about the branch's own tail, not the user's experience. The user is told.
 
 ### Checkpoint 5 fixes (rev 18)
-- plan-crit1's full-diff review found two regressions in the hook. (1) `parse_hook_input` passed all of `zellaude.json` through argv. Past 128 KiB `jq` never runs, `HOOK_EVENT` stays empty, and every event is dropped; on `develop` the same file only cost the launch env. (2) A Notification landing between an urgent event's claim steps could make it give up unpiped, and Claude fires `PermissionRequest` with a Notification on every prompt.
+- plan-crit1's full-diff review found two regressions in the hook. (1) `parse_hook_input` passed all of `zellaude.json` through argv. Past 128 KiB `jq` never runs, `HOOK_EVENT` stays empty, and every event is dropped. impl1-crit1's parity check later showed `develop` also pipes nothing for such a file, so the failure predates the branch; the branch fixes it rather than restoring it. (2) A Notification landing between an urgent event's claim steps could make it give up unpiped, and Claude fires `PermissionRequest` with a Notification on every prompt.
 - Options: fix now as T18 (impl1) with a focused re-verify T19 (impl3) / accept / defer. Selected: fix now — the first silences zellaude on legitimate settings files, and the second can hide the ⚠ the user waits on. The critic's waiter-poll suggestion (0.25 s instead of 0.1 s) rides in T18.
 - Rev 19, from impl1 at T18: "being claimed" cannot be seen per stream without new state, because the claimed marker outlives its delivery. Options, ranked: 1. (rec) drop a Notification only while its stream has an event pending — no new state; it still pipes after its urgent event, at most one extra pipe per prompt · 2. a per-stream in-delivery marker — saves that pipe / new state and a stale path · 3. drop while any urgent marker of the session exists — saves the pipe / drops one pane's Notification on another pane's urgent event. Selected: 1. Not writing the marker is what fixes the bug.
 - T18 landed (c438277, flip 9bbc81d), approved by impl1-crit1 with no findings. Its critic also checked payload parity between `develop` and the branch over 7 settings variants: identical except the 140,000-character file, where `develop` pipes nothing and the branch pipes. So a huge settings file was already fatal on `develop`, and the branch now handles it. It also ran 80 real-timing Stop/Notification pairs in both orders: 0 Stops lost.
