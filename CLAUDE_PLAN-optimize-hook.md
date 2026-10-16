@@ -45,7 +45,7 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
     - *Urgent events* (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PermissionRequest`, `Stop`) set the states the user waits on; they deliver at once and supersede a pending event of their stream.
     - *Coalesced events:* everything else, per stream. A stream is one pane's root agent or its subagents, so a subagent event can never displace the root event that owns the pane.
       - *Last writer delivers:* within `DELIVERY_COALESCE_SECONDS` (0.2 s, With user), only a burst's trailing event is piped; dropping it instead would leave a stale glyph.
-      - *Notification* only refreshes a timestamp: it never supersedes, and it is dropped while its stream has an event pending.
+      - *Notification* only refreshes a timestamp. It never reads or writes its stream's newest marker, and it is dropped while its stream has an event pending or being claimed (rev 18, checkpoint 5: a Notification landing mid-claim could make the `PermissionRequest` it rides with give up unpiped).
     - *Live sample:* the 0.2 s window cut deliveries by 18 % (curve under *With user*). That count treated every event as coalesced, so exempting urgent events lowers it.
   - **Skip sessions nobody is looking at:**
     - After its window, the deliverer pipes a coalesced event only if zellij's session metadata (`<zellij cache>/contract_version_1/session_info/<session>/session-metadata.kdl`) reads `connected_clients` > 0. Missing or unparseable data means deliver.
@@ -100,7 +100,7 @@ Mode: ask. The user delegated in-scope design choices ("simply do all good and m
   - **Hook micro-cuts:**
     - one `jq` pass reads every input field and stamps `ts_ms`, kept millisecond-precise because the plugin orders by it;
     - `$EUID` replaces `id -u`; `hostname` stays, because `attach_detection.sh` compares its output;
-    - one read of `zellaude.json` serves the launch-env names, the rainbow flag and the notification mode.
+    - one read of `zellaude.json` serves the launch-env names, the rainbow flag and the notification mode. The file reaches `jq` by path (`--rawfile`, which `src/main.rs` already relies on), never through argv. One argument caps at 128 KiB, and a missing, malformed or oversized settings file must never stop the hook parsing its own input (rev 18, checkpoint 5: through argv, a >128 KiB file silenced every event).
   - **Cache write subset:** one `stat` per path for owner and mode, no `chmod` when already 700, and one `jq` that reads the cached `ts_ms` and merges.
   - **Constraints on every hook edit:**
     - `state_cache_key()` stays self-contained (no helper calls, no outside variables) and `set -eu` clean: `src/manifest.rs` lifts it out of the hook by text search and runs it under `set -eu`.
