@@ -706,9 +706,9 @@ write_settings() {
   fi
 }
 
-# The built-ins are the whole list when no settings file exists — the regression
-# test for a hook that now reads that file on every event, or the suite has gone
-# back to reading whoever runs it.
+# With no settings file the event still pipes, and the built-ins are the whole
+# list — the regression test for a hook that now reads that file on every
+# event, or the suite has gone back to reading whoever runs it.
 write_settings
 write_environ \
   'CODEX_SQLITE_HOME=/tmp/codex-sqlite' \
@@ -718,7 +718,8 @@ write_environ \
 run_launch_env_hook claude \
   '{"session_id":"launch-env-builtin","hook_event_name":"SessionStart"}'
 jq -e '
-  .launch_env.CODEX_SQLITE_HOME == "/tmp/codex-sqlite"
+  .hook_event == "SessionStart"
+  and .launch_env.CODEX_SQLITE_HOME == "/tmp/codex-sqlite"
   and .launch_env.OPENAI_BASE_URL == "http://127.0.0.1:9/v1"
   and (.launch_env | keys) == ["CODEX_SQLITE_HOME", "OPENAI_BASE_URL"]
 ' "$CAPTURE_FILE" >/dev/null
@@ -1177,6 +1178,15 @@ for settings in '{"rainbow":true}' '{"rainbow":"no"}' '{"rainbow":' \
   write_settings "$settings"
   run_hook claude "$(claude_ultra_event UserPromptSubmit rainbow-on)" true
 done
+# Past one argument's 128 KiB the settings still apply: jq reads them by path.
+write_settings "$(printf '{"rainbow":false,%s,"padding":"%140000s"}' \
+  '"launch_env_names":{"verbatim":["MY_BASE_URL"]}' '')"
+run_hook claude "$(claude_ultra_event UserPromptSubmit big-settings)" null
+write_environ 'MY_BASE_URL=http://127.0.0.1:9/mine'
+run_launch_env_hook claude \
+  '{"session_id":"big-settings","hook_event_name":"PreToolUse"}'
+jq -e '.launch_env.MY_BASE_URL == "http://127.0.0.1:9/mine"' \
+  "$CAPTURE_FILE" >/dev/null
 write_settings
 
 # The cache write: one stat per directory, and chmod only when not already 700.
@@ -1315,8 +1325,29 @@ expect_delivered "Notification never displaces a pending event" \
 EXPECTED_DELIVERED="Notification"
 expect_delivered "Notification alone" "$(delivery_event Notification)"
 EXPECTED_DELIVERED="PreToolUse:last"
-expect_delivered "Notification is superseded like any coalesced event" \
+expect_delivered "Notification yields to a later pending event" \
   "$(delivery_event Notification)" "$(delivery_event PreToolUse last)"
+
+# A Notification fired inside an urgent event's claim never supersedes it.
+MID_CLAIM_BIN="$TEST_DIR/mid-claim-bin"
+mkdir -p "$MID_CLAIM_BIN"
+cat > "$MID_CLAIM_BIN/mv" <<'MID_CLAIM_MV'
+#!/usr/bin/env bash
+command -p mv "$@" || exit
+# Fires once: the Notification's own hook runs disarmed.
+if [ -n "${ZELLAUDE_TEST_MID_CLAIM_INPUT:-}" ] && [[ ${!#} == *.claimed ]]; then
+  ZELLAUDE_TEST_INPUT=$ZELLAUDE_TEST_MID_CLAIM_INPUT ZELLAUDE_TEST_MID_CLAIM_INPUT= \
+    bash "$ZELLAUDE_TEST_HOOK_PARENT" >/dev/null
+fi
+exit 0
+MID_CLAIM_MV
+chmod +x "$MID_CLAIM_BIN/mv"
+EXPECTED_DELIVERED="Notification Stop"
+ZELLAUDE_TEST_MID_CLAIM_INPUT=$(delivery_event Notification) \
+  ZELLAUDE_TEST_HOOK_PARENT=$HOOK_PARENT PATH="$MID_CLAIM_BIN:$PATH" \
+  expect_delivered "Notification mid-claim" "$(delivery_event Stop)"
+expect_equal "Notification mid-claim: order" "Stop Notification" \
+  "$(piped_in_order)"
 
 # Root and subagent streams never displace each other, urgent events included.
 EXPECTED_DELIVERED="PreToolUse:root PreToolUse:sub@subagent"
@@ -1415,12 +1446,16 @@ PHANTOM_MS=$(($(date +%s) * 1000))
 EXPECTED_DELIVERED=""
 DELIVERY_WINDOW=0.05 expect_delivered "coalesced yields to urgent" \
   "$(delivery_event PreToolUse)"
+expect_equal "coalesced poll" "sleep 0.25" \
+  "$(grep -x -e 'sleep 0.1' -e 'sleep 0.25' "$TIMELINE" | sort -u)"
 EXPECTED_DELIVERED="Stop"
 expect_delivered "urgent waits behind an older urgent" "$(delivery_event Stop)"
 if ! grep -qx 'slept 0.1' "$TIMELINE"; then
   printf 'an urgent event piped ahead of an older one\n' >&2
   exit 1
 fi
+expect_equal "urgent poll" "sleep 0.1" \
+  "$(grep -x -e 'sleep 0.1' -e 'sleep 0.25' "$TIMELINE" | sort -u)"
 rm -f "$SESSION_PREFIX.urgent.$PHANTOM_MS.99999"
 
 # A newer event of its stream supersedes a waiting urgent event; SessionEnd is

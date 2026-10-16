@@ -245,11 +245,13 @@ case "$CLIENT" in
 esac
 
 SETTINGS_FILE="${HOME:-}/.config/zellij/plugins/zellaude.json"
-SETTINGS_PRESENT=false
-SETTINGS_JSON=""
-if [ -f "$SETTINGS_FILE" ]; then
-  SETTINGS_PRESENT=true
-  IFS= read -r -d '' SETTINGS_JSON 2>/dev/null < "$SETTINGS_FILE"
+# By path, not argv (128 KiB cap). On a path it cannot open, jq never reads stdin.
+if [ ! -f "$SETTINGS_FILE" ]; then
+  SETTINGS_JQ_ARGS=(--arg settings_json '{}')
+elif [ -r "$SETTINGS_FILE" ]; then
+  SETTINGS_JQ_ARGS=(--rawfile settings_json "$SETTINGS_FILE")
+else
+  SETTINGS_JQ_ARGS=(--arg settings_json "")
 fi
 
 # Reads the hook input on stdin; prints shell assignments for eval.
@@ -257,8 +259,7 @@ parse_hook_input() {
   jq -r \
     --arg claude_effort "${CLAUDE_EFFORT:-}" \
     --arg configured_effort "${CLAUDE_CODE_EFFORT_LEVEL:-}" \
-    --arg settings_json "$SETTINGS_JSON" \
-    --arg settings_present "$SETTINGS_PRESENT" '
+    "${SETTINGS_JQ_ARGS[@]}" '
       def assign($name; value):
         "\($name)=\(value // "" | if type == "string" then . else tojson end | @sh)";
       def lowercase_text: if type == "string" then ascii_downcase else "" end;
@@ -328,10 +329,7 @@ parse_hook_input() {
         else "true"
         end),
       assign("NOTIFY_MODE";
-        if $settings_present == "true"
-        then try ($settings_json | fromjson | .notifications // "Always") catch ""
-        else "Always"
-        end)
+        try ($settings_json | fromjson | .notifications // "Always") catch "")
     ' 2>/dev/null
 }
 
@@ -541,7 +539,7 @@ read_launch_env() {
   jq -Rsc \
     --arg config_names "$LAUNCH_ENV_CONFIG_NAMES" \
     --arg secret_names "$LAUNCH_ENV_SECRET_NAMES" \
-    --arg settings_json "$SETTINGS_JSON" \
+    "${SETTINGS_JQ_ARGS[@]}" \
     --arg safe_secret_value "$LAUNCH_ENV_SAFE_SECRET_VALUE" \
     --arg redacted_marker "$LAUNCH_ENV_REDACTED_MARKER" '
       # No apostrophes in these comments: one would end the shell string.
@@ -1286,7 +1284,6 @@ fi
 
 DELIVERY_COALESCE_SECONDS=${ZELLAUDE_DELIVERY_COALESCE_SECONDS:-0.2}
 DELIVERY_REAPER_SECONDS=${ZELLAUDE_DELIVERY_REAPER_SECONDS:-5}
-DELIVERY_POLL_SECONDS=0.1
 
 # True only on connected_clients 0, so missing or odd metadata means deliver.
 session_is_clientless() {
@@ -1330,7 +1327,20 @@ is_stream_newest() {
   [ "$newest" = "$1" ]
 }
 
+# Whether token $1 still has something to pipe. SessionEnd always does; a
+# Notification only while its stream has no event pending.
+is_event_live() {
+  case "$HOOK_EVENT" in
+    SessionEnd) return 0 ;;
+    Notification) [ ! -e "$STREAM_PENDING" ] ;;
+    *) is_stream_newest "$1" ;;
+  esac
+}
+
 claim_stream_event() {
+  case "$HOOK_EVENT" in
+    SessionEnd|Notification) return 0 ;;
+  esac
   is_stream_newest "$1" || return 1
   [ ! -e "$STREAM_PENDING" ] || mv -f "$STREAM_PENDING" "$STREAM_CLAIMED" 2>/dev/null
   is_stream_newest "$1"
@@ -1413,7 +1423,7 @@ end_turn() {
 # pipes without the lock.
 pipe_in_turn() {
   local token=$1 started=$SECONDS holding=false may_pipe=false
-  while [ "$HOOK_EVENT" = "SessionEnd" ] || is_stream_newest "$token"; do
+  while is_event_live "$token"; do
     if is_my_turn "$token" && take_pipe_lock "$token"; then
       holding=true
       may_pipe=true
@@ -1426,8 +1436,7 @@ pipe_in_turn() {
     fi
     sleep "$DELIVERY_POLL_SECONDS"
   done
-  if [ "$may_pipe" = true ] &&
-     { [ "$HOOK_EVENT" = "SessionEnd" ] || claim_stream_event "$token"; }; then
+  if [ "$may_pipe" = true ] && claim_stream_event "$token"; then
     pipe_payload
   fi
   end_turn "$token" "$holding"
@@ -1468,16 +1477,19 @@ deliver_payload() {
   fi
   case "$HOOK_EVENT" in
     SessionStart|SessionEnd|UserPromptSubmit|PermissionRequest|Stop)
-      IS_URGENT_EVENT=true ;;
-    *) IS_URGENT_EVENT=false ;;
+      IS_URGENT_EVENT=true
+      DELIVERY_POLL_SECONDS=0.1 ;;
+    *)
+      IS_URGENT_EVENT=false
+      DELIVERY_POLL_SECONDS=0.25 ;;
   esac
 
   if [ "$HOOK_EVENT" = "SessionEnd" ]; then
     rm -f "$PANE_CACHE_PREFIX.$host_key".root.* \
       "$PANE_CACHE_PREFIX.$host_key".subagents.*
-  elif [ "$HOOK_EVENT" = "Notification" ] && [ -e "$STREAM_PENDING" ]; then
-    # Notification only refreshes a timestamp; it yields to a pending event.
-    return
+  elif [ "$HOOK_EVENT" = "Notification" ]; then
+    # Off the newest marker, so it can never supersede an event mid-claim.
+    is_event_live "$token" || return
   elif ! printf '%s\n' "$token" 2>/dev/null > "$STREAM_PENDING"; then
     start_deliverer pipe_payload
     return
