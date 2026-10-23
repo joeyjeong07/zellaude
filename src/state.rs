@@ -145,6 +145,7 @@ pub struct Settings {
     pub elapsed_time: bool,
     pub mode_indicator: bool,
     pub smart_focus: bool,
+    pub rainbow: bool,
 }
 
 impl Default for Settings {
@@ -155,6 +156,7 @@ impl Default for Settings {
             elapsed_time: true,
             mode_indicator: true,
             smart_focus: true,
+            rainbow: true,
         }
     }
 }
@@ -173,6 +175,7 @@ pub enum SettingKey {
     ElapsedTime,
     ModeIndicator,
     SmartFocus,
+    Rainbow,
 }
 
 pub enum MenuAction {
@@ -212,6 +215,9 @@ pub struct State {
     /// The body itself is held — not a dirty flag — because the holder may be
     /// a hidden instance whose own tabs/panes are stale by flush time.
     pub manifest_pending_body: Option<manifest::ManifestBody>,
+    /// When the armed Timer is due, on the `monotonic_ms` clock.
+    pub next_tick_due_ms: u64,
+    pub tick_interval_ms: u64,
     pub term_program: Option<String>,
     pub input_mode: InputMode,
     pub settings: Settings,
@@ -225,8 +231,12 @@ pub struct State {
     /// the plugin is left permanently inert and indistinguishable from a working
     /// one — no hooks installed, no config, no explanation.
     pub permissions_denied: bool,
-    pub split_three_bindings_installed: bool,
-    pub custom_layout_bindings_installed: bool,
+    /// The instance this client's runtime bindings target, as last heard: the snapshot erases it.
+    pub bindings_target_plugin_id: Option<u32>,
+    /// The host put this client's focus on another tab: kept to the next TabUpdate, never re-asked.
+    pub client_focus_elsewhere: bool,
+    /// A host-judged retarget already ran since the last TabUpdate.
+    pub host_judged_retarget_spent: bool,
     pub split_three_uses_legacy_keybinds: bool,
     pub initial_keybinds: Option<KeybindsVec>,
     pub split_three_operation: Option<split_three::Operation>,
@@ -244,9 +254,16 @@ pub struct State {
     /// when the key is absent, so the built-in still compiles.
     pub session_templates: Option<Vec<session_templates::SessionTemplate>>,
     pub session_templates_compiled: bool,
+    pub session_template_commands_pending: usize,
+    pub session_template_command_failed: bool,
     pub session_template_config_error: Option<String>,
+    pub hook_install_requested: bool,
     pub hooks_installed: bool,
     pub attach_scan_requested: bool,
+    pub attach_scan_succeeded: bool,
+    /// Install, attach scan and template compile, done here or by a peer; never repeated.
+    pub attach_work_done: bool,
     pub plugin_id: Option<u32>,
+    pub client_id: Option<ClientId>,
     pub plugin_configuration: BTreeMap<String, String>,
 }

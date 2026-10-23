@@ -127,21 +127,21 @@ min_pane_height 12
 
 tab "{tab}-impl" unless="single_tab only_crit" {
     each for="i" in="1..=n" {
-        pane "claude -n impl{i} '/madev-impl impl{i}'"
+        pane "claude -n impl{i} '/madev:impl impl{i}'"
     }
 }
 each for="k" in="from..from+m" {
     tab "{tab}-crit{k}" unless="single_tab" {
         each for="i" in="1..=n" {
-            pane "claude -n impl{i}-crit{k} '/madev-impl-crit impl{i}-crit{k}'"
+            pane "claude -n impl{i}-crit{k} '/madev:impl-crit impl{i}-crit{k}'"
         }
     }
 }
 tab if="single_tab" {
     each for="i" in="1..=n" {
-        pane "claude -n impl{i} '/madev-impl impl{i}'" unless="only_crit"
+        pane "claude -n impl{i} '/madev:impl impl{i}'" unless="only_crit"
         each for="k" in="from..from+m" {
-            pane "claude -n impl{i}-crit{k} '/madev-impl-crit impl{i}-crit{k}'"
+            pane "claude -n impl{i}-crit{k} '/madev:impl-crit impl{i}-crit{k}'"
         }
     }
 }
@@ -188,7 +188,7 @@ A `tab` that ends up with no panes refuses, and so does a line that opens no tab
 
 `{name}` is replaced for the names a file declares, plus the built-in `{tab}` — the name of the tab the prompt was opened from. **Anything else in braces is left alone**, so `${HOME}` and `{a,b}` reach the shell untouched. That is also the one place the language stays quiet rather than refusing: a misspelt `{crti}` is passed through as text instead of reported.
 
-A string — `{tab}` or a declared one — goes into a tab name raw and into a command single-quoted, so nothing typed on the prompt line or held in a tab name can change how `sh -lc` parses the command around it. With `arg "feature" type="string"`, the line `impl auth` renders `pane "claude -n {feature} '/madev-impl {feature}'"` as `claude -n 'auth' '/madev-impl 'auth''`, and adjacent single-quoted pieces concatenate, so the program receives `auth` and then the one word `/madev-impl auth`. Put a string inside single quotes or none, not double quotes, where the quote marks would reach the program as text. Being text rather than a number, a string belongs only in templates: it cannot be tested by `if` or counted over in a range.
+A string — `{tab}` or a declared one — goes into a tab name raw and into a command single-quoted, so nothing typed on the prompt line or held in a tab name can change how `sh -lc` parses the command around it. With `arg "feature" type="string"`, the line `impl auth` renders `pane "claude -n {feature} '/madev:impl {feature}'"` as `claude -n 'auth' '/madev:impl 'auth''`, and adjacent single-quoted pieces concatenate, so the program receives `auth` and then the one word `/madev:impl auth`. Put a string inside single quotes or none, not double quotes, where the quote marks would reach the program as text. Being text rather than a number, a string belongs only in templates: it cannot be tested by `if` or counted over in a range.
 
 #### Pane size
 
@@ -344,6 +344,7 @@ Click the **Zellaude** prefix on the left side of the bar to open the settings m
 | Flash | Persist / Brief / Off | Brief | Theme-colored flash on permission requests. "Persist" keeps flashing until resolved, "Brief" flashes for 2 seconds. |
 | Elapsed time | On / Off | On | Show time since last activity (appears after 30s). |
 | Smart focus | On / Off | On | Clicking an agent-aware tab focuses its most recently active agent pane (waiting ⚠ sessions first). Off makes tab clicks plain tab switches. |
+| Rainbow | On / Off | On | Tab names of Codex `ultra` and Claude Code `ultracode` sessions shimmer through rainbow colors. Off draws them as plain names and skips the hook's mode detection; after turning it back on, a session can show its old mode until its next prompt. |
 
 ## Install
 
@@ -574,11 +575,11 @@ Three things it does not touch:
 Three components:
 
 1. **WASM plugin** — runs inside Zellij, receives events, maintains state in memory, renders the status bar, and sends desktop notifications. On first load, it writes the hook script to `~/.config/zellij/plugins/zellaude-hook.sh` and registers it in `~/.claude/settings.json` and `~/.codex/hooks.json`.
-2. **Hook script** — a thin bash bridge that forwards Claude Code and Codex hook events to the plugin via `zellij pipe`
+2. **Hook script** — a thin bash bridge that forwards Claude Code and Codex hook events to the plugin via `zellij action pipe`, from a detached process so the agent never waits on Zellij. Each session runs one pipe at a time, so a backlog delivers only each agent's newest state, though a session end always goes out. Session start, prompt, permission, stop and session end events go ahead of the rest; tool, subagent and notification events first wait 0.2 s, and skip sessions with no client attached.
 3. **Attach probe** — runs once when the plugin attaches, maps live agent processes to their real Zellij pane IDs, and restores their current effort modes without waiting for another prompt
 
 ```
-Claude Code / Codex hook → zellaude-hook.sh → zellij pipe → plugin → render
+Claude Code / Codex hook → zellaude-hook.sh → zellij action pipe → plugin → render
 ```
 
 The hook script and registration are version-tagged and updated automatically when the plugin version changes.

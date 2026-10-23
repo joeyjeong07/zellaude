@@ -119,7 +119,10 @@ fn rollback_actions_are_supported_by_the_plugin_action_protocol() {
 fn runtime_reconfigure_preserves_the_targeted_pipe_fields() {
     let desired = bindings(TEST_PLUGIN_ID);
     let parsed = Config::from_kdl(
-        &split_three::reconfigure_snippet(&desired, TEST_PLUGIN_ID),
+        &format!(
+            "keybinds {{\n{}}}\n",
+            split_three::keybinds_section(&desired, TEST_PLUGIN_ID)
+        ),
         None,
     )
     .unwrap();

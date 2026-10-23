@@ -293,7 +293,8 @@ install() {
     "hooks": [{
       "type": "command",
       "command": $cmd,
-      "timeout": 3
+      "timeout": 3,
+      "async": true
     }]
   }]')
 

@@ -41,6 +41,10 @@ CLAUDE_EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","UserPromptSubmi
 CODEX_EVENTS='["PreToolUse","PostToolUse","UserPromptSubmit","PermissionRequest","Stop","SubagentStart","SubagentStop","SessionStart","SessionEnd"]'
 CLAUDE_OWNED='${HOME}/.config/zellij/plugins/zellaude-hook.sh'
 CODEX_OWNED='${HOME}/.config/zellij/plugins/zellaude-hook.sh --client codex'
+CLAUDE_OWNED_HOOK=$("$REAL_JQ" -nc --arg cmd "$CLAUDE_OWNED" \
+  '{type: "command", command: $cmd, timeout: 5, async: true}')
+CODEX_OWNED_HOOK=$("$REAL_JQ" -nc --arg cmd "$CODEX_OWNED" \
+  '{type: "command", command: $cmd, timeout: 3, async: true}')
 PACKAGE_VERSION=$(awk -F '"' '/^version = "/ { print $2; exit }' "$PROJECT_DIR/Cargo.toml")
 
 link_real_tool() {
@@ -249,7 +253,7 @@ owned_hook_count() {
 }
 
 assert_exact_hooks() {
-  local file=$1 events=$2 expected_count=$3 owned=$4
+  local file=$1 events=$2 expected_count=$3 owned=$4 expected_hook=$5
   local actual_events expected_events event count
   [ -f "$file" ] || fail "missing hook settings: $file"
   [ "$(owned_hook_count "$file" "$owned")" -eq "$expected_count" ] ||
@@ -266,11 +270,12 @@ assert_exact_hooks() {
     fail "Zellaude hook event set differs in $file"
 
   while IFS= read -r event; do
-    count=$("$REAL_JQ" --arg event "$event" --arg owned "$owned" '[
+    count=$("$REAL_JQ" --arg event "$event" --argjson expected "$expected_hook" '[
       .hooks[$event][]?.hooks[]?
-      | select((.command // "") == $owned)
+      | select(. == $expected)
     ] | length' "$file")
-    [ "$count" -eq 1 ] || fail "$event does not have exactly one Zellaude hook in $file"
+    [ "$count" -eq 1 ] ||
+      fail "$event does not have exactly one Zellaude hook shaped $expected_hook in $file"
   done < <(printf '%s' "$events" | "$REAL_JQ" -r '.[]')
 }
 
@@ -329,9 +334,11 @@ assert_exact_permissions() {
 assert_complete_install() {
   assert_installed_files
   assert_exact_hooks \
-    "$INSTALL_HOME/.claude/settings.json" "$CLAUDE_EVENTS" 11 "$CLAUDE_OWNED"
+    "$INSTALL_HOME/.claude/settings.json" "$CLAUDE_EVENTS" 11 "$CLAUDE_OWNED" \
+    "$CLAUDE_OWNED_HOOK"
   assert_exact_hooks \
-    "$CODEX_INSTALL_HOME/hooks.json" "$CODEX_EVENTS" 9 "$CODEX_OWNED"
+    "$CODEX_INSTALL_HOME/hooks.json" "$CODEX_EVENTS" 9 "$CODEX_OWNED" \
+    "$CODEX_OWNED_HOOK"
   assert_exact_permissions
 }
 
@@ -451,9 +458,11 @@ cp "$CACHE_DIR/permissions.kdl" "$CASE_ROOT/permissions.before"
 run_installer --no-permissions > "$CASE_ROOT/install.out" 2>&1
 assert_installed_files
 assert_exact_hooks \
-  "$INSTALL_HOME/.claude/settings.json" "$CLAUDE_EVENTS" 11 "$CLAUDE_OWNED"
+  "$INSTALL_HOME/.claude/settings.json" "$CLAUDE_EVENTS" 11 "$CLAUDE_OWNED" \
+  "$CLAUDE_OWNED_HOOK"
 assert_exact_hooks \
-  "$CODEX_INSTALL_HOME/hooks.json" "$CODEX_EVENTS" 9 "$CODEX_OWNED"
+  "$CODEX_INSTALL_HOME/hooks.json" "$CODEX_EVENTS" 9 "$CODEX_OWNED" \
+  "$CODEX_OWNED_HOOK"
 cmp -s "$CASE_ROOT/permissions.before" "$CACHE_DIR/permissions.kdl" ||
   fail "--no-permissions changed the permissions cache"
 

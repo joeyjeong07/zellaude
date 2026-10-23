@@ -12,17 +12,88 @@ mkdir -p "$TEST_DIR/runtime"
 # without this the developer's own zellaude.json decides what these cases see.
 mkdir -p "$TEST_DIR/home"
 export HOME="$TEST_DIR/home"
+# Logs each call and its end; ZELLAUDE_TEST_ZELLIJ_SECONDS slows each pipe,
+# ZELLAUDE_TEST_ZELLIJ_HANGS makes it never answer.
+TIMELINE="$TEST_DIR/timeline.log"
 cat > "$TEST_DIR/bin/zellij" <<'FAKE_ZELLIJ'
 #!/usr/bin/env bash
 printf '%s' "${!#}" > "$ZELLAUDE_TEST_CAPTURE"
+printf 'zellij %s\n' "$*" >> "$ZELLAUDE_TEST_TIMELINE"
+seconds=${ZELLAUDE_TEST_ZELLIJ_SECONDS:-0}
+[ -z "${ZELLAUDE_TEST_ZELLIJ_HANGS:-}" ] || seconds=30
+if [ "$seconds" != 0 ]; then
+  trap 'kill "$sleeper"; printf "zellij killed\n" >> "$ZELLAUDE_TEST_TIMELINE"; exit 143' TERM
+  command -p sleep "$seconds" &
+  sleeper=$!
+  wait "$sleeper"
+fi
+printf 'zellij done\n' >> "$ZELLAUDE_TEST_TIMELINE"
 FAKE_ZELLIJ
 chmod +x "$TEST_DIR/bin/zellij"
 
-cat > "$TEST_DIR/fake-claude" <<'FAKE_CLAUDE'
-#!/usr/bin/env bash
-printf '%s' "$ZELLAUDE_TEST_INPUT" | "$ZELLAUDE_TEST_HOOK"
-FAKE_CLAUDE
-chmod +x "$TEST_DIR/fake-claude"
+# A fixture tree, or the climb reaches whatever runs the suite (a real claude).
+TREE_ROOT="$TEST_DIR/tree"
+mkdir -p "$TREE_ROOT"
+HOOK_PARENT="$TEST_DIR/hook-parent.sh"
+cat > "$HOOK_PARENT" <<'HOOK_PARENT_SCRIPT'
+# The hook's parent; its fixture entries go when it does, as in /proc.
+published=()
+if [ -d "$ZELLAUDE_TREE_PROC_ROOT" ]; then
+  node="$ZELLAUDE_TREE_PROC_ROOT/$$"
+  mkdir -p "$node"
+  printf '%s\n' "$ZELLAUDE_TEST_PARENT_COMM" > "$node/comm"
+  printf '%s (%s) S %s 0 0\n' "$$" "$ZELLAUDE_TEST_PARENT_COMM" \
+    "${ZELLAUDE_TEST_GRANDPARENT_PID:-1}" > "$node/stat"
+  printf '%s\0' "$ZELLAUDE_TEST_PARENT_COMM" "$@" > "$node/cmdline"
+  published+=("$node")
+fi
+if [ -s "${ZELLAUDE_TEST_ENVIRON:-}" ]; then
+  mkdir -p "$ZELLAUDE_PROC_ROOT/$$"
+  cp "$ZELLAUDE_TEST_ENVIRON" "$ZELLAUDE_PROC_ROOT/$$/environ"
+  published+=("$ZELLAUDE_PROC_ROOT/$$")
+fi
+printf '%s' "$ZELLAUDE_TEST_INPUT" |
+  PATH=${ZELLAUDE_TEST_HOOK_PATH:-$PATH} ZELLAUDE_TEST_PARENT_PID=$$ \
+    "$BASH" "$ZELLAUDE_TEST_HOOK" ${ZELLAUDE_TEST_HOOK_ARGS:-}
+hook_status=$?
+printf 'hook returned\n' >> "$ZELLAUDE_TEST_TIMELINE"
+rm -rf "${published[@]}"
+exit "$hook_status"
+HOOK_PARENT_SCRIPT
+
+# hook_process INPUT [NAME=value]... CMD...; parent comm bash, so no agent.
+# The reaper defaults to 1 s unless the caller exports another, even empty.
+hook_process() {
+  local input=$1
+  shift
+  env -u CLAUDE_EFFORT \
+    -u CLAUDE_CODE_EFFORT_LEVEL \
+    -u ZELLAUDE_CLAUDE_MODE \
+    PATH="$TEST_DIR/bin:$PATH" \
+    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
+    XDG_CACHE_HOME="$TEST_DIR/xdg-cache" \
+    ZELLAUDE_DELIVERY_COALESCE_SECONDS=0 \
+    ZELLAUDE_DELIVERY_REAPER_SECONDS="${ZELLAUDE_DELIVERY_REAPER_SECONDS-1}" \
+    ZELLAUDE_TEST_TIMELINE="$TIMELINE" \
+    ZELLIJ_SESSION_NAME="test-session" \
+    ZELLIJ_PANE_ID="7" \
+    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
+    ZELLAUDE_TREE_PROC_ROOT="$TREE_ROOT" \
+    ZELLAUDE_PROC_ROOT="$TEST_DIR/no-environ" \
+    ZELLAUDE_TEST_PARENT_COMM=bash \
+    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
+    ZELLAUDE_TEST_INPUT="$input" \
+    "$@"
+}
+
+# Runs "$@" until every process it started, deliverers included, closes fd 9.
+await_descendants() {
+  { { "$@" 9>&1 1>&3 3>&-; } | cat; } 3>&1
+}
+
+run_hook_process() {
+  await_descendants hook_process "$@"
+}
 
 run_hook() {
   local client=$1
@@ -36,27 +107,13 @@ run_hook() {
 
   : > "$CAPTURE_FILE"
   if [ "$client" = "codex" ]; then
-    printf '%s' "$input" |
-      env -u CLAUDE_EFFORT \
-        -u CLAUDE_CODE_EFFORT_LEVEL \
-        -u ZELLAUDE_CLAUDE_MODE \
-        PATH="$TEST_DIR/bin:$PATH" \
-        XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-        ZELLIJ_SESSION_NAME="test-session" \
-        ZELLIJ_PANE_ID="7" \
-        ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-        "$PROJECT_DIR/scripts/zellaude-hook.sh" --client codex >/dev/null
+    run_hook_process "$input" \
+      ZELLAUDE_TEST_HOOK_ARGS="--client codex" \
+      bash "$HOOK_PARENT" >/dev/null
   else
-    printf '%s' "$input" |
-      env -u CLAUDE_EFFORT \
-        -u CLAUDE_CODE_EFFORT_LEVEL \
-        ZELLAUDE_CLAUDE_MODE="$mode" \
-        PATH="$TEST_DIR/bin:$PATH" \
-        XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-        ZELLIJ_SESSION_NAME="test-session" \
-        ZELLIJ_PANE_ID="7" \
-        ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-        "$PROJECT_DIR/scripts/zellaude-hook.sh" >/dev/null
+    run_hook_process "$input" \
+      ZELLAUDE_CLAUDE_MODE="$mode" \
+      bash "$HOOK_PARENT" >/dev/null
   fi
 
   actual=$(jq -c '.rainbow_name' "$CAPTURE_FILE")
@@ -111,17 +168,9 @@ run_launch_flag() {
   local actual actual_marker
 
   : > "$CAPTURE_FILE"
-  env -u CLAUDE_EFFORT \
-    -u CLAUDE_CODE_EFFORT_LEVEL \
-    -u ZELLAUDE_CLAUDE_MODE \
-    PATH="$TEST_DIR/bin:$PATH" \
-    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-    ZELLIJ_SESSION_NAME="test-session" \
-    ZELLIJ_PANE_ID="7" \
-    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
-    ZELLAUDE_TEST_INPUT="$input" \
-    "$TEST_DIR/fake-claude" --effort "$effort" >/dev/null
+  run_hook_process "$input" \
+    ZELLAUDE_TEST_PARENT_COMM=claude \
+    bash "$HOOK_PARENT" --effort "$effort" >/dev/null
 
   actual=$(jq -c '.rainbow_name' "$CAPTURE_FILE")
   actual_marker=$(jq -c '.rainbow_mode_marker' "$CAPTURE_FILE")
@@ -139,17 +188,10 @@ run_inline_settings_flag() {
   local actual
 
   : > "$CAPTURE_FILE"
-  env -u CLAUDE_EFFORT \
-    -u CLAUDE_CODE_EFFORT_LEVEL \
-    -u ZELLAUDE_CLAUDE_MODE \
-    PATH="$TEST_DIR/bin:$PATH" \
-    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-    ZELLIJ_SESSION_NAME="test-session" \
-    ZELLIJ_PANE_ID="7" \
-    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
-    ZELLAUDE_TEST_INPUT='{"session_id":"claude-settings","hook_event_name":"SessionStart"}' \
-    "$TEST_DIR/fake-claude" --settings "$settings" >/dev/null
+  run_hook_process \
+    '{"session_id":"claude-settings","hook_event_name":"SessionStart"}' \
+    ZELLAUDE_TEST_PARENT_COMM=claude \
+    bash "$HOOK_PARENT" --settings "$settings" >/dev/null
 
   actual=$(jq -c '.rainbow_name' "$CAPTURE_FILE")
   if [ "$actual" != "$expected" ]; then
@@ -497,28 +539,11 @@ jq -e --argjson mode_ts "$LAUNCH_OVERRIDE_MODE_TS" '
 run_inline_settings_flag '{"ultracode":true}' true
 run_inline_settings_flag '{"ultracode":false,"other":true}' false
 
-# find_agent_pid matches on comm, and a shebang script reports comm=bash, so the
-# stand-in agent must be a copy of the bash binary named for the client. Kept
-# off PATH: these names would otherwise shadow a real client for other cases.
-LAUNCH_ENV_BIN="$TEST_DIR/launch-bin"
+# HOOK_PARENT plays the agent; an empty environ fixture means "not captured".
 LAUNCH_ENV_PROC_ROOT="$TEST_DIR/launch-proc"
 LAUNCH_ENV_ENVIRON="$TEST_DIR/launch-environ"
 LAUNCH_ENV_STDOUT="$TEST_DIR/launch-stdout.json"
-mkdir -p "$LAUNCH_ENV_BIN" "$LAUNCH_ENV_PROC_ROOT"
-cp "$(command -v bash)" "$LAUNCH_ENV_BIN/claude"
-cp "$(command -v bash)" "$LAUNCH_ENV_BIN/codex"
-
-# The agent publishes its own environ, because only it knows the pid that
-# find_agent_pid will resolve to. An empty fixture publishes nothing, which is
-# how the not-captured path is reached.
-cat > "$TEST_DIR/launch-agent.sh" <<'LAUNCH_AGENT'
-if [ -s "$ZELLAUDE_TEST_ENVIRON" ]; then
-  mkdir -p "$ZELLAUDE_PROC_ROOT/$$"
-  cp "$ZELLAUDE_TEST_ENVIRON" "$ZELLAUDE_PROC_ROOT/$$/environ"
-fi
-printf '%s' "$ZELLAUDE_TEST_INPUT" |
-  "$ZELLAUDE_TEST_HOOK" ${ZELLAUDE_TEST_HOOK_ARGS:-}
-LAUNCH_AGENT
+mkdir -p "$LAUNCH_ENV_PROC_ROOT"
 
 write_environ() {
   local entry
@@ -534,21 +559,13 @@ run_launch_env_hook() {
   [ "$client" != "codex" ] || hook_args="--client codex"
 
   : > "$CAPTURE_FILE"
-  env -u CLAUDE_EFFORT \
-    -u CLAUDE_CODE_EFFORT_LEVEL \
-    -u ZELLAUDE_CLAUDE_MODE \
-    PATH="$TEST_DIR/bin:$PATH" \
-    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-    ZELLIJ_SESSION_NAME="test-session" \
-    ZELLIJ_PANE_ID="7" \
-    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-    ZELLAUDE_TEST_HOOK="$PROJECT_DIR/scripts/zellaude-hook.sh" \
+  run_hook_process "$input" \
+    ZELLAUDE_TEST_PARENT_COMM="$client" \
     ZELLAUDE_TEST_HOOK_ARGS="$hook_args" \
-    ZELLAUDE_TEST_INPUT="$input" \
     ZELLAUDE_TEST_ENVIRON="$LAUNCH_ENV_ENVIRON" \
     ZELLAUDE_PROC_ROOT="$LAUNCH_ENV_PROC_ROOT" \
     "$@" \
-    "$LAUNCH_ENV_BIN/$client" "$TEST_DIR/launch-agent.sh" > "$LAUNCH_ENV_STDOUT"
+    bash "$HOOK_PARENT" > "$LAUNCH_ENV_STDOUT"
 }
 
 rm -f "$STATE_FILE"
@@ -689,9 +706,9 @@ write_settings() {
   fi
 }
 
-# The built-ins are the whole list when no settings file exists — the regression
-# test for a hook that now reads that file on every event, or the suite has gone
-# back to reading whoever runs it.
+# With no settings file the event still pipes, and the built-ins are the whole
+# list — the regression test for a hook that now reads that file on every
+# event, or the suite has gone back to reading whoever runs it.
 write_settings
 write_environ \
   'CODEX_SQLITE_HOME=/tmp/codex-sqlite' \
@@ -701,7 +718,8 @@ write_environ \
 run_launch_env_hook claude \
   '{"session_id":"launch-env-builtin","hook_event_name":"SessionStart"}'
 jq -e '
-  .launch_env.CODEX_SQLITE_HOME == "/tmp/codex-sqlite"
+  .hook_event == "SessionStart"
+  and .launch_env.CODEX_SQLITE_HOME == "/tmp/codex-sqlite"
   and .launch_env.OPENAI_BASE_URL == "http://127.0.0.1:9/v1"
   and (.launch_env | keys) == ["CODEX_SQLITE_HOME", "OPENAI_BASE_URL"]
 ' "$CAPTURE_FILE" >/dev/null
@@ -943,35 +961,662 @@ VENDOR_PRETOOLUSE_JSON
 run_hook claude "$(cat "$VENDOR_PRETOOLUSE")" false
 jq -e '.current_effort_level == "high"' "$CAPTURE_FILE" >/dev/null
 
-# find_agent_pid under macOS's ps, measured 2026-09-03: `-o comm=` answers with
-# a full path while `-o ucomm=` answers with the rewritten process title. Real
-# coverage is impossible on Linux, where comm is already a basename and ucomm
-# merely aliases it, so the stub branches on the flag it is asked for — that is
-# what fails a ucomm implementation, which would otherwise pass here and match
-# nothing on macOS.
+# The hook's PATH holds only shims: a name not in EXEC_SHIM_NAMES logs MISSING.
+EXEC_SHIM_BIN="$TEST_DIR/exec-shim-bin"
+EXEC_LOG="$TEST_DIR/exec.log"
+EXEC_SHIM_NAMES="awk cat chmod date grep head hostname id jq mkdir mktemp mv od
+  ps rm rmdir sha256sum sleep stat tail tr uname zellij"
+mkdir -p "$EXEC_SHIM_BIN"
+cat > "$TEST_DIR/exec-shim" <<'EXEC_SHIM'
+#!/bin/sh
+printf '%s\n' "${0##*/}" >> "$ZELLAUDE_TEST_EXEC_LOG"
+PATH=$ZELLAUDE_TEST_REAL_PATH
+export PATH
+exec "${0##*/}" "$@"
+EXEC_SHIM
+chmod +x "$TEST_DIR/exec-shim"
+for name in $EXEC_SHIM_NAMES; do
+  if PATH="$TEST_DIR/bin:$PATH" command -v "$name" >/dev/null; then
+    ln -s "$TEST_DIR/exec-shim" "$EXEC_SHIM_BIN/$name"
+  fi
+done
+cat > "$TEST_DIR/exec-bash-env" <<'EXEC_BASH_ENV'
+command_not_found_handle() {
+  printf 'MISSING %s\n' "$1" >> "$ZELLAUDE_TEST_EXEC_LOG"
+  return 127
+}
+EXEC_BASH_ENV
+
+# Prints "name=count" per exec'd command; sleep is left out, its count races.
+exec_profile() {
+  local input=$1
+  shift
+  : > "$EXEC_LOG"
+  run_hook_process "$input" \
+    ZELLAUDE_TEST_HOOK_PATH="$EXEC_SHIM_BIN" \
+    ZELLAUDE_TEST_REAL_PATH="$TEST_DIR/bin:$PATH" \
+    ZELLAUDE_TEST_EXEC_LOG="$EXEC_LOG" \
+    BASH_ENV="$TEST_DIR/exec-bash-env" \
+    "$@" \
+    bash "$HOOK_PARENT" >/dev/null
+  if grep '^MISSING ' "$EXEC_LOG" >&2; then
+    exit 1
+  fi
+  { grep -vx sleep "$EXEC_LOG" || true; } |
+    sort | uniq -c | awk '{ printf "%s%s=%s", sep, $2, $1; sep = " " }'
+}
+
+exec_count() {
+  grep -cx "$1" "$EXEC_LOG" || true
+}
+
+expect_equal() {
+  local label=$1 expected=$2 actual=$3
+  if [ "$actual" != "$expected" ]; then
+    printf '%s\n  expected: %s\n  actual:   %s\n' \
+      "$label" "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
+# Process facts: fixture agents 4242 and 4343 serve as HOOK_PARENT's parent.
+plant_process() {
+  local pid=$1 comm=$2
+  mkdir -p "$TREE_ROOT/$pid"
+  printf '%s\n' "$comm" > "$TREE_ROOT/$pid/comm"
+  printf '%s (%s) S 1 0 0\n' "$pid" "$comm" > "$TREE_ROOT/$pid/stat"
+}
+plant_process 4242 claude
+plant_process 4343 claude
+
+TREE_TOOL_EVENT='{"session_id":"tree-root","hook_event_name":"PreToolUse"}'
+TREE_SESSION_START='{"session_id":"tree-root","hook_event_name":"SessionStart"}'
+
+# $1 the input, $2 the grandparent; the rest are run_hook_process overrides.
+run_tree_hook() {
+  local input=$1 grandparent=$2
+  shift 2
+  : > "$CAPTURE_FILE"
+  run_hook_process "$input" \
+    ZELLAUDE_TEST_GRANDPARENT_PID="$grandparent" \
+    "$@" \
+    bash "$HOOK_PARENT" >/dev/null
+}
+
+expect_agent_pid() {
+  expect_equal "$1: agent_pid" "$2" "$(jq -r '.agent_pid' "$CAPTURE_FILE")"
+}
+
+rm -f "$STATE_FILE"
+# The stat parse counts fields from the last ')', since comm may hold both.
+run_tree_hook "$TREE_SESSION_START" 4242 ZELLAUDE_TEST_PARENT_COMM='sh (x) y'
+expect_agent_pid "climb through a parent named with parens" 4242
+
+# The memo outranks a moved tree, except on SessionStart: a resume reuses ids.
+run_tree_hook "$TREE_TOOL_EVENT" 4343
+expect_agent_pid "memo hit" 4242
+run_tree_hook "$TREE_SESSION_START" 4343
+expect_agent_pid "SessionStart climbs" 4343
+
+# A recycled pid fails the comm check, and the climb answers instead.
+plant_process 4343 vim
+run_tree_hook "$TREE_TOOL_EVENT" 4242
+expect_agent_pid "recycled memo pid" 4242
+plant_process 4343 claude
+
+# Another host's record, another session's and a subagent event all climb.
+OTHER_HOST_BIN="$TEST_DIR/other-host-bin"
+mkdir -p "$OTHER_HOST_BIN"
+cat > "$OTHER_HOST_BIN/hostname" <<'FAKE_HOSTNAME'
+#!/usr/bin/env bash
+printf 'other-host.invalid\n'
+FAKE_HOSTNAME
+chmod +x "$OTHER_HOST_BIN/hostname"
+run_tree_hook "$TREE_TOOL_EVENT" 4343 PATH="$OTHER_HOST_BIN:$TEST_DIR/bin:$PATH"
+expect_agent_pid "other host" 4343
+run_tree_hook "$TREE_TOOL_EVENT" 4242
+expect_agent_pid "record from another host" 4242
+run_tree_hook '{"session_id":"tree-other","hook_event_name":"PreToolUse"}' 4343
+expect_agent_pid "other session" 4343
+run_tree_hook "$TREE_SESSION_START" 4242
+run_tree_hook \
+  '{"session_id":"tree-root","hook_event_name":"PreToolUse","agent_id":"child"}' \
+  4343
+expect_agent_pid "subagent event" 4343
+
+# --inspect, outside the agent's tree, neither reads nor writes the record.
+cp "$STATE_FILE" "$TEST_DIR/record.before"
+run_hook_process '{"session_id":"tree-root","hook_event_name":"SessionRestore"}' \
+  ZELLAUDE_TEST_GRANDPARENT_PID=4343 \
+  ZELLAUDE_TEST_HOOK_ARGS=--inspect \
+  bash "$HOOK_PARENT" > "$TEST_DIR/inspect.json"
+jq -e '.agent_pid == 4343' "$TEST_DIR/inspect.json" >/dev/null
+cmp -s "$STATE_FILE" "$TEST_DIR/record.before"
+
+# Requested-mode detection reads argv from the same tree.
+plant_process 4444 claude
+printf 'claude\0--effort\0ultracode\0' > "$TREE_ROOT/4444/cmdline"
+run_tree_hook '{"session_id":"tree-mode","hook_event_name":"SessionStart"}' 4444
+jq -e '.rainbow_name == true and .agent_pid == 4444' "$CAPTURE_FILE" >/dev/null
+
+# The Linux climb is builtins only: a memo hit and a climb cost the same execs.
+run_tree_hook "$TREE_SESSION_START" 4242
+LINUX_TOOL_EVENT_EXECS=$(exec_profile "$TREE_TOOL_EVENT" \
+  ZELLAUDE_TEST_GRANDPARENT_PID=4343)
+expect_agent_pid "memo hit, counted" 4242
+# A coalesced event: its deliverer claims the stream marker (one mv), pipes,
+# and releases the session pipe lock (one rm).
+expect_equal "Linux tool event execs" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rm=1 rmdir=2 stat=2 tr=1 zellij=1" \
+  "$LINUX_TOOL_EVENT_EXECS"
+expect_equal "Linux climbing tool event execs" "$LINUX_TOOL_EVENT_EXECS" \
+  "$(exec_profile '{"session_id":"tree-climb","hook_event_name":"PreToolUse"}' \
+    ZELLAUDE_TEST_GRANDPARENT_PID=4343)"
+# An urgent event skips the window but otherwise costs the same.
+LINUX_URGENT_EVENT_EXECS=$(exec_profile "$TREE_SESSION_START" \
+  ZELLAUDE_TEST_GRANDPARENT_PID=4242)
+expect_equal "Linux SessionStart execs" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rm=1 rmdir=2 stat=2 tr=1 zellij=1" \
+  "$LINUX_URGENT_EVENT_EXECS"
+# A subagent writes no state record, but its stream marker is in the cache.
+expect_equal "Linux subagent tool event execs" \
+  "hostname=1 jq=2 mv=1 rm=1 stat=2 tr=1 zellij=1" \
+  "$(exec_profile \
+    '{"session_id":"tree-root","hook_event_name":"PreToolUse","agent_id":"child"}' \
+    ZELLAUDE_TEST_GRANDPARENT_PID=4343)"
+# The common Linux path: the agent is found and its environ is readable.
+write_environ 'ANTHROPIC_BASE_URL=http://127.0.0.1:9/'
+expect_equal "Linux tool event with launch env execs" \
+  "date=1 hostname=1 jq=4 mkdir=2 mktemp=1 mv=2 rm=1 rmdir=2 stat=2 tr=1 zellij=1" \
+  "$(exec_profile '{"session_id":"tree-launch-env","hook_event_name":"PreToolUse"}' \
+    ZELLAUDE_TEST_PARENT_COMM=claude \
+    ZELLAUDE_TEST_ENVIRON="$LAUNCH_ENV_ENVIRON" \
+    ZELLAUDE_PROC_ROOT="$LAUNCH_ENV_PROC_ROOT")"
+jq -e '.launch_env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9/"' \
+  "$CAPTURE_FILE" >/dev/null
+# The plugin orders racing events by ts_ms, so it stays in milliseconds.
+jq -e '(.ts_ms - now * 1000 | fabs) < 60000' "$CAPTURE_FILE" >/dev/null
+
+# Only turn boundaries and attach recovery scan; mid-turn reads .effort alone.
+claude_ultra_event() {
+  jq -nc --arg event "$1" --arg session_id "$2" \
+    --arg transcript "$CLAUDE_ULTRA_TRANSCRIPT" '{
+      session_id: $session_id,
+      hook_event_name: $event,
+      transcript_path: $transcript,
+      effort: {level: "xhigh"}
+    }'
+}
+for event in PreToolUse PostToolUse PostToolUseFailure Notification Stop; do
+  exec_profile "$(claude_ultra_event "$event" scan-rule)" >/dev/null
+  expect_equal "$event: rainbow_name" null "$(jq -c '.rainbow_name' "$CAPTURE_FILE")"
+  expect_equal "$event: tail, grep" "0 0" "$(exec_count tail) $(exec_count grep)"
+done
+for event in SessionStart UserPromptSubmit SessionRestore; do
+  exec_profile "$(claude_ultra_event "$event" scan-rule)" >/dev/null
+  expect_equal "$event: rainbow_name" true "$(jq -c '.rainbow_name' "$CAPTURE_FILE")"
+  expect_equal "$event: tail" 2 "$(exec_count tail)"
+done
+
+# Rainbow off skips detection and sends null, never false: the cache keeps true.
+rm -f "$STATE_FILE"
+run_hook claude "$(claude_ultra_event UserPromptSubmit rainbow-off)" true
+write_settings '{"rainbow":false}'
+expect_equal "rainbow off execs" "$LINUX_URGENT_EVENT_EXECS" \
+  "$(exec_profile "$(claude_ultra_event UserPromptSubmit rainbow-off)" \
+    ZELLAUDE_TEST_GRANDPARENT_PID=4242)"
+jq -e '.rainbow_name == null and .rainbow_mode_ts_ms == null' \
+  "$CAPTURE_FILE" >/dev/null
+jq -e '.session_id == "rainbow-off" and .rainbow_name == true' \
+  "$STATE_FILE" >/dev/null
+run_hook codex \
+  '{"session_id":"rainbow-off-codex","hook_event_name":"PreToolUse","reasoning_effort":"ultra"}' \
+  null
+# Only a literal false turns it off: any other value or a bad file leaves it on.
+for settings in '{"rainbow":true}' '{"rainbow":"no"}' '{"rainbow":' \
+  '[{"id":"claude6","width":3,"height":2,"commands":["claude"]}]'; do
+  write_settings "$settings"
+  run_hook claude "$(claude_ultra_event UserPromptSubmit rainbow-on)" true
+done
+# Past one argument's 128 KiB the settings still apply: jq reads them by path.
+write_settings "$(printf '{"rainbow":false,%s,"padding":"%140000s"}' \
+  '"launch_env_names":{"verbatim":["MY_BASE_URL"]}' '')"
+run_hook claude "$(claude_ultra_event UserPromptSubmit big-settings)" null
+write_environ 'MY_BASE_URL=http://127.0.0.1:9/mine'
+run_launch_env_hook claude \
+  '{"session_id":"big-settings","hook_event_name":"PreToolUse"}'
+jq -e '.launch_env.MY_BASE_URL == "http://127.0.0.1:9/mine"' \
+  "$CAPTURE_FILE" >/dev/null
+write_settings
+
+# The cache write: one stat per directory, and chmod only when not already 700.
+CACHE_DIR="$TEST_DIR/runtime/zellaude-$(id -u)"
+is_private_dir() {
+  [ "$(ls -ld "$1" | cut -c1-10)" = "drwx------" ]
+}
+chmod 750 "$CACHE_DIR"
+exec_profile "$TREE_TOOL_EVENT" >/dev/null
+expect_equal "loose cache dir: chmod" 1 "$(exec_count chmod)"
+is_private_dir "$CACHE_DIR"
+exec_profile "$TREE_TOOL_EVENT" >/dev/null
+expect_equal "private cache dir: chmod" 0 "$(exec_count chmod)"
+
+# A group-writable runtime dir falls back to ~/.cache, at one stat per level.
+HOME_STATE_FILE="$HOME/.cache/zellaude/runtime/test-session.7.json"
+chmod 770 "$TEST_DIR/runtime"
+run_tree_hook "$TREE_TOOL_EVENT" 1
+chmod 700 "$TEST_DIR/runtime"
+jq -e '.session_id == "tree-root"' "$HOME_STATE_FILE" >/dev/null
+is_private_dir "$HOME/.cache/zellaude/runtime"
+expect_equal "home cache execs" \
+  "date=1 hostname=1 jq=3 mkdir=2 mktemp=1 mv=2 rm=1 rmdir=2 stat=3 tr=1 zellij=1" \
+  "$(exec_profile "$TREE_TOOL_EVENT" XDG_RUNTIME_DIR=)"
+
+# A record jq cannot read, empty or malformed, is replaced, not kept forever.
+for record in '' '{"session_id":'; do
+  printf '%s' "$record" > "$STATE_FILE"
+  run_tree_hook "$TREE_TOOL_EVENT" 4242
+  jq -e '.session_id == "tree-root" and .hook_event == "PreToolUse"' \
+    "$STATE_FILE" >/dev/null
+done
+
+# A 700 cache dir owned by someone else is refused; the event still pipes.
+FOREIGN_STAT_BIN="$TEST_DIR/foreign-stat-bin"
+mkdir -p "$FOREIGN_STAT_BIN"
+cat > "$FOREIGN_STAT_BIN/stat" <<'FAKE_STAT'
+#!/usr/bin/env bash
+if [ "${!#}" = "$ZELLAUDE_TEST_FOREIGN_DIR" ]; then
+  printf '0 700\n'
+else
+  command -p stat "$@"
+fi
+FAKE_STAT
+chmod +x "$FOREIGN_STAT_BIN/stat"
+rm -f "$STATE_FILE"
+: > "$CAPTURE_FILE"
+run_tree_hook "$TREE_TOOL_EVENT" 4242 \
+  PATH="$FOREIGN_STAT_BIN:$TEST_DIR/bin:$PATH" \
+  ZELLAUDE_TEST_FOREIGN_DIR="$CACHE_DIR"
+[ ! -e "$STATE_FILE" ]
+jq -e '.session_id == "tree-root"' "$CAPTURE_FILE" >/dev/null
+
+# Delivery. The fake sleep logs to the timeline, "slept" only when it ran out.
+DELIVERY_BIN="$TEST_DIR/delivery-bin"
+mkdir -p "$DELIVERY_BIN"
+cat > "$DELIVERY_BIN/sleep" <<'FAKE_SLEEP'
+#!/usr/bin/env bash
+printf 'sleep %s\n' "$*" >> "$ZELLAUDE_TEST_TIMELINE"
+trap 'kill "$sleeper"; exit 143' TERM
+command -p sleep "$@" &
+sleeper=$!
+wait "$sleeper"
+printf 'slept %s\n' "$*" >> "$ZELLAUDE_TEST_TIMELINE"
+FAKE_SLEEP
+chmod +x "$DELIVERY_BIN/sleep"
+# Distinct from the reaper's 1 second, so the timeline tells them apart.
+DELIVERY_WINDOW=1.5
+
+# One event per input, sharing one window; wrap in await_descendants to wait.
+# "@<pane> <input>" runs in that pane; "pause:<seconds>" waits between events.
+run_delivery_burst() {
+  local input pane
+  for input in "$@"; do
+    pane=7
+    case "$input" in
+      pause:*) sleep "${input#pause:}"; continue ;;
+      @*) pane=${input%% *}; pane=${pane#@}; input=${input#* } ;;
+    esac
+    hook_process "$input" \
+      PATH="$DELIVERY_BIN:$TEST_DIR/bin:$PATH" \
+      ZELLIJ_PANE_ID="$pane" \
+      ZELLAUDE_DELIVERY_COALESCE_SECONDS="$DELIVERY_WINDOW" \
+      bash "$HOOK_PARENT" >/dev/null
+  done
+}
+
+# Each piped payload as event[:tool][@subagent], in pipe order.
+piped_events() {
+  sed -n 's/^zellij action pipe --name zellaude -- //p' "$TIMELINE" |
+    jq -r '.hook_event
+      + (if .tool_name then ":" + .tool_name else "" end)
+      + (if .is_subagent then "@subagent" else "" end)'
+}
+
+delivered() {
+  piped_events | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+piped_in_order() {
+  piped_events | tr '\n' ' ' | sed 's/ $//'
+}
+
+delivery_event() {
+  jq -nc --arg event "$1" --arg tool "${2:-}" --arg agent_id "${3:-}" '
+    {session_id: "delivery", hook_event_name: $event}
+    + (if $tool == "" then {} else {tool_name: $tool} end)
+    + (if $agent_id == "" then {} else {agent_id: $agent_id} end)'
+}
+
+expect_delivered() {
+  local label=$1
+  shift
+  : > "$TIMELINE"
+  await_descendants run_delivery_burst "$@"
+  expect_equal "$label: delivered" "$EXPECTED_DELIVERED" "$(delivered)"
+}
+
+EXPECTED_DELIVERED="PreToolUse:last"
+expect_delivered "superseded events never pipe" \
+  "$(delivery_event PreToolUse first)" \
+  "$(delivery_event PostToolUse first)" \
+  "$(delivery_event PreToolUse last)"
+
+# An urgent event pipes before the pending window closes, and supersedes it.
+EXPECTED_DELIVERED="Stop"
+expect_delivered "urgent supersedes" \
+  "$(delivery_event PreToolUse first)" "$(delivery_event Stop)"
+expect_equal "urgent pipes at once" "pipe window" \
+  "$(awk '/^zellij action / { print "pipe" } $0 == "slept 1.5" { print "window" }' \
+    "$TIMELINE" | tr '\n' ' ' | sed 's/ $//')"
+
+EXPECTED_DELIVERED="PreToolUse:first"
+expect_delivered "Notification never displaces a pending event" \
+  "$(delivery_event PreToolUse first)" "$(delivery_event Notification)"
+EXPECTED_DELIVERED="Notification"
+expect_delivered "Notification alone" "$(delivery_event Notification)"
+EXPECTED_DELIVERED="PreToolUse:last"
+expect_delivered "Notification yields to a later pending event" \
+  "$(delivery_event Notification)" "$(delivery_event PreToolUse last)"
+
+# A Notification fired inside an urgent event's claim never supersedes it.
+MID_CLAIM_BIN="$TEST_DIR/mid-claim-bin"
+mkdir -p "$MID_CLAIM_BIN"
+cat > "$MID_CLAIM_BIN/mv" <<'MID_CLAIM_MV'
+#!/usr/bin/env bash
+command -p mv "$@" || exit
+# Fires once: the Notification's own hook runs disarmed.
+if [ -n "${ZELLAUDE_TEST_MID_CLAIM_INPUT:-}" ] && [[ ${!#} == *.claimed ]]; then
+  ZELLAUDE_TEST_INPUT=$ZELLAUDE_TEST_MID_CLAIM_INPUT ZELLAUDE_TEST_MID_CLAIM_INPUT= \
+    bash "$ZELLAUDE_TEST_HOOK_PARENT" >/dev/null
+fi
+exit 0
+MID_CLAIM_MV
+chmod +x "$MID_CLAIM_BIN/mv"
+EXPECTED_DELIVERED="Notification Stop"
+ZELLAUDE_TEST_MID_CLAIM_INPUT=$(delivery_event Notification) \
+  ZELLAUDE_TEST_HOOK_PARENT=$HOOK_PARENT PATH="$MID_CLAIM_BIN:$PATH" \
+  expect_delivered "Notification mid-claim" "$(delivery_event Stop)"
+expect_equal "Notification mid-claim: order" "Stop Notification" \
+  "$(piped_in_order)"
+
+# Root and subagent streams never displace each other, urgent events included.
+EXPECTED_DELIVERED="PreToolUse:root PreToolUse:sub@subagent"
+expect_delivered "streams are separate" \
+  "$(delivery_event PreToolUse root)" \
+  "$(delivery_event PreToolUse sub child-1)"
+EXPECTED_DELIVERED="PreToolUse:sub@subagent Stop"
+expect_delivered "root urgent leaves the subagent stream" \
+  "$(delivery_event PreToolUse sub child-1)" "$(delivery_event Stop)"
+
+# Presence: no client gets urgent events only; missing or odd metadata delivers.
+case "$OSTYPE" in
+  darwin*) ZELLIJ_CACHE="$HOME/Library/Caches/org.Zellij-Contributors.Zellij" ;;
+  *) ZELLIJ_CACHE="$TEST_DIR/xdg-cache/zellij" ;;
+esac
+SESSION_INFO_DIR="$ZELLIJ_CACHE/contract_version_1/session_info/test-session"
+mkdir -p "$SESSION_INFO_DIR"
+printf 'name "test-session"\nconnected_clients 0\nweb_clients_allowed false\n' \
+  > "$SESSION_INFO_DIR/session-metadata.kdl"
+EXPECTED_DELIVERED=""
+expect_delivered "no client: coalesced skipped" "$(delivery_event PreToolUse)"
+EXPECTED_DELIVERED="Stop"
+expect_delivered "no client: urgent delivered" "$(delivery_event Stop)"
+printf 'name "test-session"\nconnected_clients 1\n' \
+  > "$SESSION_INFO_DIR/session-metadata.kdl"
+EXPECTED_DELIVERED="PreToolUse"
+expect_delivered "a client attached" "$(delivery_event PreToolUse)"
+printf 'connected_clients zero\n' > "$SESSION_INFO_DIR/session-metadata.kdl"
+expect_delivered "unparseable metadata fails open" "$(delivery_event PreToolUse)"
+rm -rf "$ZELLIJ_CACHE"
+
+# The reaper dies with an answered client; a hung one is killed at the 1 s
+# test bound.
+EXPECTED_DELIVERED="Stop"
+expect_delivered "reaper, answered" "$(delivery_event Stop)"
+if grep -qx 'slept 1' "$TIMELINE"; then
+  printf 'the reaper outlived an answered pipe\n' >&2
+  exit 1
+fi
+ZELLAUDE_TEST_ZELLIJ_HANGS=1 expect_delivered "reaper, never answered" \
+  "$(delivery_event Stop)"
+expect_equal "hung client" "hook returned|slept 1|zellij killed" \
+  "$(grep -x -e 'hook returned' -e 'slept 1' -e 'zellij killed' \
+    -e 'zellij done' "$TIMELINE" | tr '\n' '|' | sed 's/|$//')"
+
+# One pipe in flight per session. The session lock and urgent markers sit
+# beside the stream markers.
+SESSION_PREFIX="$CACHE_DIR/test-session.$(hostname)"
+PIPE_LOCK="$SESSION_PREFIX.pipe-lock"
+
+# The pipes of a burst, as s(tart) and d(one) in timeline order.
+pipe_spans() {
+  awk '/^zellij action / { print "s" } $0 == "zellij done" { print "d" }' \
+    "$TIMELINE" | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Coalesced events of separate streams have no urgent marker to order them, so
+# only the lock keeps their pipes apart.
+EXPECTED_DELIVERED="PreToolUse:p7 PreToolUse:p8 PreToolUse:p9 Stop:p10"
+DELIVERY_WINDOW=0.05 ZELLAUDE_TEST_ZELLIJ_SECONDS=0.3 expect_delivered \
+  "one pipe at a time" \
+  "@7 $(delivery_event PreToolUse p7)" "@8 $(delivery_event PreToolUse p8)" \
+  "@9 $(delivery_event PreToolUse p9)" "@10 $(delivery_event Stop p10)"
+expect_equal "one pipe at a time: spans" "s d s d s d s d" "$(pipe_spans)"
+if [ -e "$PIPE_LOCK" ] || compgen -G "$SESSION_PREFIX.urgent.*" >/dev/null; then
+  printf 'a finished burst left its lock or urgent markers\n' >&2
+  exit 1
+fi
+
+# Events that pile up behind a running pipe collapse to each stream's latest.
+EXPECTED_DELIVERED="PreToolUse:a3 PreToolUse:s2@subagent Stop:p7"
+# Tests with a slow holder raise the reaper, so its pipe outlasts the burst.
+DELIVERY_WINDOW=0.05 ZELLAUDE_DELIVERY_REAPER_SECONDS=5 \
+  ZELLAUDE_TEST_ZELLIJ_SECONDS=4 expect_delivered \
+  "piled-up events collapse" \
+  "@7 $(delivery_event Stop p7)" \
+  "@8 $(delivery_event PreToolUse a1)" \
+  "@8 $(delivery_event PreToolUse s1 child-1)" pause:0.3 \
+  "@8 $(delivery_event PreToolUse a2)" pause:0.3 \
+  "@8 $(delivery_event PreToolUse a3)" \
+  "@8 $(delivery_event PreToolUse s2 child-1)"
+
+# An urgent event takes the lock ahead of a coalesced waiter.
+EXPECTED_DELIVERED="PreToolUse:c Stop:p7 UserPromptSubmit:p9"
+DELIVERY_WINDOW=0.05 ZELLAUDE_DELIVERY_REAPER_SECONDS=5 \
+  ZELLAUDE_TEST_ZELLIJ_SECONDS=3 expect_delivered "urgent before coalesced" \
+  "@7 $(delivery_event Stop p7)" "@8 $(delivery_event PreToolUse c)" pause:0.3 \
+  "@9 $(delivery_event UserPromptSubmit p9)"
+expect_equal "urgent before coalesced: order" \
+  "Stop:p7 UserPromptSubmit:p9 PreToolUse:c" "$(piped_in_order)"
+
+# Priority, against a live urgent marker no deliverer will clear: a coalesced
+# event yields until it gives up, and an urgent one waits behind an older one.
+PHANTOM_MS=$(($(date +%s) * 1000))
+: > "$SESSION_PREFIX.urgent.$PHANTOM_MS.99999"
+EXPECTED_DELIVERED=""
+DELIVERY_WINDOW=0.05 expect_delivered "coalesced yields to urgent" \
+  "$(delivery_event PreToolUse)"
+expect_equal "coalesced poll" "sleep 0.25" \
+  "$(grep -x -e 'sleep 0.1' -e 'sleep 0.25' "$TIMELINE" | sort -u)"
+EXPECTED_DELIVERED="Stop"
+expect_delivered "urgent waits behind an older urgent" "$(delivery_event Stop)"
+if ! grep -qx 'slept 0.1' "$TIMELINE"; then
+  printf 'an urgent event piped ahead of an older one\n' >&2
+  exit 1
+fi
+expect_equal "urgent poll" "sleep 0.1" \
+  "$(grep -x -e 'sleep 0.1' -e 'sleep 0.25' "$TIMELINE" | sort -u)"
+rm -f "$SESSION_PREFIX.urgent.$PHANTOM_MS.99999"
+
+# A newer event of its stream supersedes a waiting urgent event; SessionEnd is
+# never superseded, and urgent events go oldest first.
+EXPECTED_DELIVERED="PreToolUse:newer Stop:p7"
+DELIVERY_WINDOW=0.05 ZELLAUDE_DELIVERY_REAPER_SECONDS=5 \
+  ZELLAUDE_TEST_ZELLIJ_SECONDS=3 expect_delivered "waiting urgent superseded" \
+  "@7 $(delivery_event Stop p7)" "@8 $(delivery_event Stop p8)" \
+  "@8 $(delivery_event PreToolUse newer)"
+EXPECTED_DELIVERED="SessionEnd SessionStart Stop:p7"
+ZELLAUDE_DELIVERY_REAPER_SECONDS=5 ZELLAUDE_TEST_ZELLIJ_SECONDS=3 \
+  expect_delivered "SessionEnd always pipes" \
+  "@7 $(delivery_event Stop p7)" "@8 $(delivery_event SessionEnd)" \
+  "@8 $(delivery_event SessionStart)"
+expect_equal "SessionEnd always pipes: order" "Stop:p7 SessionEnd SessionStart" \
+  "$(piped_in_order)"
+
+# A lock older than the reaper plus 2 s is broken by its age, even one
+# unreadable since its writer died mid-write; a coalesced event then still
+# pipes rather than give up.
+printf '%s deadbeef\n' "$(($(date +%s) - 100))" > "$PIPE_LOCK"
+EXPECTED_DELIVERED="PreToolUse"
+DELIVERY_WINDOW=0.05 expect_delivered "stale lock broken" \
+  "$(delivery_event PreToolUse)"
+: > "$PIPE_LOCK"
+ZELLAUDE_DELIVERY_REAPER_SECONDS=2 DELIVERY_WINDOW=0.05 \
+  expect_delivered "unreadable lock broken" "$(delivery_event PreToolUse)"
+
+# The unreadable-lock clock covers one unbroken run of unreadable reads: a
+# readable or absent lock in between restarts it, so a fresh lock caught
+# mid-write is never aged by an earlier run.
+STALE_LOCK_FN=$(sed -n '/^break_stale_pipe_lock() {/,/^}/p' \
+  "$PROJECT_DIR/scripts/zellaude-hook.sh")
+for interruption in readable absent; do
+  bash -c "$STALE_LOCK_FN"'
+    PIPE_LOCK=$1 DELIVERY_REAPER_SECONDS=1 TS_MS=$(($(date +%s) * 1000))
+    UNREADABLE_LOCK_SINCE=$((SECONDS - 100))
+    if [ "$2" = readable ]; then
+      printf "%s fresh\n" "$((TS_MS / 1000))" > "$PIPE_LOCK"
+    else
+      rm -f "$PIPE_LOCK"
+    fi
+    break_stale_pipe_lock
+    : > "$PIPE_LOCK"
+    break_stale_pipe_lock
+    [ -e "$PIPE_LOCK" ]' _ "$TEST_DIR/unit-pipe-lock" "$interruption" || {
+    printf 'a %s lock did not restart the unreadable-lock clock\n' \
+      "$interruption" >&2
+    exit 1
+  }
+done
+rm -f "$TEST_DIR/unit-pipe-lock"
+
+# A live holder that never lets go: after three reaper spans a coalesced event
+# is dropped and an urgent one pipes without the lock.
+printf '%s alive\n' "$(($(date +%s) + 1000))" > "$PIPE_LOCK"
+EXPECTED_DELIVERED="Stop:p8"
+DELIVERY_WINDOW=0.05 expect_delivered "give up" \
+  "@7 $(delivery_event PreToolUse dropped)" "@8 $(delivery_event Stop p8)"
+rm -f "$PIPE_LOCK"
+
+# The reaper's default bound is five seconds.
+EXPECTED_DELIVERED="Stop"
+ZELLAUDE_DELIVERY_REAPER_SECONDS= ZELLAUDE_TEST_ZELLIJ_HANGS=1 \
+  expect_delivered "default reaper" "$(delivery_event Stop)"
+expect_equal "default reaper: killed" "slept 5|zellij killed" \
+  "$(grep -x -e 'slept 5' -e 'zellij killed' -e 'zellij done' "$TIMELINE" |
+    tr '\n' '|' | sed 's/|$//')"
+
+# --inspect prints the payload back to zellaude-attach.sh and never pipes.
+: > "$TIMELINE"
+run_hook_process '{"session_id":"delivery","hook_event_name":"SessionRestore"}' \
+  ZELLAUDE_TEST_HOOK_ARGS=--inspect \
+  bash "$HOOK_PARENT" > "$TEST_DIR/inspect.json"
+jq -e '.hook_event == "SessionRestore"' "$TEST_DIR/inspect.json" >/dev/null
+if grep -q '^zellij ' "$TIMELINE"; then
+  printf -- '--inspect piped its payload\n' >&2
+  exit 1
+fi
+
+# Codex reads Stop stdout as JSON to EOF: no deliverer may hold it, hung or not.
+codex_stop_stdout() {
+  local stdout
+  stdout=$(hook_process '{"session_id":"delivery","hook_event_name":"Stop"}' \
+    ZELLAUDE_TEST_HOOK_ARGS="--client codex" bash "$HOOK_PARENT")
+  printf 'stdout closed %s\n' "$stdout" >> "$TIMELINE"
+}
+: > "$TIMELINE"
+ZELLAUDE_TEST_ZELLIJ_HANGS=1 await_descendants codex_stop_stdout
+expect_equal "codex Stop stdout" "stdout closed {}|zellij killed" \
+  "$(grep -e '^stdout closed' -e '^zellij killed' "$TIMELINE" |
+    tr '\n' '|' | sed 's/|$//')"
+
+# SessionEnd removes this host's stream markers for the pane, not another's.
+STREAM_PREFIX="$CACHE_DIR/test-session.7.$(hostname)"
+compgen -G "$STREAM_PREFIX.root.*" >/dev/null
+run_hook_process '{"session_id":"delivery","hook_event_name":"SessionEnd"}' \
+  bash "$HOOK_PARENT" >/dev/null
+if compgen -G "$STREAM_PREFIX.root.*" >/dev/null ||
+   compgen -G "$STREAM_PREFIX.subagents.*" >/dev/null; then
+  printf 'SessionEnd left stream markers behind\n' >&2
+  exit 1
+fi
+compgen -G "$CACHE_DIR/test-session.7.other-host.invalid.root.*" >/dev/null
+
+# The stub answers as macOS ps does: comm a full path, ucomm the process title.
 MACOS_PS_BIN="$TEST_DIR/macos-ps-bin"
 mkdir -p "$MACOS_PS_BIN"
 cat > "$MACOS_PS_BIN/ps" <<'FAKE_MACOS_PS'
 #!/usr/bin/env bash
+pid=${!#}
 case " $* " in
-  *" -o comm= "*)  printf '/Users/x/.local/bin/claude\n' ;;
+  *" -A "*)
+    [ "${ZELLAUDE_TEST_PS_TABLE:-}" != empty ] || exit 0
+    printf '    1     0 /sbin/launchd\n'
+    printf ' 4242     1 /Users/x/.local/bin/claude\n'
+    printf '%5s  4242 /Applications/My Term.app/Contents/MacOS/My Term\n' \
+      "$ZELLAUDE_TEST_PARENT_PID"
+    [ "${ZELLAUDE_TEST_PS_TABLE:-}" != failed ] || exit 1
+    ;;
+  *" -o comm= "*)
+    if [ "$pid" = 4242 ]; then
+      printf '/Users/x/.local/bin/claude\n'
+    else
+      printf '/bin/bash\n'
+    fi
+    ;;
   *" -o ucomm= "*) printf '2.1.191\n' ;;
-  *" -o ppid= "*)  printf '1\n' ;;
+  *" -o ppid= "*)
+    if [ "$pid" = 4242 ]; then printf '1\n'; else printf '4242\n'; fi
+    ;;
 esac
 FAKE_MACOS_PS
 chmod +x "$MACOS_PS_BIN/ps"
+MACOS_PATH="$MACOS_PS_BIN:$TEST_DIR/bin:$PATH"
 
-: > "$CAPTURE_FILE"
-printf '%s' '{"session_id":"macos-comm","hook_event_name":"PreToolUse"}' |
-  env -u CLAUDE_EFFORT \
-    -u CLAUDE_CODE_EFFORT_LEVEL \
-    -u ZELLAUDE_CLAUDE_MODE \
-    PATH="$MACOS_PS_BIN:$TEST_DIR/bin:$PATH" \
-    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
-    ZELLIJ_SESSION_NAME="test-session" \
-    ZELLIJ_PANE_ID="7" \
-    ZELLAUDE_TEST_CAPTURE="$CAPTURE_FILE" \
-    "$PROJECT_DIR/scripts/zellaude-hook.sh" >/dev/null
-jq -e '(.agent_pid | type) == "number"' "$CAPTURE_FILE" >/dev/null
+# $1 the input, $2 the stub's table mode: "", empty or failed.
+macos_exec_profile() {
+  exec_profile "$1" \
+    ZELLAUDE_TREE_PROC_ROOT="$TEST_DIR/no-procfs" \
+    ZELLAUDE_TEST_REAL_PATH="$MACOS_PATH" \
+    ZELLAUDE_TEST_PS_TABLE="$2" >/dev/null
+}
+
+rm -f "$STATE_FILE"
+macos_exec_profile '{"session_id":"macos-root","hook_event_name":"PreToolUse"}' ""
+expect_agent_pid "macOS batched ps" 4242
+expect_equal "macOS batched ps: ps, awk" "1 1" \
+  "$(exec_count ps) $(exec_count awk)"
+# The memo answers first, unconfirmed: macOS has no fork-free comm check.
+macos_exec_profile '{"session_id":"macos-root","hook_event_name":"PreToolUse"}' empty
+expect_agent_pid "macOS memo hit" 4242
+expect_equal "macOS memo hit: ps, awk" "0 0" \
+  "$(exec_count ps) $(exec_count awk)"
+for table_mode in empty failed; do
+  macos_exec_profile \
+    "{\"session_id\":\"macos-$table_mode\",\"hook_event_name\":\"PreToolUse\"}" \
+    "$table_mode"
+  expect_agent_pid "macOS $table_mode table falls back" 4242
+  expect_equal "macOS $table_mode table: ps, awk" "4 0" \
+    "$(exec_count ps) $(exec_count awk)"
+done
 
 printf 'hook mode detection tests passed\n'

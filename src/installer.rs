@@ -261,7 +261,7 @@ CLAUDE_HOOK=$(jq -nc --arg cmd "$CLAUDE_HOOK_CMD" '{
   "type": "command", "command": $cmd, "timeout": 5, "async": true
 }')
 CODEX_HOOK=$(jq -nc --arg cmd "$CODEX_HOOK_CMD" '{
-  "type": "command", "command": $cmd, "timeout": 3
+  "type": "command", "command": $cmd, "timeout": 3, "async": true
 }')
 CLAUDE_ENTRY=$(jq -nc --argjson hook "$CLAUDE_HOOK" '[{"hooks": [$hook]}]')
 CODEX_ENTRY=$(jq -nc --argjson hook "$CODEX_HOOK" '[{"hooks": [$hook]}]')
@@ -404,7 +404,7 @@ mod tests {
         fs::write(path, format!("{document}\n")).expect("seed settings");
     }
 
-    fn command_count(document: &Value, command: &str) -> usize {
+    fn hooks_with_command<'a>(document: &'a Value, command: &str) -> Vec<&'a Value> {
         document["hooks"]
             .as_object()
             .into_iter()
@@ -415,7 +415,7 @@ mod tests {
             .filter_map(Value::as_array)
             .flatten()
             .filter(|hook| hook.get("command").and_then(Value::as_str) == Some(command))
-            .count()
+            .collect()
     }
 
     #[test]
@@ -488,10 +488,16 @@ mod tests {
         let codex: Value =
             serde_json::from_slice(&fs::read(&codex_hooks).expect("read installed Codex settings"))
                 .expect("parse installed Codex settings");
-        assert_eq!(command_count(&claude, CLAUDE_OWNED), 11);
-        assert_eq!(command_count(&codex, CODEX_OWNED), 9);
-        assert_eq!(command_count(&claude, LOOKALIKE), 1);
-        assert_eq!(command_count(&codex, LOOKALIKE), 1);
+        assert_eq!(hooks_with_command(&claude, CLAUDE_OWNED).len(), 11);
+        assert_eq!(hooks_with_command(&codex, CODEX_OWNED).len(), 9);
+        assert_eq!(hooks_with_command(&claude, LOOKALIKE).len(), 1);
+        assert_eq!(hooks_with_command(&codex, LOOKALIKE).len(), 1);
+        let codex_hook = serde_json::json!({
+            "type": "command", "command": CODEX_OWNED, "timeout": 3, "async": true
+        });
+        assert!(hooks_with_command(&codex, CODEX_OWNED)
+            .iter()
+            .all(|hook| **hook == codex_hook));
         assert_eq!(
             fs::read_to_string(&hook_path).expect("read installed hook"),
             hook_script_content()

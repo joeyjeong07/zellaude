@@ -92,7 +92,7 @@ assert_install() {
       $events[];
       . as $event
       | [$root.hooks[$event][]?.hooks[]?
-          | select((.command // "") == $owned)]
+          | select(. == {type: "command", command: $owned, timeout: 5, async: true})]
       | length == 1
     )
   ' "$CLAUDE_SETTINGS" >/dev/null
@@ -102,7 +102,7 @@ assert_install() {
       $events[];
       . as $event
       | [$root.hooks[$event][]?.hooks[]?
-          | select((.command // "") == $owned)]
+          | select(. == {type: "command", command: $owned, timeout: 3, async: true})]
       | length == 1
     )
   ' "$CODEX_HOOKS" >/dev/null

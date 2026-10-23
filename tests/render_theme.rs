@@ -128,6 +128,7 @@ mod state {
         pub elapsed_time: bool,
         pub mode_indicator: bool,
         pub smart_focus: bool,
+        pub rainbow: bool,
     }
 
     #[derive(Default, PartialEq)]
@@ -144,6 +145,7 @@ mod state {
         ElapsedTime,
         ModeIndicator,
         SmartFocus,
+        Rainbow,
     }
 
     pub enum MenuAction {
@@ -214,6 +216,7 @@ mod state {
                     elapsed_time: true,
                     mode_indicator: true,
                     smart_focus: true,
+                    rainbow: true,
                 },
                 view_mode: ViewMode::Normal,
                 prefix_click_region: None,
@@ -232,7 +235,7 @@ mod session_selection;
 mod render;
 
 use prelude::{PaletteColor, StyleDeclaration, Styling, TabInfo};
-use state::{Activity, SessionInfo, State, ViewMode};
+use state::{Activity, MenuAction, SessionInfo, SettingKey, State, ViewMode};
 
 fn rgb(r: u8, g: u8, b: u8) -> PaletteColor {
     PaletteColor::Rgb((r, g, b))
@@ -467,6 +470,54 @@ fn settings_surface_uses_gruvbox_text_and_accent_colors() {
     assert!(output.contains("\x1b[38;2;104;157;106m●"));
     assert!(output.contains("\x1b[38;2;214;93;14m◐"));
     assert!(output.contains("\x1b[38;2;204;36;29m×"));
+}
+
+#[test]
+fn rainbow_off_renders_a_rainbow_name_exactly_as_a_plain_name() {
+    let render_with = |rainbow_setting: bool, rainbow_name: bool| {
+        let mut state = State {
+            zellij_styling: Some(gruvbox_dark()),
+            tabs: vec![tab(0, "agent", true), tab(1, "other", false)],
+            ..State::default()
+        };
+        state.settings.rainbow = rainbow_setting;
+        for (pane_id, tab_index) in [(7, 0), (8, 1)] {
+            state.sessions.insert(
+                pane_id,
+                SessionInfo {
+                    tab_index: Some(tab_index),
+                    rainbow_name,
+                    rainbow_name_known: true,
+                    ..idle_agent_session(pane_id)
+                },
+            );
+        }
+        render::build_status_bar(&mut state, 1, 120)
+    };
+
+    let plain = render_with(true, false);
+    assert_ne!(render_with(true, true), plain);
+    assert_eq!(render_with(false, true), plain);
+}
+
+#[test]
+fn settings_menu_shows_rainbow_state_and_registers_its_toggle() {
+    let mut state = State {
+        zellij_styling: Some(gruvbox_dark()),
+        view_mode: ViewMode::Settings,
+        ..State::default()
+    };
+
+    let visible = strip_ansi(&render::build_status_bar(&mut state, 1, 200));
+    assert!(visible.contains("● Rainbow: on"), "{visible}");
+    assert!(state.menu_click_regions.iter().any(|region| matches!(
+        region.action,
+        MenuAction::ToggleSetting(SettingKey::Rainbow)
+    )));
+
+    state.settings.rainbow = false;
+    let visible = strip_ansi(&render::build_status_bar(&mut state, 1, 200));
+    assert!(visible.contains("○ Rainbow: off"), "{visible}");
 }
 
 fn idle_agent_session(pane_id: u32) -> SessionInfo {
