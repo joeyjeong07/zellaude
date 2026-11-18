@@ -1883,9 +1883,8 @@ impl State {
 
     /// Debounced to one write per second and skipped while the content is
     /// unchanged, which also keeps per-tab instances from churning over the
-    /// one file: they all derive the same body from the same events. After a
-    /// rename the previous name's manifest is removed; only this plugin ever
-    /// learns a rename happened.
+    /// one file: they all derive the same body from the same events. Each
+    /// write also removes this session's manifest under any older name.
     fn dispatch_manifest(&mut self, body: manifest::ManifestBody) {
         if self.manifest_last_body.as_ref() == Some(&body) {
             self.manifest_pending_body = None;
@@ -1897,16 +1896,7 @@ impl State {
             return;
         }
         let payload = manifest::payload_json(&body, now);
-        let previous_session_name = self
-            .manifest_last_body
-            .take()
-            .map(|last| last.zellij_session)
-            .filter(|last_name| *last_name != body.zellij_session);
-        manifest::write(
-            &payload,
-            &body.zellij_session,
-            previous_session_name.as_deref(),
-        );
+        manifest::write(&payload, &body.zellij_session, get_plugin_ids().zellij_pid);
         self.manifest_last_body = Some(body);
         self.manifest_last_write_ms = now;
         self.manifest_pending_body = None;

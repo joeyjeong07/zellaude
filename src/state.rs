@@ -209,8 +209,7 @@ pub struct State {
     /// launch-time environment value, which goes stale after `rename-session`
     /// — the manifest must not use it while this is available.
     pub reported_session_name: Option<String>,
-    /// Body of the last dispatched manifest write. Skips identical rewrites
-    /// and names the key to delete after a session rename.
+    /// Body of the last dispatched manifest write. Skips identical rewrites.
     pub manifest_last_body: Option<manifest::ManifestBody>,
     pub manifest_last_write_ms: u64,
     /// A change that arrived inside the debounce window, held for the timer.
