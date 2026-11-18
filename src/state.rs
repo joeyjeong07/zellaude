@@ -202,7 +202,9 @@ pub struct State {
     /// pane_id -> flash deadline in ms (for waiting animation)
     pub flash_deadlines: HashMap<u32, u64>,
     pub zellij_session_name: Option<String>,
-    /// Session name as Zellij itself reports it (SessionUpdate, ModeUpdate).
+    /// Session name as Zellij itself reports it (ModeUpdate). Zellij sends
+    /// that only to plugins on a tab a client is viewing, so a rename made
+    /// while detached shows up here at the next attach.
     /// Hook payloads also feed `zellij_session_name`, but theirs is the
     /// launch-time environment value, which goes stale after `rename-session`
     /// — the manifest must not use it while this is available.
