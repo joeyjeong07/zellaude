@@ -175,11 +175,12 @@ impl ZellijPlugin for State {
         self.split_three_uses_legacy_keybinds =
             split_three::uses_legacy_mode_keybinds(&get_zellij_version());
         request_permission(&REQUIRED_PERMISSIONS);
+        // Never SessionUpdate: Zellij sends it to every instance on every
+        // state report, and decoding it pinned the plugin threads.
         subscribe(&[
             EventType::TabUpdate,
             EventType::PaneUpdate,
             EventType::ModeUpdate,
-            EventType::SessionUpdate,
             EventType::Timer,
             EventType::Mouse,
             EventType::Key,
@@ -240,27 +241,6 @@ impl ZellijPlugin for State {
                 self.maybe_start_attach_scan();
                 self.maybe_write_manifest();
                 true
-            }
-            // The only client-independent source of the session's current
-            // name: ModeUpdate needs an attached client, and hook payloads
-            // carry the stale launch-time name after a rename. Without this a
-            // detached session never learns its name (or a rename), and the
-            // manifest cannot follow.
-            Event::SessionUpdate(sessions, _) => {
-                if let Some(current) = sessions.iter().find(|session| session.is_current_session) {
-                    if self.reported_session_name.as_deref() != Some(current.name.as_str()) {
-                        self.reported_session_name = Some(current.name.clone());
-                        // Written from the update's own topology snapshot:
-                        // this event reaches hidden instances too, whose own
-                        // tabs/panes stop updating while another tab is
-                        // visible and would republish a stale layout here.
-                        if !current.tabs.is_empty() {
-                            let body = manifest::body(&current.name, &current.tabs, &current.panes);
-                            self.dispatch_manifest(body);
-                        }
-                    }
-                }
-                false
             }
             Event::Key(key) if self.custom_layout_prompt.is_some() => {
                 self.handle_custom_layout_prompt_key(key)
@@ -1903,9 +1883,8 @@ impl State {
 
     /// Debounced to one write per second and skipped while the content is
     /// unchanged, which also keeps per-tab instances from churning over the
-    /// one file: they all derive the same body from the same events. After a
-    /// rename the previous name's manifest is removed; only this plugin ever
-    /// learns a rename happened.
+    /// one file: they all derive the same body from the same events. Each
+    /// write also removes this session's manifest under any older name.
     fn dispatch_manifest(&mut self, body: manifest::ManifestBody) {
         if self.manifest_last_body.as_ref() == Some(&body) {
             self.manifest_pending_body = None;
@@ -1917,16 +1896,7 @@ impl State {
             return;
         }
         let payload = manifest::payload_json(&body, now);
-        let previous_session_name = self
-            .manifest_last_body
-            .take()
-            .map(|last| last.zellij_session)
-            .filter(|last_name| *last_name != body.zellij_session);
-        manifest::write(
-            &payload,
-            &body.zellij_session,
-            previous_session_name.as_deref(),
-        );
+        manifest::write(&payload, &body.zellij_session, get_plugin_ids().zellij_pid);
         self.manifest_last_body = Some(body);
         self.manifest_last_write_ms = now;
         self.manifest_pending_body = None;
