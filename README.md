@@ -538,6 +538,18 @@ frontmost. macOS uses `osascript`. X11 needs [`xdotool`](https://github.com/jord
 without it — and on Wayland, which exposes no standard way to check — the
 terminal never counts as focused, so Unfocused behaves like Always.
 
+### Upgrading running sessions
+
+A running Zellij session keeps the plugin build it first loaded, even after you install a new one. `zellij action start-or-reload-plugin` alone does not fix that: it acts on one session, does nothing in a detached session, and upgrades only the copies belonging to the clients attached right now, while Zellij keeps a copy for every client that was ever attached at the same time. After installing a new build, run:
+
+```bash
+python3 scripts/reload-running-sessions.py
+# or, without a checkout:
+curl -fsSL https://raw.githubusercontent.com/joeyjeong07/zellaude/main/scripts/reload-running-sessions.py | python3 -
+```
+
+It reloads every running session on this machine that uses Zellaude, attaching invisible clients for about 25 seconds where it needs them (sized so no pane resizes), and skips sessions without Zellaude. Work the old build had already queued still runs, so CPU settles within a few minutes.
+
 ## Uninstall
 
 Run from the clone — the script removes what it installed relative to its own
