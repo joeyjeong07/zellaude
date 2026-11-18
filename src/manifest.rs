@@ -105,10 +105,11 @@ fn state_cache_key_shell_fn() -> Option<&'static str> {
 }
 
 /// Write one manifest atomically: `$1` manifest JSON (host not yet included),
-/// `$2` the session name, `$3` the previous session name ("" when unchanged),
-/// whose manifest is removed after a rename. Readers may race the write, so
-/// the payload lands in a same-directory temp file first and is renamed over
-/// the destination.
+/// `$2` the session name, `$3` the Zellij server's pid. Readers may race the
+/// write, so the payload lands in a same-directory temp file first and is
+/// renamed over the destination. The file records its server (pid and start
+/// time); any other manifest of that same server is this session under an
+/// older name and is removed.
 const WRITE_SCRIPT_TEMPLATE: &str = r#"
 set -eu
 
@@ -118,23 +119,32 @@ cache_dir="$HOME/.cache/zellaude/runtime"
 umask 077
 mkdir -p "$cache_dir"
 key=$(state_cache_key "$2")
+manifest="$cache_dir/$key.manifest.json"
 tmp=$(mktemp "$cache_dir/.manifest.XXXXXX")
 trap 'rm -f "$tmp"' 0 HUP INT TERM
 host=$(hostname 2>/dev/null) || host=""
+# Start time makes the identity exact: a reused pid belongs to a different server.
+server_started=$(ps -o lstart= -p "$3" 2>/dev/null) || server_started=""
 if [ -n "$host" ] && command -v jq >/dev/null 2>&1; then
-    printf '%s\n' "$1" | jq -c --arg host "$host" '. + {host: $host}' > "$tmp"
+    printf '%s\n' "$1" | jq -c --arg host "$host" --argjson pid "$3" --arg started "$server_started" \
+        '. + {host: $host} + (if $started == "" then {} else {server: {pid: $pid, started: $started}} end)' > "$tmp"
 else
     printf '%s\n' "$1" > "$tmp"
 fi
-mv "$tmp" "$cache_dir/$key.manifest.json"
+mv "$tmp" "$manifest"
 trap - 0 HUP INT TERM
-if [ -n "$3" ] && [ "$3" != "$2" ]; then
-    old_key=$(state_cache_key "$3") || exit 0
-    rm -f "$cache_dir/$old_key.manifest.json"
-fi
+# A rename made while detached reaches only fresh instances, which never knew the old name.
+[ -n "$host" ] && [ -n "$server_started" ] && command -v jq >/dev/null 2>&1 || exit 0
+grep -lF -- "\"server\":{\"pid\":$3," "$cache_dir"/*.manifest.json 2>/dev/null | while IFS= read -r other; do
+    [ "$other" = "$manifest" ] && continue
+    if jq -e --arg host "$host" --argjson pid "$3" --arg started "$server_started" \
+        '.host == $host and .server.pid == $pid and .server.started == $started' "$other" >/dev/null 2>&1; then
+        rm -f "$other"
+    fi
+done
 "#;
 
-pub fn write(payload: &str, session_name: &str, previous_session_name: Option<&str>) {
+pub fn write(payload: &str, session_name: &str, zellij_server_pid: u32) {
     let Some(key_fn) = state_cache_key_shell_fn() else {
         eprintln!("Zellaude could not find state_cache_key in the embedded hook script");
         return;
@@ -150,7 +160,7 @@ pub fn write(payload: &str, session_name: &str, previous_session_name: Option<&s
             "zellaude-manifest",
             payload,
             session_name,
-            previous_session_name.unwrap_or(""),
+            &zellij_server_pid.to_string(),
         ],
         ctx,
     );
@@ -159,7 +169,10 @@ pub fn write(payload: &str, session_name: &str, previous_session_name: Option<&s
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{body, payload_json, state_cache_key_shell_fn, WRITE_SCRIPT_TEMPLATE};
-    use serde_json::Value;
+    use serde_json::{json, Value};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use zellij_tile::prelude::{PaneInfo, PaneManifest, TabInfo};
 
@@ -191,9 +204,53 @@ mod tests {
         );
     }
 
+    fn run_write_script(home: &Path, session_name: &str, server_pid: u32) {
+        let key_fn = state_cache_key_shell_fn().expect("hook script defines state_cache_key");
+        let script = WRITE_SCRIPT_TEMPLATE.replace("__STATE_CACHE_KEY__", key_fn);
+        let payload = json!({"zellij_session": session_name, "ts_ms": 1, "tabs": []}).to_string();
+        let status = Command::new("bash")
+            .args(["-c", &script, "zellaude-manifest", &payload, session_name])
+            .arg(server_pid.to_string())
+            .env("HOME", home)
+            .status()
+            .expect("run the manifest write script");
+        assert!(status.success());
+    }
+
     #[test]
-    fn write_script_only_removes_the_previous_manifest_on_rename() {
-        assert!(WRITE_SCRIPT_TEMPLATE.contains(r#"rm -f "$cache_dir/$old_key.manifest.json""#));
+    fn a_write_removes_only_this_servers_manifest_under_an_older_name() {
+        let home = std::env::temp_dir().join(format!("zellaude-manifest-rename-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let runtime = home.join(".cache/zellaude/runtime");
+        let this_server = std::process::id();
+        run_write_script(&home, "before-rename", this_server);
+        run_write_script(&home, "other-server", std::os::unix::process::parent_id());
+        let written: Value = serde_json::from_str(
+            &fs::read_to_string(runtime.join("before-rename.manifest.json")).expect("manifest written"),
+        )
+        .expect("manifest is JSON");
+        assert_eq!(written["server"]["pid"], this_server);
+        let mut reused_pid = written.clone();
+        reused_pid["zellij_session"] = json!("reused-pid");
+        reused_pid["server"]["started"] = json!("Thu Jan  1 00:00:00 1970");
+        fs::write(runtime.join("reused-pid.manifest.json"), reused_pid.to_string()).unwrap();
+        let mut other_pod = written.clone();
+        other_pod["zellij_session"] = json!("other-pod");
+        other_pod["host"] = json!("other-pod-host");
+        fs::write(runtime.join("other-pod.manifest.json"), other_pod.to_string()).unwrap();
+
+        run_write_script(&home, "after-rename", this_server);
+
+        let remaining: BTreeSet<String> = fs::read_dir(&runtime)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let _ = fs::remove_dir_all(&home);
+        let expected: BTreeSet<String> = ["after-rename", "other-pod", "other-server", "reused-pid"]
+            .iter()
+            .map(|name| format!("{name}.manifest.json"))
+            .collect();
+        assert_eq!(remaining, expected);
     }
 
     fn pane(id: u32, y: usize, x: usize) -> PaneInfo {
