@@ -548,7 +548,7 @@ python3 scripts/reload-running-sessions.py
 curl -fsSL https://raw.githubusercontent.com/joeyjeong07/zellaude/main/scripts/reload-running-sessions.py | python3 -
 ```
 
-It reloads every running session on this machine that uses Zellaude, attaching invisible clients for about 25 seconds where it needs them (sized so no pane resizes), and skips sessions without Zellaude. Work the old build had already queued still runs, so CPU settles within a few minutes.
+It reloads every running session on this machine that uses Zellaude, attaching invisible clients where it needs them (sized so no pane resizes), and skips sessions without Zellaude. It takes up to about a minute, printing each step; Ctrl+C detaches its clients. Work the old build had already queued still runs, so CPU settles within a few minutes.
 
 ## Uninstall
 
